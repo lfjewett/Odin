@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Connection Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .connected {
+            background-color: #22c55e;
+            color: white;
+        }
+        .disconnected {
+            background-color: #ef4444;
+            color: white;
+        }
+        .log {
+            background-color: #f3f4f6;
+            padding: 10px;
+            border-radius: 5px;
+            height: 400px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Connection Test</h1>
+    <div id="status" class="status disconnected">Disconnected</div>
+    <button onclick="connect()">Connect</button>
+    <button onclick="disconnect()">Disconnect</button>
+    <h2>Log:</h2>
+    <div id="log" class="log"></div>
+
+    <script>
+        let ws = null;
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+
+        function log(message) {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.textContent = `[${new Date().toISOString()}] ${message}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function updateStatus(isConnected) {
+            if (isConnected) {
+                statusDiv.textContent = 'Connected ✅';
+                statusDiv.className = 'status connected';
+            } else {
+                statusDiv.textContent = 'Disconnected ❌';
+                statusDiv.className = 'status disconnected';
+            }
+        }
+
+        function connect() {
+            if (ws) {
+                log('Already connected or connecting');
+                return;
+            }
+
+            const url = 'ws://localhost:8001/ws';
+            log(`Connecting to ${url}...`);
+            
+            ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                log('✅ Connected successfully!');
+                updateStatus(true);
+            };
+
+            ws.onmessage = (event) => {
+                log(`📨 Received: ${event.data}`);
+                try {
+                    const data = JSON.parse(event.data);
+                    log(`   Type: ${data.type}`);
+                } catch (e) {
+                    log(`   (Failed to parse as JSON)`);
+                }
+            };
+
+            ws.onerror = (error) => {
+                log(`❌ Error: ${error}`);
+            };
+
+            ws.onclose = (event) => {
+                log(`❌ Disconnected (code: ${event.code}, reason: ${event.reason || 'none'})`);
+                updateStatus(false);
+                ws = null;
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                log('Closing connection...');
+                ws.close();
+            } else {
+                log('Not connected');
+            }
+        }
+
+        // Auto-connect on page load
+        window.onload = () => {
+            log('Page loaded. Click Connect to test WebSocket connection.');
+        };
+    </script>
+</body>
+</html>

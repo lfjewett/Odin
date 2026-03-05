@@ -1,0 +1,1 @@
+- Everytime you edit the frontend app change the string at the top that says ODIN Market Workspace v0.xx to increment it to the next number

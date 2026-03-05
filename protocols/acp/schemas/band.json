@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "acp/schemas/band.json",
+  "title": "ACP Band Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "ts", "upper", "lower"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "ts": { "type": "string", "format": "date-time" },
+    "upper": { "type": "number" },
+    "lower": { "type": "number" },
+    "center": { "type": "number" }
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/odin/acp/schemas/metadata.json",
+  "title": "ACP Agent Metadata Response",
+  "description": "Schema for agent metadata endpoint response, providing configuration requirements and UI rendering hints",
+  "type": "object",
+  "required": [
+    "spec_version",
+    "agent_id",
+    "agent_name",
+    "agent_version",
+    "description",
+    "config_schema",
+    "output_schema",
+    "overlay"
+  ],
+  "properties": {
+    "spec_version": {
+      "type": "string",
+      "description": "ACP protocol version",
+      "pattern": "^ACP-[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "examples": ["ACP-0.1.0"]
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Unique identifier for this agent type",
+      "pattern": "^[a-z0-9_]+$",
+      "examples": ["sma_20", "vwap", "rsi_14"]
+    },
+    "agent_name": {
+      "type": "string",
+      "description": "Human-readable agent name",
+      "minLength": 1,
+      "examples": ["Simple Moving Average", "VWAP Overlay"]
+    },
+    "agent_version": {
+      "type": "string",
+      "description": "Agent implementation version",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "examples": ["1.0.0", "2.1.3"]
+    },
+    "description": {
+      "type": "string",
+      "description": "Brief description of agent functionality",
+      "minLength": 1
+    },
+    "config_schema": {
+      "type": "object",
+      "description": "Configuration parameters the agent requires",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type", "description", "required"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["string", "integer", "number", "boolean"],
+            "description": "Parameter data type"
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable parameter explanation"
+          },
+          "required": {
+            "type": "boolean",
+            "description": "Whether the parameter is mandatory"
+          },
+          "default": {
+            "description": "Default value if not provided"
+          },
+          "min": {
+            "type": "number",
+            "description": "Minimum value (for integer/number types)"
+          },
+          "max": {
+            "type": "number",
+            "description": "Maximum value (for integer/number types)"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regex pattern validation (for string type)"
+          },
+          "enum": {
+            "type": "array",
+            "description": "Allowed values (for string type)",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "output_schema": {
+      "type": "string",
+      "description": "Type of data records the agent will emit",
+      "enum": ["ohlc", "line", "event", "band", "histogram", "forecast"]
+    },
+    "overlay": {
+      "type": "object",
+      "description": "UI rendering hints for displaying agent output",
+      "required": ["kind", "panel"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Visual representation type (matches output_schema)",
+          "enum": ["ohlc", "line", "event", "band", "histogram", "forecast"]
+        },
+        "panel": {
+          "type": "string",
+          "description": "Where to render the overlay",
+          "enum": ["price", "separate"]
+        },
+        "color": {
+          "type": "string",
+          "description": "Hex color code for rendering",
+          "pattern": "^#[0-9a-fA-F]{6}$",
+          "examples": ["#3b82f6", "#ef4444"]
+        },
+        "legend": {
+          "type": "string",
+          "description": "Display label for the indicator"
+        },
+        "y_range": {
+          "description": "Y-axis range for scaling",
+          "oneOf": [
+            {
+              "type": "null",
+              "description": "Auto-scale"
+            },
+            {
+              "type": "array",
+              "description": "Fixed range [min, max]",
+              "items": [
+                { "type": "number" },
+                { "type": "number" }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            }
+          ]
+        },
+        "line_width": {
+          "type": "number",
+          "description": "Stroke width for line-based overlays",
+          "minimum": 0.5,
+          "maximum": 10
+        },
+        "style": {
+          "type": "object",
+          "description": "Additional rendering style hints (agent-specific)",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

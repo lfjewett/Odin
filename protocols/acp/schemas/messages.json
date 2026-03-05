@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "acp/schemas/messages.json",
+  "title": "ACP Message Envelope",
+  "oneOf": [
+    { "$ref": "#/$defs/subscribe" },
+    { "$ref": "#/$defs/unsubscribe" },
+    { "$ref": "#/$defs/reconfigure" },
+    { "$ref": "#/$defs/data" },
+    { "$ref": "#/$defs/heartbeat" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["type", "spec_version"],
+      "properties": {
+        "type": { "type": "string" },
+        "spec_version": { "type": "string", "const": "ACP-0.1.0" },
+        "subscription_id": { "type": "string", "minLength": 1 },
+        "agent_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "subscribe": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "spec_version", "subscription_id", "agent_id", "symbol", "interval", "params"],
+          "properties": {
+            "type": { "const": "subscribe" },
+            "symbol": { "type": "string", "minLength": 1 },
+            "interval": { "type": "string", "enum": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] },
+            "params": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "unsubscribe": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "spec_version", "subscription_id"],
+          "properties": {
+            "type": { "const": "unsubscribe" }
+          }
+        }
+      ]
+    },
+    "reconfigure": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "spec_version", "subscription_id", "symbol", "interval", "new_params"],
+          "properties": {
+            "type": { "const": "reconfigure" },
+            "symbol": { "type": "string", "minLength": 1 },
+            "interval": { "type": "string", "enum": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] },
+            "new_params": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "data": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "spec_version", "subscription_id", "agent_id", "schema", "record"],
+          "properties": {
+            "type": { "const": "data" },
+            "schema": { "type": "string", "enum": ["ohlc", "line", "event", "band", "histogram", "forecast"] },
+            "record": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "heartbeat": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "spec_version", "subscription_id", "agent_id", "status", "uptime_s", "last_event_ts"],
+          "properties": {
+            "type": { "const": "heartbeat" },
+            "status": { "type": "string", "enum": ["ok", "degraded", "error"] },
+            "uptime_s": { "type": "integer", "minimum": 0 },
+            "last_event_ts": { "type": "string", "format": "date-time" }
+          }
+        }
+      ]
+    },
+    "error": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "spec_version", "subscription_id", "agent_id", "code", "message", "retryable"],
+          "properties": {
+            "type": { "const": "error" },
+            "code": {
+              "type": "string",
+              "enum": [
+                "INVALID_REQUEST",
+                "INVALID_SYMBOL",
+                "INVALID_INTERVAL",
+                "INVALID_PARAMS",
+                "UNSUPPORTED_OPERATION",
+                "SUBSCRIPTION_NOT_FOUND",
+                "AGENT_OVERLOADED",
+                "BACKFILL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": { "type": "string", "minLength": 1 },
+            "retryable": { "type": "boolean" },
+            "details": { "type": "object" }
+          }
+        }
+      ]
+    }
+  }
+}

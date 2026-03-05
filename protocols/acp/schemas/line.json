@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "acp/schemas/line.json",
+  "title": "ACP Line Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "ts", "value"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "ts": { "type": "string", "format": "date-time" },
+    "value": { "type": "number" }
+  }
+}

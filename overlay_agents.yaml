@@ -1,0 +1,16 @@
+# Overlay Agents Configuration
+# ACP-compliant agent definitions
+
+agents:
+  - spec_version: "ACP-0.1.0"
+    agent_url: "http://host.docker.internal:8010"
+    agent_id: "price_agent"
+    agent_name: "Price Data"
+    agent_version: "1.0.0"
+    description: "Live OHLCV candle data"
+    config_schema:
+      candle_type: "candlestick"
+      ticker: "follow_chart"
+      interval: "follow_chart"
+      show_volume: true
+    output_schema: "ohlc"
