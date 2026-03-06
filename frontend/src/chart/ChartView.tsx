@@ -1,12 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { createChart, IChartApi, ISeriesApi } from "lightweight-charts";
 import { MarketCandle } from "../types/events";
-import { fetchHistory, getTimeframeTimestamps } from "../history/fetchHistory";
 import type { OHLCBar } from "../history/fetchHistory";
 import { formatEasternChartTime, formatEasternDateTime } from "../utils/time";
 
 interface ChartViewProps {
   onCandleReceived: (handler: (candle: MarketCandle) => void) => void;
+  onSnapshotRequested: (handler: (bars: OHLCBar[]) => void) => void;
   selectedSymbol: string;
   selectedInterval?: string;
   selectedTimeframe?: number;
@@ -55,7 +55,8 @@ function normalizeHistoryBars(bars: OHLCBar[]): OHLCBar[] {
 }
 
 export function ChartView({ 
-  onCandleReceived, 
+  onCandleReceived,
+  onSnapshotRequested,
   selectedSymbol, 
   selectedInterval = "1m",
   selectedTimeframe = 1,
@@ -67,136 +68,135 @@ export function ChartView({
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<any> | null>(null);
-  const historyRequestIdRef = useRef(0);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [selectedCandleDetails, setSelectedCandleDetails] = useState<MarketCandle | null>(null);
   
   // Store candle data by timestamp for lookup
   const candleDataRef = useRef<Map<number, MarketCandle>>(new Map());
 
-  // Load historical data
+  // Handle snapshot data from backend
+  const handleSnapshot = useCallback((bars: OHLCBar[]) => {
+    console.log("[ChartView] Received snapshot with", bars.length, "bars");
+    
+    if (!seriesRef.current) {
+      console.warn("[ChartView] Series not ready for snapshot");
+      return;
+    }
+    
+    setIsLoadingHistory(true);
+    setHistoryError(null);
+    
+    try {
+      const normalizedBars = normalizeHistoryBars(bars);
+      
+      // Clear and rebuild candle data map
+      candleDataRef.current.clear();
+      
+      // Transform data based on chart type
+      let chartData: any[] = [];
+      
+      if (candleType === 'line' || candleType === 'area') {
+        // Line and area charts use close price as the value
+        chartData = normalizedBars
+          .map((bar) => {
+            const time = toUnixSeconds(bar.ts);
+            if (time === null) return null;
+            
+            // Store full candle data
+            candleDataRef.current.set(time, bar);
+            
+            return {
+              time,
+              value: bar.close,
+            };
+          })
+          .filter((bar): bar is { time: number; value: number } => bar !== null);
+      } else {
+        // Candlestick and bar charts use OHLC data
+        chartData = normalizedBars
+          .map((bar) => {
+            const time = toUnixSeconds(bar.ts);
+            if (time === null) return null;
+            
+            // Store full candle data
+            candleDataRef.current.set(time, bar);
+            
+            return {
+              time,
+              open: bar.open,
+              high: bar.high,
+              low: bar.low,
+              close: bar.close,
+            };
+          })
+          .filter(
+            (
+              bar
+            ): bar is {
+              time: number;
+              open: number;
+              high: number;
+              low: number;
+              close: number;
+            } => bar !== null
+          );
+      }
+      
+      seriesRef.current.setData(chartData);
+      
+      if (chartRef.current) {
+        chartRef.current.timeScale().fitContent();
+      }
+      
+      console.log("[ChartView] Chart populated with", chartData.length, "bars");
+    } catch (error) {
+      console.error("Failed to process snapshot:", error);
+      setHistoryError(error instanceof Error ? error.message : "Unknown error");
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }, [candleType]);
+  
+  // Register snapshot handler
   useEffect(() => {
-    const requestId = ++historyRequestIdRef.current;
-    let isMounted = true;
+    onSnapshotRequested(handleSnapshot);
+  }, [onSnapshotRequested, handleSnapshot]);
 
-    const loadHistory = async () => {
-      // Wait for series to be ready (with timeout)
+  // Wait for series to be ready, then indicate ready for snapshot
+  useEffect(() => {
+    let isMounted = true;
+    setIsLoadingHistory(true);
+    setHistoryError(null);
+    
+    const waitForSeries = async () => {
       const maxWaitMs = 5000;
       const startWait = Date.now();
       
       while (!seriesRef.current && isMounted && (Date.now() - startWait < maxWaitMs)) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
-
-      if (!isMounted || requestId !== historyRequestIdRef.current) {
-        return;
-      }
-
+      
+      if (!isMounted) return;
+      
       if (!seriesRef.current) {
-        console.error("[ChartView] Series not ready after timeout, cannot load history");
+        console.error("[ChartView] Series not ready after timeout");
         setHistoryError("Chart initialization timeout");
-        return;
-      }
-
-      setIsLoadingHistory(true);
-      setHistoryError(null);
-
-      try {
-        const { fromTs, toTs } = getTimeframeTimestamps(selectedTimeframe);
-        const historyData = await fetchHistory(selectedSymbol, fromTs, toTs, selectedInterval);
-
-        // Check if this request is still current and series still exists
-        if (!isMounted || requestId !== historyRequestIdRef.current) {
-          console.log("[ChartView] Stale history request, discarding");
-          return;
-        }
-
-        if (!seriesRef.current) {
-          console.warn("[ChartView] Series destroyed before history loaded");
-          setHistoryError("Chart was reset");
-          return;
-        }
-
-        const normalizedBars = normalizeHistoryBars(historyData.data);
-
-        // Clear and rebuild candle data map
-        candleDataRef.current.clear();
-
-        // Transform data based on chart type
-        let chartData: any[] = [];
-        
-        if (candleType === 'line' || candleType === 'area') {
-          // Line and area charts use close price as the value
-          chartData = normalizedBars
-            .map((bar) => {
-              const time = toUnixSeconds(bar.ts);
-              if (time === null) return null;
-
-              // Store full candle data
-              candleDataRef.current.set(time, bar);
-
-              return {
-                time,
-                value: bar.close,
-              };
-            })
-            .filter((bar): bar is { time: number; value: number } => bar !== null);
-        } else {
-          // Candlestick and bar charts use OHLC data
-          chartData = normalizedBars
-            .map((bar) => {
-              const time = toUnixSeconds(bar.ts);
-              if (time === null) return null;
-
-              // Store full candle data
-              candleDataRef.current.set(time, bar);
-
-              return {
-                time,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                close: bar.close,
-              };
-            })
-            .filter(
-              (
-                bar
-              ): bar is {
-                time: number;
-                open: number;
-                high: number;
-                low: number;
-                close: number;
-              } => bar !== null
-            );
-        }
-
-        seriesRef.current.setData(chartData);
-        
-        if (chartRef.current) {
-          chartRef.current.timeScale().fitContent();
-        }
-      } catch (error) {
-        if (!isMounted || requestId !== historyRequestIdRef.current) {
-          return;
-        }
-        console.error("Failed to load history:", error);
-        setHistoryError(error instanceof Error ? error.message : "Unknown error");
-      } finally {
-        if (isMounted && requestId === historyRequestIdRef.current) {
-          setIsLoadingHistory(false);
-        }
+        setIsLoadingHistory(false);
+      } else {
+        console.log("[ChartView] Chart series ready, waiting for snapshot...");
+        // isLoadingHistory stays true until snapshot arrives
       }
     };
-
-    loadHistory();
-
+    
+    waitForSeries();
+    
     return () => {
       isMounted = false;
     };
-  }, [selectedSymbol, selectedInterval, selectedTimeframe, candleType]);
+  }, [selectedSymbol, selectedInterval, selectedTimeframe]);
+
+  // Remove old history loading effect - now using snapshots via WebSocket
 
   useLayoutEffect(() => {
     if (!containerRef.current) return;
@@ -278,6 +278,8 @@ export function ChartView({
 
       const time = toUnixSeconds(candle.ts);
       if (time === null) return;
+
+      const hadNoCandles = candleDataRef.current.size === 0;
       
       // Store the candle data
       candleDataRef.current.set(time, candle);
@@ -296,6 +298,10 @@ export function ChartView({
           low: candle.low,
           close: candle.close,
         });
+      }
+
+      if (hadNoCandles && chartRef.current) {
+        chartRef.current.timeScale().fitContent();
       }
     };
 

@@ -1,0 +1,132 @@
+INFO:     Will watch for changes in these directories: ['/Users/ljewett/git/home/github/Odin/backend']
+INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+INFO:     Started reloader process [61335] using WatchFiles
+INFO:     Started server process [61338]
+INFO:     Waiting for application startup.
+2026-03-04 23:14:08,448 - app.main - INFO - 🚀 Odin backend starting...
+2026-03-04 23:14:08,448 - app.main - INFO - 📂 Loading agent configs from: /Users/ljewett/git/home/github/Odin/overlay_agents.yaml
+2026-03-04 23:14:08,449 - app.agent_manager - INFO - ✅ Loaded agent: Price Data (price_agent)
+2026-03-04 23:14:08,449 - app.agent_manager - INFO - 📋 Loaded 1 agent(s) from /Users/ljewett/git/home/github/Odin/overlay_agents.yaml
+2026-03-04 23:14:08,449 - app.main - INFO - 🔌 Connecting to agents...
+2026-03-04 23:14:08,451 - app.agent_manager - INFO - 🔌 Starting connections for 1 agents...
+2026-03-04 23:14:08,451 - app.agent_manager - INFO - 📡 Starting connection to price_agent at http://localhost:8010...
+2026-03-04 23:14:08,451 - app.agent_manager - INFO -    Attempting to connect and subscribe to SPY @ 1m...
+2026-03-04 23:14:08,451 - app.agent_connection - INFO - [price_agent] Connecting to ws://localhost:8010/ws/live...
+2026-03-04 23:14:08,463 - app.agent_connection - INFO - ✅ [price_agent] Connected to agent WebSocket
+2026-03-04 23:14:08,463 - app.agent_connection - INFO - 📊 [price_agent] Subscribed: SPY @ 1m (sub: price_agent:default)
+2026-03-04 23:14:08,463 - app.agent_manager - INFO - ✅ Successfully connected to price_agent
+2026-03-04 23:14:08,463 - app.agent_manager - INFO - 📊 Connection summary: 1 connections established
+2026-03-04 23:14:08,463 - app.main - INFO - 📡 WebSocket endpoint available at: ws://localhost:8001/ws
+INFO:     Application startup complete.
+INFO:     ('127.0.0.1', 59850) - "WebSocket /ws" [accepted]
+2026-03-04 23:14:09,198 - app.main - INFO - ✅ Client 4420597904 connected. Total connections: 1
+INFO:     connection open
+INFO:     ('127.0.0.1', 59852) - "WebSocket /ws" [accepted]
+2026-03-04 23:14:09,210 - app.main - INFO - ✅ Client 4420527392 connected. Total connections: 2
+INFO:     connection open
+2026-03-04 23:14:23,333 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:14:23,333 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:14:23,334 - app.agent_connection - INFO - [price_agent] ⬇️  Received data message from agent
+2026-03-04 23:14:23,334 - app.main - INFO - 📤 Broadcasting data from price_agent to 2 client(s)
+2026-03-04 23:14:24,363 - app.agent_connection - INFO - [price_agent] ⬇️  Received data message from agent
+2026-03-04 23:14:24,363 - app.main - INFO - 📤 Broadcasting data from price_agent to 2 client(s)
+2026-03-04 23:14:33,334 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:14:33,335 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+INFO:     ('127.0.0.1', 59864) - "WebSocket /ws" [accepted]
+2026-03-04 23:14:37,121 - app.main - INFO - ✅ Client 4421161840 connected. Total connections: 3
+INFO:     connection open
+2026-03-04 23:14:43,343 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:14:43,343 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:14:52,130 - app.main - INFO - ❌ Client 4421161840 disconnected. Total connections: 2
+INFO:     connection closed
+2026-03-04 23:14:53,344 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:14:53,344 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+INFO:     ('127.0.0.1', 59879) - "WebSocket /ws" [accepted]
+2026-03-04 23:15:00,268 - app.main - INFO - ✅ Client 4420057520 connected. Total connections: 3
+INFO:     connection open
+2026-03-04 23:15:03,346 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:15:03,346 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:15:13,348 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:15:13,348 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:15:23,350 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:15:23,351 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:15:33,351 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:15:33,352 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:15:43,352 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:15:43,353 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:15:53,353 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:15:53,353 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 3 client(s)
+2026-03-04 23:16:00,279 - app.main - INFO - ❌ Client 4420057520 disconnected. Total connections: 2
+INFO:     connection closed
+2026-03-04 23:16:03,357 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:16:03,357 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:16:13,359 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:16:13,359 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:16:23,361 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:16:23,361 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:16:33,362 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:16:33,362 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:16:43,363 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:16:43,364 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:16:53,365 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:16:53,365 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:17:03,350 - app.main - INFO - ❌ Client 4420597904 disconnected. Total connections: 1
+2026-03-04 23:17:03,351 - app.main - INFO - ❌ Client 4420527392 disconnected. Total connections: 0
+INFO:     connection closed
+INFO:     connection closed
+2026-03-04 23:17:03,365 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+INFO:     ('127.0.0.1', 59933) - "WebSocket /ws" [accepted]
+2026-03-04 23:17:03,432 - app.main - INFO - ✅ Client 4420965712 connected. Total connections: 1
+INFO:     127.0.0.1:59935 - "GET /api/agents HTTP/1.1" 200 OK
+INFO:     connection open
+INFO:     127.0.0.1:59935 - "GET /api/agents HTTP/1.1" 200 OK
+INFO:     ('127.0.0.1', 59939) - "WebSocket /ws" [accepted]
+2026-03-04 23:17:03,446 - app.main - INFO - ✅ Client 4421310400 connected. Total connections: 2
+INFO:     connection open
+2026-03-04 23:17:03,449 - app.main - INFO - ❌ Client 4420965712 disconnected. Total connections: 1
+INFO:     connection closed
+INFO:     ('127.0.0.1', 59941) - "WebSocket /ws" [accepted]
+2026-03-04 23:17:06,454 - app.main - INFO - ✅ Client 4420956272 connected. Total connections: 2
+INFO:     connection open
+2026-03-04 23:17:13,366 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:17:13,366 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:17:17,955 - app.main - INFO - ❌ Client 4421310400 disconnected. Total connections: 1
+2026-03-04 23:17:17,956 - app.main - INFO - ❌ Client 4420956272 disconnected. Total connections: 0
+INFO:     connection closed
+INFO:     connection closed
+INFO:     127.0.0.1:59937 - "GET /api/agents HTTP/1.1" 200 OK
+INFO:     ('127.0.0.1', 59961) - "WebSocket /ws" [accepted]
+2026-03-04 23:17:18,022 - app.main - INFO - ✅ Client 4419969360 connected. Total connections: 1
+INFO:     connection open
+INFO:     127.0.0.1:59937 - "GET /api/agents HTTP/1.1" 200 OK
+INFO:     ('127.0.0.1', 59964) - "WebSocket /ws" [accepted]
+2026-03-04 23:17:18,035 - app.main - INFO - ✅ Client 4421325184 connected. Total connections: 2
+INFO:     connection open
+2026-03-04 23:17:18,039 - app.main - INFO - ❌ Client 4419969360 disconnected. Total connections: 1
+INFO:     connection closed
+INFO:     ('127.0.0.1', 59966) - "WebSocket /ws" [accepted]
+2026-03-04 23:17:21,042 - app.main - INFO - ✅ Client 4421178448 connected. Total connections: 2
+INFO:     connection open
+2026-03-04 23:17:23,367 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:17:23,368 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:17:33,369 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:17:33,369 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:17:43,370 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:17:43,370 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+2026-03-04 23:17:53,371 - app.agent_connection - INFO - [price_agent] ⬇️  Received heartbeat message from agent
+2026-03-04 23:17:53,372 - app.main - INFO - 📤 Broadcasting heartbeat from price_agent to 2 client(s)
+INFO:     Shutting down
+2026-03-04 23:17:57,930 - app.main - INFO - ❌ Client 4421325184 disconnected. Total connections: 1
+2026-03-04 23:17:57,930 - app.main - INFO - ❌ Client 4421178448 disconnected. Total connections: 0
+INFO:     connection closed
+INFO:     connection closed
+INFO:     Waiting for application shutdown.
+2026-03-04 23:17:58,024 - app.main - INFO - 🛑 Stopping agent connections...
+2026-03-04 23:17:58,025 - app.agent_manager - INFO - Stopping connection to price_agent...
+2026-03-04 23:17:58,025 - app.agent_connection - INFO - 🚫 [price_agent] Unsubscribed: price_agent:default
+2026-03-04 23:17:58,032 - app.agent_connection - INFO - 🔌 [price_agent] Disconnected
+2026-03-04 23:17:58,032 - app.main - INFO - 🛑 Odin backend shutting down...
+2026-03-04 23:17:58,032 - app.agent_connection - WARNING - [price_agent] Connection closed by agent
+INFO:     Application shutdown complete.
+INFO:     Finished server process [61338]
+INFO:     Stopping reloader process [61335]

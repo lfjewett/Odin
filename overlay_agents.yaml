@@ -3,7 +3,7 @@
 
 agents:
   - spec_version: "ACP-0.1.0"
-    agent_url: "http://host.docker.internal:8010"
+    agent_url: "http://localhost:8010"
     agent_id: "price_agent"
     agent_name: "Price Data"
     agent_version: "1.0.0"

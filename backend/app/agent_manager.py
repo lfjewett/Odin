@@ -6,9 +6,10 @@ Handles loading agent configurations from YAML and managing agent lifecycle.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -22,6 +23,8 @@ class AgentManager:
     
     def __init__(self):
         self.agents: dict[str, Agent] = {}
+        self.connections: dict[str, Any] = {}  # agent_id -> AgentConnection
+        self.on_agent_message: Callable[[str, dict[str, Any]], Any] | None = None
     
     def load_from_yaml(self, yaml_path: str | Path) -> None:
         """Load agent configurations from YAML file"""
@@ -80,6 +83,64 @@ class AgentManager:
     def list_agents_for_frontend(self) -> list[dict[str, Any]]:
         """Get all agents in frontend-compatible format"""
         return [agent.to_frontend_format() for agent in self.agents.values()]
+    
+    def get_connection(self, agent_id: str) -> Any | None:
+        """Get agent connection by ID"""
+        return self.connections.get(agent_id)
+    
+    async def send_cached_snapshots_to_client(self, callback: Callable) -> None:
+        """Send all cached snapshots to a newly connected client"""
+        for agent_id, connection in self.connections.items():
+            if hasattr(connection, 'cached_snapshot') and connection.cached_snapshot:
+                logger.info(f"📸 Sending cached snapshot from {agent_id} to new client")
+                if inspect.iscoroutinefunction(callback):
+                    await callback(agent_id, connection.cached_snapshot)
+                else:
+                    callback(agent_id, connection.cached_snapshot)
+    
+    def add_connection(self, agent_id: str, connection: Any) -> None:
+        """Register an agent connection"""
+        self.connections[agent_id] = connection
+        logger.debug(f"Registered connection for agent: {agent_id}")
+    
+    def remove_connection(self, agent_id: str) -> None:
+        """Remove an agent connection"""
+        if agent_id in self.connections:
+            del self.connections[agent_id]
+            logger.debug(f"Removed connection for agent: {agent_id}")
+    
+    async def start_all_connections(self) -> None:
+        """Start WebSocket connections to all configured agents without subscribing to market streams."""
+        from app.agent_connection import AgentConnection
+        
+        logger.info(f"🔌 Starting connections for {len(self.agents)} agents...")
+        
+        for agent in self.agents.values():
+            if agent.config.output_schema == "ohlc":  # Only connect to price agents for now
+                logger.info(f"📡 Starting connection to {agent.agent_id} at {agent.config.agent_url}...")
+                
+                connection = AgentConnection(
+                    agent=agent,
+                    on_message=self.on_agent_message
+                )
+                
+                self.add_connection(agent.agent_id, connection)
+                
+                logger.info("   Attempting to connect (stream subscription deferred until frontend request)...")
+                success = await connection.start()
+                if success:
+                    logger.info(f"✅ Successfully connected to {agent.agent_id}")
+                else:
+                    logger.error(f"❌ Failed to connect to {agent.agent_id}")
+        
+        logger.info(f"📊 Connection summary: {len(self.connections)} connections established")
+    
+    async def stop_all_connections(self) -> None:
+        """Stop all agent connections"""
+        for agent_id, connection in list(self.connections.items()):
+            logger.info(f"Stopping connection to {agent_id}...")
+            await connection.stop()
+            self.remove_connection(agent_id)
 
 
 # Global agent manager instance

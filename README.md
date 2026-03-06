@@ -185,3 +185,4 @@ TBD
 ## Contact
 
 Questions or feedback? Open an issue or reach out to the team.
+    agent_url: "http://host.docker.internal:8010"

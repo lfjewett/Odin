@@ -5,11 +5,13 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
-import { useEventStream, CandleEvent, StatusUpdate } from "./stream/useEventStream";
+import { useEventStream, CandleEvent, StatusUpdate, SnapshotEvent } from "./stream/useEventStream";
 import { ChartView } from "./chart/ChartView";
 import { MarketCandle } from "./types/events";
+import type { OHLCBar } from "./history/fetchHistory";
 import { useAgentSubscriptions } from "./hooks/useAgentSubscriptions";
 import AgentConfigModal from "./components/AgentConfigModal";
 import { formatEasternTime24 } from "./utils/time";
@@ -52,9 +54,13 @@ export default function App() {
   const [candleHandler, setCandleHandler] = useState<
     ((candle: MarketCandle) => void) | null
   >(null);
+  const [snapshotHandler, setSnapshotHandler] = useState<
+    ((bars: OHLCBar[]) => void) | null
+  >(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
   const [clockNow, setClockNow] = useState(() => Date.now());
+  const lastSubscribeKeyRef = useRef<string | null>(null);
 
   const {
     subscriptions,
@@ -65,21 +71,56 @@ export default function App() {
 
   const selectedAgent = subscriptions?.find((a) => a.id === selectedAgentId) || null;
 
+  useEffect(() => {
+    if (!selectedAgentId && subscriptions && subscriptions.length > 0) {
+      const preferred =
+        subscriptions.find((agent) => agent.output_schema === "ohlc") || subscriptions[0];
+      setSelectedAgentId(preferred.id);
+    }
+  }, [selectedAgentId, subscriptions]);
+
   const handleStatusUpdate = useCallback((update: StatusUpdate) => {
     updateAgentStatus(update.agent_id, update.status, update.error_message);
   }, [updateAgentStatus]);
-
-  const { isConnected } = useEventStream((event: CandleEvent) => {
-    // Only process candles for the selected agent's subscription
-    if (selectedAgent && event.subscriptionId === selectedAgent.id) {
-      if (candleHandler) {
-        candleHandler(event.candle);
+  
+  const handleSnapshot = useCallback((event: SnapshotEvent) => {
+    const activeAgentId = selectedAgent?.id ?? selectedAgentId ?? null;
+    
+    // Only process snapshot if it's for the active agent
+    if (
+      activeAgentId &&
+      event.agentId === activeAgentId &&
+      event.symbol === selectedSymbol &&
+      event.interval === intervalInput
+    ) {
+      console.log(`[App] Received snapshot for ${event.agentId}:`, event.bars.length, "bars");
+      if (snapshotHandler) {
+        snapshotHandler(event.bars);
       }
-
-      setLastPrice(event.candle.close);
-      setLastEventTime(event.candle.ts);
     }
-  }, handleStatusUpdate);
+  }, [selectedAgent, selectedAgentId, selectedSymbol, intervalInput, snapshotHandler]);
+
+  const { isConnected, sendSubscribeRequest } = useEventStream(
+    (event: CandleEvent) => {
+      const activeAgentId = selectedAgent?.id ?? selectedAgentId ?? null;
+
+      // If no active selection exists yet, accept first incoming stream.
+      if (!activeAgentId || event.agentId === activeAgentId) {
+        if (!activeAgentId) {
+          setSelectedAgentId(event.agentId);
+        }
+
+        if (candleHandler) {
+          candleHandler(event.candle);
+        }
+
+        setLastPrice(event.candle.close);
+        setLastEventTime(event.candle.ts);
+      }
+    },
+    handleStatusUpdate,
+    handleSnapshot
+  );
 
   const handleCandleReceived = useCallback(
     (handler: (candle: MarketCandle) => void) => {
@@ -87,6 +128,55 @@ export default function App() {
     },
     []
   );
+  
+  const handleSnapshotRequested = useCallback(
+    (handler: (bars: OHLCBar[]) => void) => {
+      setSnapshotHandler(() => handler);
+    },
+    []
+  );
+
+  useEffect(() => {
+    const nextSymbol = tickerInput.trim().toUpperCase();
+    if (nextSymbol && nextSymbol !== selectedSymbol) {
+      setSelectedSymbol(nextSymbol);
+      setLastPrice(null);
+      setLastEventTime(null);
+    }
+  }, [tickerInput, selectedSymbol]);
+
+  useEffect(() => {
+    const agentId = selectedAgent?.id ?? selectedAgentId;
+    if (!agentId || !selectedSymbol) {
+      return;
+    }
+
+    const subscribeKey = `${agentId}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`;
+    if (lastSubscribeKeyRef.current === subscribeKey) {
+      return;
+    }
+
+    const sent = sendSubscribeRequest({
+      agentId,
+      symbol: selectedSymbol,
+      interval: intervalInput,
+      timeframeDays: selectedTimeframe,
+    });
+
+    if (sent) {
+      lastSubscribeKeyRef.current = subscribeKey;
+      console.log("[App] Resubscribe requested:", subscribeKey);
+    } else {
+      console.log("[App] Subscribe queued until socket is ready:", subscribeKey);
+    }
+  }, [
+    selectedAgent,
+    selectedAgentId,
+    selectedSymbol,
+    intervalInput,
+    selectedTimeframe,
+    sendSubscribeRequest,
+  ]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -232,7 +322,10 @@ export default function App() {
                     className={`watchlist-item ${
                       selectedSymbol === symbol ? "active" : ""
                     }`}
-                    onClick={() => setSelectedSymbol(symbol)}
+                    onClick={() => {
+                      setSelectedSymbol(symbol);
+                      setTickerInput(symbol);
+                    }}
                   >
                     {symbol}
                   </button>
@@ -339,7 +432,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.10</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.15</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
@@ -402,6 +495,20 @@ export default function App() {
                     className="ticker-input"
                     value={tickerInput}
                     onChange={(e) => setTickerInput(e.target.value.toUpperCase())}
+                    onBlur={() => {
+                      const nextSymbol = tickerInput.trim().toUpperCase();
+                      if (nextSymbol) {
+                        setSelectedSymbol(nextSymbol);
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        const nextSymbol = tickerInput.trim().toUpperCase();
+                        if (nextSymbol) {
+                          setSelectedSymbol(nextSymbol);
+                        }
+                      }
+                    }}
                     placeholder="SPY"
                     maxLength={5}
                   />
@@ -443,7 +550,8 @@ export default function App() {
             </div>
             <div className="chart-container">
               <ChartView 
-                onCandleReceived={handleCandleReceived} 
+                onCandleReceived={handleCandleReceived}
+                onSnapshotRequested={handleSnapshotRequested}
                 selectedSymbol={selectedSymbol}
                 selectedInterval={intervalInput}
                 selectedTimeframe={selectedTimeframe}

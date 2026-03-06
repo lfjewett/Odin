@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { MarketCandle } from "../types/events";
+import type { OHLCBar } from "../history/fetchHistory";
 
 interface UseEventStreamOptions {
   wsUrl?: string;
@@ -19,9 +20,25 @@ export interface StatusUpdate {
   timestamp: string;
 }
 
+export interface SnapshotEvent {
+  agentId: string;
+  subscriptionId: string;
+  symbol: string;
+  interval: string;
+  bars: OHLCBar[];
+}
+
+export interface SubscribeRequest {
+  agentId: string;
+  symbol: string;
+  interval: string;
+  timeframeDays: number;
+}
+
 export function useEventStream(
   onEvent: (event: CandleEvent) => void,
   onStatusUpdate?: (update: StatusUpdate) => void,
+  onSnapshot?: (event: SnapshotEvent) => void,
   options: UseEventStreamOptions = {}
 ) {
   const {
@@ -32,9 +49,29 @@ export function useEventStream(
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSubscribeRef = useRef<SubscribeRequest | null>(null);
   const onEventRef = useRef(onEvent);
   const onStatusUpdateRef = useRef(onStatusUpdate);
-  const mockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const onSnapshotRef = useRef(onSnapshot);
+
+  const sendSubscribePayload = useCallback((request: SubscribeRequest): boolean => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    const payload = {
+      type: "subscribe_request",
+      agent_id: request.agentId,
+      symbol: request.symbol,
+      interval: request.interval,
+      timeframe_days: request.timeframeDays,
+    };
+
+    ws.send(JSON.stringify(payload));
+    console.log("[WebSocket] Sent subscribe_request:", payload);
+    return true;
+  }, []);
 
   useEffect(() => {
     onEventRef.current = onEvent;
@@ -43,49 +80,10 @@ export function useEventStream(
   useEffect(() => {
     onStatusUpdateRef.current = onStatusUpdate;
   }, [onStatusUpdate]);
-
-  const startMockData = useCallback(() => {
-    // Generate mock candle data until we have real agent streams
-    let currentTs = Date.now();
-    let price = 145;
-    let rev = 0;
-
-    mockTimerRef.current = setInterval(() => {
-      currentTs += 60_000;
-      rev += 1;
-
-      const open = price;
-      const close = Math.max(1, open + Math.sin(rev / 5) * 0.8 + Math.cos(rev / 7) * 0.3);
-      const high = Math.max(open, close) + 0.4;
-      const low = Math.min(open, close) - 0.4;
-
-      price = close;
-
-      onEventRef.current({
-        subscriptionId: "price_agent",
-        agentId: "price_agent",
-        candle: {
-          id: `live-${currentTs}`,
-          ts: new Date(currentTs).toISOString(),
-          open: Number(open.toFixed(2)),
-          high: Number(high.toFixed(2)),
-          low: Number(low.toFixed(2)),
-          close: Number(close.toFixed(2)),
-          volume: 10_000 + (rev % 2000),
-          rev,
-          bar_state: "partial",
-          seq: rev,
-        },
-      });
-    }, 2_000);
-  }, []);
-
-  const stopMockData = useCallback(() => {
-    if (mockTimerRef.current) {
-      clearInterval(mockTimerRef.current);
-      mockTimerRef.current = null;
-    }
-  }, []);
+  
+  useEffect(() => {
+    onSnapshotRef.current = onSnapshot;
+  }, [onSnapshot]);
 
   const connect = useCallback(() => {
     console.log(`[WebSocket] Connecting to ${wsUrl}...`);
@@ -97,9 +95,13 @@ export function useEventStream(
       ws.onopen = () => {
         console.log("[WebSocket] Connected successfully");
         setIsConnected(true);
-        
-        // Start mock data generation (until we have real agents)
-        startMockData();
+
+        if (pendingSubscribeRef.current) {
+          const flushed = sendSubscribePayload(pendingSubscribeRef.current);
+          if (flushed) {
+            console.log("[WebSocket] Flushed pending subscribe_request on connect");
+          }
+        }
       };
 
       ws.onmessage = (event) => {
@@ -112,9 +114,11 @@ export function useEventStream(
             case "connection":
               console.log("[WebSocket] Connection confirmed:", message.message);
               break;
+            
             case "heartbeat":
               console.log("[WebSocket] Heartbeat received");
               break;
+            
             case "agent_status_update":
               console.log("[WebSocket] Agent status update:", message.agent_id, message.status);
               if (onStatusUpdateRef.current) {
@@ -126,6 +130,47 @@ export function useEventStream(
                 });
               }
               break;
+            
+            case "data":
+              // ACP data message
+              console.log("[WebSocket] ACP data message:", message.agent_id, message.subscription_id);
+              if (message.schema === "ohlc" && message.record) {
+                // Forward OHLC candle to callback
+                onEventRef.current({
+                  subscriptionId: message.subscription_id,
+                  agentId: message.agent_id,
+                  candle: message.record as MarketCandle,
+                });
+              }
+              break;
+            
+            case "snapshot":
+              // Historical data snapshot
+              console.log("[WebSocket] Snapshot received:", message.agent_id, message.count || 0, "bars");
+              if (onSnapshotRef.current && message.bars) {
+                onSnapshotRef.current({
+                  agentId: message.agent_id,
+                  subscriptionId: message.subscription_id,
+                  symbol: message.symbol,
+                  interval: message.interval,
+                  bars: message.bars,
+                });
+              }
+              break;
+            
+            case "error":
+              // ACP error message
+              console.error("[WebSocket] ACP error:", message.code, message.message);
+              if (onStatusUpdateRef.current) {
+                onStatusUpdateRef.current({
+                  agent_id: message.agent_id,
+                  status: "error",
+                  error_message: `${message.code}: ${message.message}`,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+              break;
+            
             default:
               console.log("[WebSocket] Unknown message type:", message.type);
           }
@@ -141,7 +186,6 @@ export function useEventStream(
       ws.onclose = (event) => {
         console.log(`[WebSocket] Disconnected (code: ${event.code}, reason: ${event.reason})`);
         setIsConnected(false);
-        stopMockData();
         wsRef.current = null;
 
         // Attempt to reconnect after delay
@@ -158,7 +202,7 @@ export function useEventStream(
       console.error("[WebSocket] Failed to create connection:", err);
       setIsConnected(false);
     }
-  }, [wsUrl, reconnectDelay, startMockData, stopMockData]);
+    }, [wsUrl, reconnectDelay]);
 
   useEffect(() => {
     connect();
@@ -171,14 +215,17 @@ export function useEventStream(
         reconnectTimeoutRef.current = null;
       }
       
-      stopMockData();
-      
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
       }
     };
-  }, [connect, stopMockData]);
+  }, [connect]);
 
-  return { isConnected };
+  const sendSubscribeRequest = useCallback((request: SubscribeRequest): boolean => {
+    pendingSubscribeRef.current = request;
+    return sendSubscribePayload(request);
+  }, [sendSubscribePayload]);
+
+  return { isConnected, sendSubscribeRequest };
 }
