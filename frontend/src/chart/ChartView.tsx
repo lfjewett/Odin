@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import { createChart, IChartApi, ISeriesApi } from "lightweight-charts";
+import { createChart, IChartApi, ISeriesApi, Time } from "lightweight-charts";
 import { MarketCandle } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
 import { formatEasternChartTime, formatEasternDateTime } from "../utils/time";
@@ -30,6 +30,39 @@ function toUnixSeconds(ts: string): number | null {
   }
 
   return Math.floor(millis / 1000);
+}
+
+const EASTERN_TIME_ZONE = "America/New_York";
+
+const easternAxisTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: EASTERN_TIME_ZONE,
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+const easternAxisDateFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: EASTERN_TIME_ZONE,
+  month: "2-digit",
+  day: "2-digit",
+  hour12: false,
+});
+
+function formatEasternAxisTick(time: Time): string {
+  if (typeof time === "number") {
+    return easternAxisTimeFormatter.format(new Date(time * 1000));
+  }
+
+  if (typeof time === "string") {
+    const date = new Date(`${time}T00:00:00Z`);
+    if (Number.isNaN(date.getTime())) {
+      return "";
+    }
+    return easternAxisDateFormatter.format(date);
+  }
+
+  const date = new Date(Date.UTC(time.year, time.month - 1, time.day));
+  return easternAxisDateFormatter.format(date);
 }
 
 function normalizeHistoryBars(bars: OHLCBar[]): OHLCBar[] {
@@ -227,6 +260,7 @@ export function ChartView({
         rightOffset: 8,
         barSpacing: 7,
         minBarSpacing: 2,
+        tickMarkFormatter: (time: Time) => formatEasternAxisTick(time),
       },
       rightPriceScale: {
         borderColor: chartGrid,

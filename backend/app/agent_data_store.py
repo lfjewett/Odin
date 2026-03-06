@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -60,7 +60,7 @@ class AgentDataStore:
             return 1
 
     def update_heartbeat(self, last_event_ts: str | None = None) -> None:
-        self.last_heartbeat_ts = datetime.now(UTC).isoformat()
+        self.last_heartbeat_ts = datetime.now(timezone.utc).isoformat()
         if last_event_ts:
             self.last_event_ts = last_event_ts
 

@@ -37,22 +37,28 @@ function toValidDate(input: string | number | Date): Date | null {
 export function formatEasternDateTime(input: string | number | Date): string {
   const date = toValidDate(input);
   if (!date) return "—";
-  // Display as ISO-8601 UTC per SDS requirements
-  return `${date.toISOString().replace('T', ' ').replace('Z', '')} (UTC)`;
+  const parts = easternDateTimeFormatter
+    .formatToParts(date)
+    .reduce<Record<string, string>>((acc, part) => {
+      if (part.type !== "literal") {
+        acc[part.type] = part.value;
+      }
+      return acc;
+    }, {});
+
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (ET)`;
 }
 
 export function formatEasternTime24(input: string | number | Date): string {
   const date = toValidDate(input);
   if (!date) return "—";
-  // Display as UTC per SDS requirements instead of Eastern time
-  const isoString = date.toISOString().slice(11, 19);
-  return `${isoString} (UTC)`;
+
+  return `${easternTime24Formatter.format(date)} (ET)`;
 }
 
 export function formatEasternChartTime(unixSeconds: number): string {
   const date = toValidDate(unixSeconds * 1000);
   if (!date) return "—";
-  // Format as ISO-8601 UTC without the 'Z' suffix for cleaner display
-  const isoString = date.toISOString().slice(0, 19).replace('T', ' ');
-  return `${isoString} (UTC)`;
+
+  return `${easternChartFormatter.format(date)} (ET)`;
 }

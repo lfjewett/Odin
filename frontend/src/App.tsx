@@ -432,7 +432,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.15</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.17</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">

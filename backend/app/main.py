@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Set
@@ -85,7 +85,7 @@ async def root():
         "service": "odin-backend",
         "version": "0.1.0",
         "status": "running",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -96,7 +96,7 @@ async def health():
         "status": "healthy",
         "active_connections": len(active_connections),
         "agents_loaded": len(agent_manager.list_agents()),
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -141,7 +141,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_json({
             "type": "connection",
             "status": "connected",
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "message": "Connected to Odin backend"
         })
         
@@ -230,7 +230,7 @@ async def send_heartbeats(websocket: WebSocket):
             await asyncio.sleep(10)  # Heartbeat every 10 seconds
             await websocket.send_json({
                 "type": "heartbeat",
-                "timestamp": datetime.now(UTC).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             logger.debug(f"💓 Heartbeat sent to client {id(websocket)}")
         except Exception as e:
@@ -256,7 +256,7 @@ async def broadcast_agent_message(agent_id: str, message: dict) -> None:
         agent = agent_manager.get_agent(agent_id)
         if agent:
             agent.status.status = "online"
-            agent.status.last_activity_ts = datetime.now(UTC).isoformat()
+            agent.status.last_activity_ts = datetime.now(timezone.utc).isoformat()
             agent.status.error_message = None
         
         # Send agent status update to frontend
@@ -265,7 +265,7 @@ async def broadcast_agent_message(agent_id: str, message: dict) -> None:
             "agent_id": agent_id,
             "status": "online",
             "error_message": None,
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
         disconnected = set()

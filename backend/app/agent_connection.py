@@ -10,7 +10,7 @@ import asyncio
 import inspect
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import httpx
@@ -58,6 +58,11 @@ class AgentConnection:
     def http_base_url(self) -> str:
         """Get HTTP base URL for REST API calls"""
         return self.agent.config.agent_url
+
+    @staticmethod
+    def _format_history_timestamp(value: datetime) -> str:
+        """Format timestamps for agent /history queries as UTC ISO-8601 with Z suffix."""
+        return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     
     async def connect(self) -> bool:
         """Establish WebSocket connection to agent"""
@@ -211,10 +216,10 @@ class AgentConnection:
             # Fetch and ingest historical data if timeframe_days is specified
             timeframe_days = normalized_params.get("timeframe_days", 7)
             if timeframe_days and timeframe_days > 0:
-                # Calculate time range
-                now = datetime.now(UTC)
-                from_ts = (now - timedelta(days=timeframe_days)).isoformat()
-                to_ts = now.isoformat()
+                # Calculate time range (explicitly use UTC to avoid timezone interpretation issues)
+                now = datetime.now(timezone.utc)
+                from_ts = self._format_history_timestamp(now - timedelta(days=timeframe_days))
+                to_ts = self._format_history_timestamp(now)
                 
                 # Update data store maxlen based on timeframe and interval
                 self.data_store.update_retention(timeframe_days, interval)

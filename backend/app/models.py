@@ -4,7 +4,7 @@ Data models for Odin backend
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -35,8 +35,8 @@ class Agent(BaseModel):
     """Complete agent representation with config and status"""
     config: AgentConfig
     status: AgentStatus
-    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     
     @property
     def agent_id(self) -> str:
