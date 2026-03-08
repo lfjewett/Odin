@@ -4,8 +4,10 @@ Data models for Odin backend
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Literal
+import uuid
 
 from pydantic import BaseModel, Field
 
@@ -65,3 +67,155 @@ class Agent(BaseModel):
             "agent_version": self.config.agent_version,
             "description": self.config.description,
         }
+
+# ============================================================================
+# ACP v0.2.0 Session & Sequence Management
+# ============================================================================
+
+
+class SequenceTracker:
+    """Tracks sequence numbers and detects gaps for a session"""
+    
+    def __init__(self):
+        self.last_seq_received: int | None = None
+    
+    def update(self, seq: int) -> tuple[bool, int | None]:
+        """
+        Update with new sequence number. Returns (has_gap, gap_start).
+        
+        Returns:
+            (has_gap, gap_start):
+                - has_gap: True if gap detected
+                - gap_start: First missing seq number (None if no gap)
+        """
+        if self.last_seq_received is None:
+            self.last_seq_received = seq
+            return (False, None)
+        
+        expected = self.last_seq_received + 1
+        if seq < expected:
+            # Duplicate or out-of-order, ignore
+            return (False, None)
+        elif seq == expected:
+            # Normal progression
+            self.last_seq_received = seq
+            return (False, None)
+        else:
+            # Gap detected
+            gap_start = expected
+            self.last_seq_received = seq
+            return (True, gap_start)
+
+
+class ReplayBuffer:
+    """Fixed-size buffer for message replay on resync"""
+    
+    def __init__(self, max_size: int = 100):
+        self.buffer: deque[dict[str, Any]] = deque(maxlen=max_size)
+    
+    def append(self, message: dict[str, Any]) -> None:
+        """Add message to buffer"""
+        self.buffer.append(message)
+    
+    def get_messages_since(self, seq: int) -> list[dict[str, Any]]:
+        """Get all messages with sequence number > seq"""
+        return [msg for msg in self.buffer if msg.get("seq", 0) > seq]
+    
+    def clear(self) -> None:
+        """Clear the buffer"""
+        self.buffer.clear()
+
+
+class Session(BaseModel):
+    """ACP v0.2.0 Session: isolated chart view for a client"""
+    
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_id: str
+    agent_id: str
+    symbol: str
+    interval: str
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_activity_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    
+    # Runtime trackers (not serialized)
+    _sequence_tracker: SequenceTracker | None = None
+    _replay_buffer: ReplayBuffer | None = None
+    
+    def __init__(self, **data):
+        super().__init__(**data)
+        self._sequence_tracker = SequenceTracker()
+        self._replay_buffer = ReplayBuffer(max_size=100)
+    
+    @property
+    def sequence_tracker(self) -> SequenceTracker:
+        if self._sequence_tracker is None:
+            self._sequence_tracker = SequenceTracker()
+        return self._sequence_tracker
+    
+    @property
+    def replay_buffer(self) -> ReplayBuffer:
+        if self._replay_buffer is None:
+            self._replay_buffer = ReplayBuffer(max_size=100)
+        return self._replay_buffer
+    
+    def update_activity(self) -> None:
+        """Update last activity timestamp"""
+        self.last_activity_at = datetime.now(timezone.utc).isoformat()
+
+
+class SessionManager:
+    """Manages session lifecycle"""
+    
+    def __init__(self):
+        self._sessions: dict[str, Session] = {}  # session_id -> Session
+        self._client_sessions: dict[str, list[str]] = {}  # client_id -> [session_ids]
+    
+    def create_session(self, client_id: str, agent_id: str, symbol: str, interval: str) -> Session:
+        """Create a new session for a client"""
+        session = Session(client_id=client_id, agent_id=agent_id, symbol=symbol, interval=interval)
+        self._sessions[session.session_id] = session
+        
+        if client_id not in self._client_sessions:
+            self._client_sessions[client_id] = []
+        self._client_sessions[client_id].append(session.session_id)
+        
+        return session
+    
+    def get_session(self, session_id: str) -> Session | None:
+        """Retrieve a session by ID"""
+        return self._sessions.get(session_id)
+    
+    def get_client_sessions(self, client_id: str) -> list[Session]:
+        """Retrieve all sessions for a client"""
+        session_ids = self._client_sessions.get(client_id, [])
+        return [self._sessions[sid] for sid in session_ids if sid in self._sessions]
+    
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and clean up client index"""
+        if session_id not in self._sessions:
+            return False
+        
+        session = self._sessions.pop(session_id)
+        
+        if session.client_id in self._client_sessions:
+            self._client_sessions[session.client_id].remove(session_id)
+            if not self._client_sessions[session.client_id]:
+                del self._client_sessions[session.client_id]
+        
+        return True
+    
+    def cleanup_client(self, client_id: str) -> list[str]:
+        """Delete all sessions for a client and return deleted session IDs"""
+        session_ids = self._client_sessions.pop(client_id, [])
+        deleted = []
+        
+        for session_id in session_ids:
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+                deleted.append(session_id)
+        
+        return deleted
+    
+    def list_all_sessions(self) -> list[Session]:
+        """List all active sessions"""
+        return list(self._sessions.values())

@@ -11,12 +11,13 @@ Required read order before any code changes:
 2. schemas/messages.json
 3. schemas/metadata.json
 4. schemas/ohlc.json
-5. schemas/line.json
-6. schemas/event.json
-7. schemas/band.json
-8. schemas/histogram.json
-9. schemas/forecast.json
-10. version/current.txt
+5. schemas/session.json
+6. schemas/line.json
+7. schemas/event.json
+8. schemas/band.json
+9. schemas/histogram.json
+10. schemas/forecast.json
+11. version/current.txt
 
 If there is any conflict between implementation code and ACP docs/schemas, ACP docs/schemas win.
 
@@ -25,19 +26,22 @@ If there is any conflict between implementation code and ACP docs/schemas, ACP d
 - spec_version must equal the value in version/current.txt
 - Subscription interval must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d
 - Subscriptions are single-symbol only
-- No auth/discovery assumptions for ACP-0.1.0
+- No auth/discovery assumptions for ACP-0.2.0
 - Transport model:
   - REST /metadata endpoint for agent configuration discovery
-  - REST /history endpoint for backfill
-  - WebSocket for live data (not polled)
+  - REST /history endpoint for backfill snapshots (with mutable candle status/revision)
+  - WebSocket for live data and bidirectional session traffic (not polled)
 - Delivery semantics: at-least-once
 - Dedup semantics:
   - non-OHLC: (agent_id, id)
   - OHLC: (agent_id, id, rev)
 - OHLC stream semantics:
   - emit partial updates for open bar (bar_state=partial)
-  - emit terminal final update (bar_state=final)
+  - emit stream close as provisional_close (bar_state=provisional_close)
+  - emit reconciliation updates as session_reconciled when backend confirms/polls REST state
+  - emit final only when backend finalization policy marks a bar terminal
   - rev must be monotonic per bar id
+  - session_id is required on ACP-0.2.0 WebSocket protocol messages
 
 ## Required Output Contract For Agents
 
@@ -61,7 +65,7 @@ Do not merge protocol-divergent implementation changes without corresponding ACP
 
 - Do not invent new protocol fields unless explicitly requested and versioned.
 - Do not expand interval enum unless explicitly approved.
-- Do not switch OHLC semantics away from partial/final + rev without a protocol change.
+- Do not switch OHLC semantics away from partial/provisional_close/session_reconciled/final + rev without a protocol change.
 - If a task conflicts with ACP, stop and present:
   - ACP-compliant option
   - versioned protocol-change option

@@ -9,7 +9,7 @@ interface UseEventStreamOptions {
 
 export interface CandleEvent {
   candle: MarketCandle;
-  subscriptionId: string;
+  sessionId: string;
   agentId: string;
 }
 
@@ -21,20 +21,30 @@ export interface StatusUpdate {
 }
 
 export interface SnapshotEvent {
+  sessionId: string;
   agentId: string;
-  subscriptionId: string;
   symbol: string;
   interval: string;
   bars: OHLCBar[];
 }
 
 export interface SubscribeRequest {
+  sessionId: string;
   agentId: string;
   symbol: string;
   interval: string;
   timeframeDays: number;
 }
 
+/**
+ * ACP v0.2.0 WebSocket hook for frontend market data streaming
+ * 
+ * Manages:
+ * - Session-aware subscriptions (session_id per chart/view)
+ * - Sequence tracking for gap detection
+ * - Automatic resync requests on message loss
+ * - Bidirectional communication with backend
+ */
 export function useEventStream(
   onEvent: (event: CandleEvent) => void,
   onStatusUpdate?: (update: StatusUpdate) => void,
@@ -42,14 +52,25 @@ export function useEventStream(
   options: UseEventStreamOptions = {}
 ) {
   const {
-    wsUrl = "ws://localhost:8001/ws",
+    wsUrl = (() => {
+      // Use relative WebSocket path that works in both dev (via Vite proxy) and production
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host; // includes port
+      return `${protocol}//${host}/ws`;
+    })(),
     reconnectDelay = 3000,
   } = options;
 
   const [isConnected, setIsConnected] = useState(false);
+  const [clientId, setClientId] = useState<string | null>(null);
+  
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSubscribeRef = useRef<SubscribeRequest | null>(null);
+  
+  // Sequence tracking for gap detection
+  const lastSeqBySessionRef = useRef<Map<string, number>>(new Map()); // sessionId -> last_seq
+  
   const onEventRef = useRef(onEvent);
   const onStatusUpdateRef = useRef(onStatusUpdate);
   const onSnapshotRef = useRef(onSnapshot);
@@ -57,11 +78,13 @@ export function useEventStream(
   const sendSubscribePayload = useCallback((request: SubscribeRequest): boolean => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn("[WebSocket] Cannot subscribe: not connected");
       return false;
     }
 
     const payload = {
       type: "subscribe_request",
+      session_id: request.sessionId,
       agent_id: request.agentId,
       symbol: request.symbol,
       interval: request.interval,
@@ -71,6 +94,23 @@ export function useEventStream(
     ws.send(JSON.stringify(payload));
     console.log("[WebSocket] Sent subscribe_request:", payload);
     return true;
+  }, []);
+
+  const sendResyncRequest = useCallback((sessionId: string, lastSeq: number): void => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn("[WebSocket] Cannot send resync: not connected");
+      return;
+    }
+
+    const payload = {
+      type: "resync_request",
+      session_id: sessionId,
+      last_seq_received: lastSeq,
+    };
+
+    ws.send(JSON.stringify(payload));
+    console.log("[WebSocket] Sent resync_request for session", sessionId, "since seq", lastSeq);
   }, []);
 
   useEffect(() => {
@@ -95,24 +135,29 @@ export function useEventStream(
       ws.onopen = () => {
         console.log("[WebSocket] Connected successfully");
         setIsConnected(true);
-
-        if (pendingSubscribeRef.current) {
-          const flushed = sendSubscribePayload(pendingSubscribeRef.current);
-          if (flushed) {
-            console.log("[WebSocket] Flushed pending subscribe_request on connect");
-          }
-        }
+        // clientId will be set when connection_ready is received
       };
 
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
-          console.log("[WebSocket] Received message:", message);
+          console.log("[WebSocket] Received message:", message.type);
           
-          // Handle different message types from backend
+          // Handle different message types from backend (ACP v0.2.0)
           switch (message.type) {
-            case "connection":
-              console.log("[WebSocket] Connection confirmed:", message.message);
+            case "connection_ready":
+              // Store client_id from backend for future use
+              console.log("[WebSocket] Connection ready, client_id:", message.client_id);
+              setClientId(message.client_id);
+              
+              // Flush pending subscribe if waiting
+              if (pendingSubscribeRef.current) {
+                const flushed = sendSubscribePayload(pendingSubscribeRef.current);
+                if (flushed) {
+                  console.log("[WebSocket] Flushed pending subscribe_request on connect");
+                  pendingSubscribeRef.current = null;
+                }
+              }
               break;
             
             case "heartbeat":
@@ -131,30 +176,86 @@ export function useEventStream(
               }
               break;
             
+            case "snapshot":
+              // Historical data snapshot (all canonical bars including in-flight states)
+              console.log("[WebSocket] Snapshot received:", message.session_id, message.count || 0, "bars");
+              if (onSnapshotRef.current && message.bars) {
+                onSnapshotRef.current({
+                  sessionId: message.session_id,
+                  agentId: message.agent_id,
+                  symbol: message.symbol,
+                  interval: message.interval,
+                  bars: message.bars,
+                });
+                
+                // Initialize sequence tracking for this session
+                lastSeqBySessionRef.current.set(message.session_id, message.count ? 0 : -1);
+              }
+              break;
+            
             case "data":
-              // ACP data message
-              console.log("[WebSocket] ACP data message:", message.agent_id, message.subscription_id);
+              // ACP data message (live updates)
+              console.log("[WebSocket] Data message:", message.session_id, message.schema);
+              
+              // Track sequence for gap detection
+              const sessionId = message.session_id;
+              if (message.seq !== undefined) {
+                const lastSeq = lastSeqBySessionRef.current.get(sessionId) ?? -1;
+                if (message.seq > lastSeq + 1) {
+                  // Gap detected!
+                  console.warn(`[WebSocket] Gap detected for session ${sessionId}: expected ${lastSeq + 1}, got ${message.seq}`);
+                  // Request resync from backend
+                  sendResyncRequest(sessionId, lastSeq);
+                }
+                lastSeqBySessionRef.current.set(sessionId, message.seq);
+              }
+              
               if (message.schema === "ohlc" && message.record) {
                 // Forward OHLC candle to callback
                 onEventRef.current({
-                  subscriptionId: message.subscription_id,
+                  sessionId: message.session_id,
                   agentId: message.agent_id,
                   candle: message.record as MarketCandle,
                 });
               }
               break;
             
-            case "snapshot":
-              // Historical data snapshot
-              console.log("[WebSocket] Snapshot received:", message.agent_id, message.count || 0, "bars");
-              if (onSnapshotRef.current && message.bars) {
-                onSnapshotRef.current({
+            case "candle_correction":
+              // Candle update with higher revision (upsert)
+              console.log("[WebSocket] Candle correction:", message.session_id, message.record?.id);
+              if (message.record) {
+                onEventRef.current({
+                  sessionId: message.session_id,
                   agentId: message.agent_id,
-                  subscriptionId: message.subscription_id,
-                  symbol: message.symbol,
-                  interval: message.interval,
-                  bars: message.bars,
+                  candle: message.record as MarketCandle,
                 });
+              }
+              break;
+            
+            case "resync_response":
+              // Replay buffer from backend after gap
+              console.log("[WebSocket] Resync response with", message.count, "messages");
+              if (message.messages && Array.isArray(message.messages)) {
+                for (const msg of message.messages) {
+                  // Re-process each message as if fresh
+                  if (msg.type === "data" && msg.schema === "ohlc" && msg.record) {
+                    onEventRef.current({
+                      sessionId: msg.session_id,
+                      agentId: msg.agent_id,
+                      candle: msg.record as MarketCandle,
+                    });
+                  } else if (msg.type === "candle_correction" && msg.record) {
+                    onEventRef.current({
+                      sessionId: msg.session_id,
+                      agentId: msg.agent_id,
+                      candle: msg.record as MarketCandle,
+                    });
+                  }
+                  // Update sequence tracking
+                  if (msg.seq !== undefined) {
+                    lastSeqBySessionRef.current.set(msg.session_id, msg.seq);
+                  }
+                }
               }
               break;
             
@@ -163,7 +264,7 @@ export function useEventStream(
               console.error("[WebSocket] ACP error:", message.code, message.message);
               if (onStatusUpdateRef.current) {
                 onStatusUpdateRef.current({
-                  agent_id: message.agent_id,
+                  agent_id: message.agent_id || "unknown",
                   status: "error",
                   error_message: `${message.code}: ${message.message}`,
                   timestamp: new Date().toISOString(),
@@ -172,7 +273,7 @@ export function useEventStream(
               break;
             
             default:
-              console.log("[WebSocket] Unknown message type:", message.type);
+              console.log("[WebSocket] Received message type:", message.type);
           }
         } catch (err) {
           console.error("[WebSocket] Failed to parse message:", err);
@@ -186,6 +287,7 @@ export function useEventStream(
       ws.onclose = (event) => {
         console.log(`[WebSocket] Disconnected (code: ${event.code}, reason: ${event.reason})`);
         setIsConnected(false);
+        setClientId(null);
         wsRef.current = null;
 
         // Attempt to reconnect after delay
@@ -202,7 +304,7 @@ export function useEventStream(
       console.error("[WebSocket] Failed to create connection:", err);
       setIsConnected(false);
     }
-    }, [wsUrl, reconnectDelay]);
+    }, [wsUrl, reconnectDelay, sendSubscribePayload]);
 
   useEffect(() => {
     connect();
@@ -223,9 +325,17 @@ export function useEventStream(
   }, [connect]);
 
   const sendSubscribeRequest = useCallback((request: SubscribeRequest): boolean => {
-    pendingSubscribeRef.current = request;
+    if (!isConnected) {
+      console.log("[WebSocket] Not connected yet, queuing subscribe_request");
+      pendingSubscribeRef.current = request;
+      return false;
+    }
+    
+    // Reset sequence tracking for new session
+    lastSeqBySessionRef.current.set(request.sessionId, -1);
+    
     return sendSubscribePayload(request);
-  }, [sendSubscribePayload]);
+  }, [isConnected, sendSubscribePayload]);
 
-  return { isConnected, sendSubscribeRequest };
+  return { isConnected, clientId, sendSubscribeRequest };
 }

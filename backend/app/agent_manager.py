@@ -110,28 +110,28 @@ class AgentManager:
             logger.debug(f"Removed connection for agent: {agent_id}")
     
     async def start_all_connections(self) -> None:
-        """Start WebSocket connections to all configured agents without subscribing to market streams."""
+        """Start WebSocket connections to all configured agents (ACP v0.2.0)."""
         from app.agent_connection import AgentConnection
         
         logger.info(f"🔌 Starting connections for {len(self.agents)} agents...")
         
         for agent in self.agents.values():
-            if agent.config.output_schema == "ohlc":  # Only connect to price agents for now
-                logger.info(f"📡 Starting connection to {agent.agent_id} at {agent.config.agent_url}...")
-                
-                connection = AgentConnection(
-                    agent=agent,
-                    on_message=self.on_agent_message
-                )
-                
-                self.add_connection(agent.agent_id, connection)
-                
-                logger.info("   Attempting to connect (stream subscription deferred until frontend request)...")
-                success = await connection.start()
-                if success:
-                    logger.info(f"✅ Successfully connected to {agent.agent_id}")
-                else:
-                    logger.error(f"❌ Failed to connect to {agent.agent_id}")
+            # ACP v0.2.0: Connect to all agents (price, overlay, event, etc.)
+            logger.info(f"📡 Starting connection to {agent.agent_id} at {agent.config.agent_url}...")
+            
+            connection = AgentConnection(
+                agent=agent,
+                on_message=self.on_agent_message
+            )
+            
+            self.add_connection(agent.agent_id, connection)
+            
+            logger.info("   Attempting to connect...")
+            success = await connection.start()
+            if success:
+                logger.info(f"✅ Successfully connected to {agent.agent_id}")
+            else:
+                logger.error(f"❌ Failed to connect to {agent.agent_id}")
         
         logger.info(f"📊 Connection summary: {len(self.connections)} connections established")
     

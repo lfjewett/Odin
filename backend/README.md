@@ -27,10 +27,10 @@ python -app/main.py
 Or use uvicorn directly:
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 ```
 
-The server will start on `http://localhost:8000`
+The server will start on `http://localhost:8001`
 
 ## Endpoints
 

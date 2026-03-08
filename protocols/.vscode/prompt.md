@@ -212,10 +212,10 @@ UI treats chart as:
 
 f(agents, params) => visualization
 11. Versioning
-Spec version: ACP-0.1.0
+Spec version: ACP-0.2.0
 Agents must declare supported spec version:
 {
-  "spec_version": "ACP-0.1.0"
+  "spec_version": "ACP-0.2.0"
 }
 
 Breaking changes require bump:

@@ -11,6 +11,7 @@ Before making any changes, read:
 - schemas/messages.json
 - schemas/metadata.json
 - schemas/ohlc.json
+- schemas/session.json
 - schemas/line.json
 - schemas/event.json
 - schemas/band.json
@@ -22,15 +23,16 @@ Then enforce these rules exactly:
 - spec_version equals version/current.txt
 - interval is one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d
 - subscriptions are single-symbol only
-- transport is REST backfill + WebSocket live stream
+- transport is REST backfill snapshots + WebSocket live/bidirectional stream
 - delivery is at-least-once
 - dedup is:
   - non-OHLC (agent_id,id)
   - OHLC (agent_id,id,rev)
-- OHLC supports real-time partial/final updates with:
-  - bar_state in {partial, final}
+- OHLC supports lifecycle updates with:
+  - bar_state in {partial, provisional_close, session_reconciled, final}
   - monotonic rev per bar id
-- no auth and no discovery assumptions for ACP-0.1.0
+- session_id required on ACP-0.2.0 WebSocket protocol messages
+- no auth and no discovery assumptions for ACP-0.2.0
 - do not introduce protocol fields outside ACP unless proposed as a versioned change
 
 For every protocol-related task response, include:

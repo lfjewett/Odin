@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import { createChart, IChartApi, ISeriesApi, Time } from "lightweight-charts";
+import { createChart, IChartApi, ISeriesApi, Time, ISeriesPrimitive, IPrimitivePaneView, IPrimitivePaneRenderer } from "lightweight-charts";
+import { CanvasRenderingTarget2D } from 'fancy-canvas';
 import { MarketCandle } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
 import { formatEasternChartTime, formatEasternDateTime } from "../utils/time";
@@ -63,6 +64,149 @@ function formatEasternAxisTick(time: Time): string {
 
   const date = new Date(Date.UTC(time.year, time.month - 1, time.day));
   return easternAxisDateFormatter.format(date);
+}
+
+function isExtendedHours(unixSeconds: number): boolean {
+  const date = new Date(unixSeconds * 1000);
+  const easternTime = new Date(date.toLocaleString("en-US", { timeZone: EASTERN_TIME_ZONE }));
+  const hours = easternTime.getHours();
+  const minutes = easternTime.getMinutes();
+  const totalMinutes = hours * 60 + minutes;
+  
+  // Market hours: 9:30 AM (570) to 4:00 PM (960)
+  const marketOpenMinutes = 9 * 60 + 30;
+  const marketCloseMinutes = 16 * 60;
+  
+  return totalMinutes < marketOpenMinutes || totalMinutes >= marketCloseMinutes;
+}
+
+// Extended Hours Shading Primitive
+class ExtendedHoursShadeRenderer implements IPrimitivePaneRenderer {
+  _chart: IChartApi;
+  _shadeColor: string = 'rgba(128, 128, 128, 0.08)';
+
+  constructor(chart: IChartApi) {
+    this._chart = chart;
+  }
+
+  draw(target: CanvasRenderingTarget2D) {
+    target.useBitmapCoordinateSpace((scope) => {
+      const ctx = scope.context;
+      const timeScale = this._chart.timeScale();
+      const visibleRange = timeScale.getVisibleRange();
+      
+      if (!visibleRange) return;
+
+      const startTime = visibleRange.from as number;
+      const endTime = visibleRange.to as number;
+      const chartHeight = scope.bitmapSize.height;
+
+      // Generate shade regions for visible date range
+      const startDate = new Date(startTime * 1000);
+      const endDate = new Date(endTime * 1000);
+      
+      let currentDate = new Date(startDate);
+      currentDate.setUTCHours(0, 0, 0, 0);
+
+      ctx.fillStyle = this._shadeColor;
+
+      while (currentDate <= endDate) {
+        // Pre-market: 00:00 - 09:30 EST
+        // UTC offset for EST: -5 hours from UTC
+        const preMarketStart = new Date(currentDate);
+        preMarketStart.setUTCHours(5, 0, 0, 0); // 00:00 EST
+        
+        const preMarketEnd = new Date(currentDate);
+        preMarketEnd.setUTCHours(14, 30, 0, 0); // 09:30 EST
+        
+        const preMarketStartUnix = Math.floor(preMarketStart.getTime() / 1000);
+        const preMarketEndUnix = Math.floor(preMarketEnd.getTime() / 1000);
+
+        // After-hours: 16:00 EST - 23:59 EST (21:00 UTC - 04:59 UTC next day)
+        const afterHoursStart = new Date(currentDate);
+        afterHoursStart.setUTCHours(21, 0, 0, 0); // 16:00 EST
+        
+        const afterHoursEnd = new Date(currentDate);
+        afterHoursEnd.setUTCDate(afterHoursEnd.getUTCDate() + 1);
+        afterHoursEnd.setUTCHours(5, 0, 0, 0); // 00:00 EST next day
+        
+        const afterHoursStartUnix = Math.floor(afterHoursStart.getTime() / 1000);
+        const afterHoursEndUnix = Math.floor(afterHoursEnd.getTime() / 1000);
+
+        // Draw pre-market
+        if (preMarketStartUnix < endTime && preMarketEndUnix > startTime) {
+          const x1 = timeScale.timeToCoordinate(Math.max(preMarketStartUnix, startTime));
+          const x2 = timeScale.timeToCoordinate(Math.min(preMarketEndUnix, endTime));
+          
+          if (x1 !== null && x2 !== null) {
+            const pixelX1 = Math.round(x1 * scope.horizontalPixelRatio);
+            const pixelX2 = Math.round(x2 * scope.horizontalPixelRatio);
+            const width = Math.max(1, pixelX2 - pixelX1);
+            if (width > 0 && pixelX1 >= -1000 && pixelX1 <= scope.bitmapSize.width + 1000) {
+              ctx.fillRect(pixelX1, 0, width, chartHeight);
+            }
+          }
+        }
+
+        // Draw after-hours
+        if (afterHoursStartUnix < endTime && afterHoursEndUnix > startTime) {
+          const x1 = timeScale.timeToCoordinate(Math.max(afterHoursStartUnix, startTime));
+          const x2 = timeScale.timeToCoordinate(Math.min(afterHoursEndUnix, endTime));
+          
+          if (x1 !== null && x2 !== null) {
+            const pixelX1 = Math.round(x1 * scope.horizontalPixelRatio);
+            const pixelX2 = Math.round(x2 * scope.horizontalPixelRatio);
+            const width = Math.max(1, pixelX2 - pixelX1);
+            if (width > 0 && pixelX1 >= -1000 && pixelX1 <= scope.bitmapSize.width + 1000) {
+              ctx.fillRect(pixelX1, 0, width, chartHeight);
+            }
+          }
+        }
+
+        currentDate.setUTCDate(currentDate.getUTCDate() + 1);
+      }
+    });
+  }
+}
+
+class ExtendedHoursShadePaneView implements IPrimitivePaneView {
+  _chart: IChartApi;
+  _renderer: ExtendedHoursShadeRenderer;
+
+  constructor(chart: IChartApi) {
+    this._chart = chart;
+    this._renderer = new ExtendedHoursShadeRenderer(chart);
+  }
+
+  update() {
+    // Update is called when chart changes
+  }
+
+  renderer() {
+    return this._renderer;
+  }
+}
+
+class ExtendedHoursShade implements ISeriesPrimitive<Time> {
+  _chart: IChartApi;
+  _paneView: ExtendedHoursShadePaneView;
+
+  constructor(chart: IChartApi) {
+    this._chart = chart;
+    this._paneView = new ExtendedHoursShadePaneView(chart);
+  }
+
+  updateAllViews() {
+    this._paneView.update();
+  }
+
+  paneViews() {
+    return [this._paneView];
+  }
+
+  timeAxisViews() {
+    return [];
+  }
 }
 
 function normalizeHistoryBars(bars: OHLCBar[]): OHLCBar[] {
@@ -280,11 +424,13 @@ export function ChartView({
       series = chart.addBarSeries({
         upColor: chartUp,
         downColor: chartDown,
+        priceLineVisible: false,
       });
     } else if (candleType === "line") {
       series = chart.addLineSeries({
         color: chartUp,
         lineWidth: 2,
+        priceLineVisible: false,
       });
     } else if (candleType === "area") {
       series = chart.addAreaSeries({
@@ -292,6 +438,7 @@ export function ChartView({
         bottomColor: `${chartUp}05`,
         lineColor: chartUp,
         lineWidth: 2,
+        priceLineVisible: false,
       });
     } else {
       // Default to candlestick
@@ -301,8 +448,13 @@ export function ChartView({
         borderVisible: true,
         wickUpColor: chartUp,
         wickDownColor: chartDown,
+        priceLineVisible: false,
       });
     }
+
+    // Attach extended hours shading primitive
+    const extendedHoursShade = new ExtendedHoursShade(chart);
+    series.attachPrimitive(extendedHoursShade);
 
     chartRef.current = chart;
     seriesRef.current = series;

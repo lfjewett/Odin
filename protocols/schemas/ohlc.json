@@ -4,12 +4,15 @@
   "title": "ACP OHLC Record",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "ts", "open", "high", "low", "close", "volume", "rev", "bar_state"],
+  "required": ["id", "seq", "ts", "open", "high", "low", "close", "volume", "rev", "bar_state"],
   "properties": {
     "id": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0 },
     "rev": { "type": "integer", "minimum": 0 },
-    "bar_state": { "type": "string", "enum": ["partial", "final"] },
+    "bar_state": {
+      "type": "string",
+      "enum": ["partial", "provisional_close", "session_reconciled", "final"]
+    },
     "ts": { "type": "string", "format": "date-time" },
     "open": { "type": "number" },
     "high": { "type": "number" },

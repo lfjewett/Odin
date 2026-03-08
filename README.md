@@ -8,15 +8,17 @@ A real-time, TradingView-inspired trading UI platform that unifies market candle
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m uvicorn app.main:app --reload
+python -m uvicorn app.main:app --reload --port 8001
 ```
 
-**Terminal 3: Frontend Build**
+**Terminal 3: Frontend Dev Server**
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
+
+The frontend dev server runs on **http://localhost:8000** and proxies WebSocket/API requests to the backend on port 8001.
 
 
 ## Features (Phase 2)
@@ -42,17 +44,25 @@ npm run dev
 ```
 ┌──────────────────┐
 │  Browser         │
-│  (React + Chart) │
+│  (React + Chart) │    Port 8000 (Vite dev server)
 └────────┬─────────┘
          │
-    WebSocket (/ws)
-         │
+    WebSocket (/ws) + API (/api)
+         │ (proxied by Vite)
          ▼
 ┌──────────────────────────┐
-│  FastAPI Backend         │
+│  FastAPI Backend         │    Port 8001
 │  - ACP client (/ws/live) │
 │  - WebSocket router      │
 │  - Static file serving   │
+└──────────┬───────────────┘
+           │
+      WebSocket (/ws/live)
+           │
+           ▼
+┌──────────────────────────┐
+│  Price Data Agent        │    Port 8010
+│  (ACP 0.2.0)             │
 └──────────────────────────┘
 ```
 
@@ -63,7 +73,7 @@ npm run dev
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m uvicorn app.main:app --reload --log-level info
+python -m uvicorn app.main:app --reload --port 8001 --log-level info
 ```
 
 Run tests:
@@ -78,6 +88,8 @@ cd frontend
 npm install
 npm run dev  # Start Vite dev server on http://localhost:8000
 ```
+
+The dev server proxies WebSocket (`/ws`) and API (`/api`) requests to the backend at `localhost:8001`.
 
 Build for production:
 ```bash
@@ -105,7 +117,7 @@ npm run build  # Output to dist/
 ## Health Check
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:8001/health
 ```
 
 Returns:
@@ -176,7 +188,7 @@ cd frontend && npm install && npm run dev
 ```
 
 ### WebSocket connection refused
-1. Verify backend is running: `curl http://localhost:8000/health`
+1. Verify backend is running: `curl http://localhost:8001/health`
 
 ## License
 

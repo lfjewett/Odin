@@ -19,13 +19,39 @@ import "./App.css";
 
 const WATCHLIST_SYMBOLS = ["SPY", "QQQ", "IWM"];
 
-const BOTS_PLACEHOLDER = [
-  { name: "Momentum Bot", status: "idle" },
-  { name: "Mean Reversion", status: "disabled" },
+const MOCK_TRADE_RETURNS = [
+  42, -36, 58, -22, 18, 64, -48, 29, -17, 53,
+  -11, 35, -62, 72, -28, 19, 44, -31, 67, -39,
+  24, -14, 39, -55, 71, -27, 15, 46, -33, 61,
+  -41, 22, 37, -18, 55, -29, 48, -34, 69, -26,
+  17, 41, -57, 75, -32, 21, 52, -37, 63, -24,
+  26, -19, 43, -61, 79, -35, 20, 50, -38, 66,
+  -25, 28, 40, -21, 57, -30, 49, -42, 73, -23,
+  30, -16, 45, -53, 68, -34, 23, 54, -40, 62,
+];
+
+const MOCK_EQUITY_CURVE = [
+  ...MOCK_TRADE_RETURNS.reduce<number[]>((curve, tradeReturn, index) => {
+    const previousValue = index === 0 ? 10000 : curve[index - 1];
+    curve.push(previousValue + tradeReturn);
+    return curve;
+  }, []),
+];
+
+const TOTAL_PL_VALUE = 18420;
+
+const TRADE_MANAGER_METRICS = [
+  { label: "Total Trades", value: "284" },
+  { label: "Win Rate", value: "62.7%" },
+  { label: "Max DD", value: "-$3,260" },
+  { label: "Sharpe Ratio", value: "1.84" },
+  { label: "Average Win", value: "+$210" },
+  { label: "Average Loss", value: "-$128" },
+  { label: "Max Loss", value: "-$740" },
 ];
 
 type PanelSide = "left" | "right";
-type WidgetId = "watchlist" | "overlayAgents" | "tradingBots";
+type WidgetId = "watchlist" | "overlayAgents" | "tradingBots" | "tradingBots2";
 
 interface WidgetState {
   id: WidgetId;
@@ -34,9 +60,10 @@ interface WidgetState {
 }
 
 const INITIAL_WIDGETS: WidgetState[] = [
+  { id: "tradingBots2", side: "left", height: 420 },
   { id: "watchlist", side: "left", height: 330 },
   { id: "overlayAgents", side: "right", height: 240 },
-  { id: "tradingBots", side: "right", height: 220 },
+  { id: "tradingBots", side: "right", height: 420 },
 ];
 
 export default function App() {
@@ -44,7 +71,7 @@ export default function App() {
   const [symbolSearch, setSymbolSearch] = useState("");
   const [tickerInput, setTickerInput] = useState("SPY");
   const [intervalInput, setIntervalInput] = useState("1m");
-  const [selectedTimeframe, setSelectedTimeframe] = useState(1); // days
+  const [selectedTimeframe, setSelectedTimeframe] = useState(7); // days
   const [isLeftCollapsed, setIsLeftCollapsed] = useState(false);
   const [isRightCollapsed, setIsRightCollapsed] = useState(false);
   const [lastPrice, setLastPrice] = useState<number | null>(null);
@@ -60,7 +87,17 @@ export default function App() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
   const [clockNow, setClockNow] = useState(() => Date.now());
+  const [isStrategyProfitable, setIsStrategyProfitable] = useState(true);
   const lastSubscribeKeyRef = useRef<string | null>(null);
+  
+  // Session management for ACP v0.2.0
+  const sessionIdRef = useRef<string | null>(null);
+  const getSessionId = useCallback(() => {
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
+    return sessionIdRef.current;
+  }, []);
 
   const {
     subscriptions,
@@ -72,12 +109,20 @@ export default function App() {
   const selectedAgent = subscriptions?.find((a) => a.id === selectedAgentId) || null;
 
   useEffect(() => {
+    console.log("[App] Agent selection effect triggered:", {
+      selectedAgentId,
+      subscriptions: subscriptions?.length,
+      subscriptionsLoading,
+      subscriptionsError
+    });
+    
     if (!selectedAgentId && subscriptions && subscriptions.length > 0) {
       const preferred =
         subscriptions.find((agent) => agent.output_schema === "ohlc") || subscriptions[0];
+      console.log("[App] Auto-selecting agent:", preferred.id);
       setSelectedAgentId(preferred.id);
     }
-  }, [selectedAgentId, subscriptions]);
+  }, [selectedAgentId, subscriptions, subscriptionsLoading, subscriptionsError]);
 
   const handleStatusUpdate = useCallback((update: StatusUpdate) => {
     updateAgentStatus(update.agent_id, update.status, update.error_message);
@@ -147,16 +192,27 @@ export default function App() {
 
   useEffect(() => {
     const agentId = selectedAgent?.id ?? selectedAgentId;
+    console.log("[App] Subscribe effect triggered:", {
+      agentId,
+      selectedSymbol,
+      intervalInput,
+      selectedTimeframe,
+      lastSubscribeKey: lastSubscribeKeyRef.current
+    });
+    
     if (!agentId || !selectedSymbol) {
+      console.log("[App] Subscribe skipped: missing agentId or symbol");
       return;
     }
 
     const subscribeKey = `${agentId}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`;
     if (lastSubscribeKeyRef.current === subscribeKey) {
+      console.log("[App] Subscribe skipped: same key as last subscribe");
       return;
     }
 
     const sent = sendSubscribeRequest({
+      sessionId: getSessionId(),
       agentId,
       symbol: selectedSymbol,
       interval: intervalInput,
@@ -367,24 +423,117 @@ export default function App() {
         );
       }
 
+      const sparklineWidth = 300;
+      const sparklineHeight = 54;
+      const minValue = Math.min(...MOCK_EQUITY_CURVE);
+      const maxValue = Math.max(...MOCK_EQUITY_CURVE);
+      const range = Math.max(1, maxValue - minValue);
+      const sparklinePoints = MOCK_EQUITY_CURVE.map((value, index) => {
+        const x = (index / (MOCK_EQUITY_CURVE.length - 1)) * sparklineWidth;
+        const y = sparklineHeight - ((value - minValue) / range) * sparklineHeight;
+        return `${x},${y}`;
+      }).join(" ");
+      const totalPlValue = isStrategyProfitable ? Math.abs(TOTAL_PL_VALUE) : -Math.abs(TOTAL_PL_VALUE);
+      const totalPlDisplay = `${totalPlValue >= 0 ? "+" : "-"}$${Math.abs(totalPlValue).toLocaleString()}`;
+      const tradeManagerMetrics = [
+        { label: "Total P/L", value: totalPlDisplay, tone: totalPlValue >= 0 ? "positive" : "negative" },
+        ...TRADE_MANAGER_METRICS.map((metric) => ({ ...metric, tone: "neutral" })),
+      ];
+      const isRightTradeManager = widget.id === "tradingBots";
+      const sparkBarWidth = sparklineWidth / MOCK_EQUITY_CURVE.length;
+      const sparkColorClass = totalPlValue >= 0 ? "positive" : "negative";
+
+      const profitToggle = (
+        <button
+          type="button"
+          className={`trade-manager-profit-toggle ${isStrategyProfitable ? "on" : "off"}`}
+          onClick={() => setIsStrategyProfitable((current) => !current)}
+          aria-label="Toggle profitable or unprofitable strategy view"
+        >
+          <span>Profitable</span>
+          <span>Unprofitable</span>
+        </button>
+      );
+
+      const isLeftTradeManager = widget.id === "tradingBots2";
+
       return (
-        <ul className="status-list">
-          {BOTS_PLACEHOLDER.map((bot) => (
-            <li key={bot.name}>
-              <span>{bot.name}</span>
-              <span className="muted-tag">{bot.status}</span>
-            </li>
-          ))}
-        </ul>
+        <article className={`trade-manager-content ${isRightTradeManager ? "trade-manager-content--right" : ""} ${isLeftTradeManager ? "trade-manager-content--left" : ""}`}>
+
+          <div
+            className={`trade-manager-sparkline-wrap ${isRightTradeManager ? "trade-manager-sparkline-wrap--compact" : ""}`}
+            aria-label="Equity curve mock"
+          >
+            <svg
+              viewBox={`0 0 ${sparklineWidth} ${sparklineHeight}`}
+              className={`trade-manager-sparkline ${isRightTradeManager ? `trade-manager-sparkline--bars ${sparkColorClass}` : ""}`}
+              role="img"
+            >
+              {isRightTradeManager ? (
+                MOCK_EQUITY_CURVE.map((value, index) => {
+                  const normalizedHeight = Math.max(2, ((value - minValue) / range) * sparklineHeight);
+                  return (
+                    <rect
+                      key={`spark-bar-${index}`}
+                      x={index * sparkBarWidth + 0.5}
+                      y={sparklineHeight - normalizedHeight}
+                      width={Math.max(1, sparkBarWidth - 1)}
+                      height={normalizedHeight}
+                      rx={0.8}
+                    />
+                  );
+                })
+              ) : (
+                <polyline fill="none" points={sparklinePoints} />
+              )}
+            </svg>
+          </div>
+
+          <div
+            className={`trade-manager-metrics-grid ${
+              isRightTradeManager ? "trade-manager-metrics-grid--single" : ""
+            } ${isLeftTradeManager ? "trade-manager-metrics-grid--left" : ""}`}
+          >
+            {tradeManagerMetrics.map((metric) => (
+              <div key={metric.label} className={`trade-manager-metric-item ${isLeftTradeManager ? "trade-manager-metric-item--left" : ""}`}>
+                <span className="trade-manager-metric-label">{metric.label}</span>
+                <strong
+                  className={`trade-manager-metric-value ${
+                    metric.tone === "positive"
+                      ? "positive"
+                      : metric.tone === "negative"
+                      ? "negative"
+                      : ""
+                  }`}
+                >
+                  {metric.value}
+                </strong>
+              </div>
+            ))}
+          </div>
+
+          {isRightTradeManager && <div className="trade-manager-toggle-bottom">{profitToggle}</div>}
+        </article>
       );
     },
-    [subscriptionsLoading, subscriptionsError, subscriptions, selectedAgentId, isAgentModalOpen, filteredWatchlist, selectedSymbol, symbolSearch]
+    [
+      subscriptionsLoading,
+      subscriptionsError,
+      subscriptions,
+      selectedAgentId,
+      isAgentModalOpen,
+      filteredWatchlist,
+      selectedSymbol,
+      symbolSearch,
+      isStrategyProfitable,
+    ]
   );
 
   const widgetTitle = (widgetId: WidgetId) => {
     if (widgetId === "watchlist") return "Watchlist";
     if (widgetId === "overlayAgents") return "Overlay Agents";
-    return "Trading Bots";
+    if (widgetId === "tradingBots2") return "Trade Manager 2";
+    return "Trade Manager";
   };
 
   const renderWidgetArea = (side: PanelSide) => {
@@ -407,6 +556,18 @@ export default function App() {
                 onDragEnd={() => setDraggingWidgetId(null)}
               >
                 <h3>{widgetTitle(widget.id)}</h3>
+                {(widget.id === "tradingBots" || widget.id === "tradingBots2") && (
+                  <button
+                    type="button"
+                    className="widget-config-button"
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={() => {
+                      console.log("[Trade Manager] Configure clicked");
+                    }}
+                  >
+                    Configure
+                  </button>
+                )}
               </div>
               <div className="widget-body">{renderWidget(widget)}</div>
               <div
@@ -432,7 +593,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.17</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.28</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">

@@ -6,7 +6,21 @@ export default defineConfig({
   root: '.',
   publicDir: 'public',
   server: {
-    port: 8000
+    port: 8000,
+    proxy: {
+      '/ws': {
+        target: 'ws://localhost:8001',
+        ws: true,
+      },
+      '/api': {
+        target: 'http://localhost:8001',
+        changeOrigin: true,
+      },
+      '/health': {
+        target: 'http://localhost:8001',
+        changeOrigin: true,
+      }
+    }
   },
   build: {
     outDir: 'dist',

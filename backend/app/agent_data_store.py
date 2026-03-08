@@ -1,8 +1,9 @@
 """
-Per-agent data container for ACP stream state.
+Per-session canonical data container for ACP v0.2.0.
 
-Stores the latest bar revision per candle id and a rolling set of finalized
-candles so historical backfill can merge naturally in a later phase.
+Stores canonical OHLC records with proper deduplication (by agent_id, id, rev
+for OHLC; by agent_id, id for non-OHLC). Maintains rolling window of finalized
+candles for historical queries.
 """
 
 from __future__ import annotations
@@ -14,35 +15,56 @@ from typing import Any
 
 
 @dataclass
-class AgentDataStore:
-    """Holds normalized live stream state for one agent."""
+class SessionDataStore:
+    """
+    Holds canonical market data for a single session.
+    
+    Per ACP v0.2.0:
+    - OHLC deduplication: (agent_id, id, rev) — upsert on higher rev
+    - Non-OHLC deduplication: (agent_id, id)
+    """
 
+    session_id: str
     agent_id: str
+    symbol: str
+    interval: str
+    
+    # Canonical storage: id -> {latest record}
     latest_by_candle_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    
+    # Revision tracking: (agent_id, id) -> latest_rev for dedup
+    latest_rev_by_ohlc: dict[tuple[str, str], int] = field(default_factory=dict)
+    
+    # Finalized bars rolling buffer
     finalized_bars: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
+    
+    # Activity timestamps
     last_heartbeat_ts: str | None = None
     last_event_ts: str | None = None
-    
+
+    def __post_init__(self):
+        """Initialize retention based on standard timeframe"""
+        self.update_retention(timeframe_days=30, interval=self.interval)
+
     def update_retention(self, timeframe_days: int, interval: str) -> None:
         """Update finalized_bars maxlen based on timeframe and interval"""
-        # Calculate bars needed: days * minutes_per_day / interval_minutes
         interval_minutes = self._parse_interval_to_minutes(interval)
         if interval_minutes > 0:
-            # Add 10% buffer for safety
+            # Calculate bars needed: days * minutes_per_day / interval_minutes
             maxlen = int((timeframe_days * 1440 / interval_minutes) * 1.1)
-            # Ensure minimum of 1000 bars
-            maxlen = max(maxlen, 1000)
+            maxlen = max(maxlen, 1000)  # Ensure minimum of 1000 bars
             
-            # Create new deque with updated maxlen, preserving existing data
+            # Recreate deque with new maxlen, preserving existing data
             old_bars = list(self.finalized_bars)
             self.finalized_bars = deque(old_bars, maxlen=maxlen)
 
     def reset_market_data(self) -> None:
         """Clear all in-memory market data while preserving retention settings."""
         self.latest_by_candle_id.clear()
+        self.latest_rev_by_ohlc.clear()
         self.finalized_bars.clear()
         self.last_event_ts = None
-    
+
     @staticmethod
     def _parse_interval_to_minutes(interval: str) -> int:
         """Convert interval string (1m, 5m, 1h, 1d) to minutes"""
@@ -55,43 +77,87 @@ class AgentDataStore:
             elif interval.endswith('d'):
                 return int(interval[:-1]) * 1440
             else:
-                return 1  # Default to 1 minute
+                return 1
         except ValueError:
             return 1
 
-    def update_heartbeat(self, last_event_ts: str | None = None) -> None:
-        self.last_heartbeat_ts = datetime.now(timezone.utc).isoformat()
-        if last_event_ts:
-            self.last_event_ts = last_event_ts
-
-    def ingest_ohlc(self, record: dict[str, Any]) -> dict[str, Any]:
+    def ingest_ohlc(self, record: dict[str, Any]) -> dict[str, Any] | None:
         """
-        Normalize and upsert an OHLC record.
-
-        - Ensures `rev` is always numeric for frontend rendering consistency.
-        - Maintains latest revision per candle id.
-        - Persists finalized bars in rolling storage.
+        Normalize and ingest an OHLC record with deduplication.
+        
+        ACP v0.2.0 deduplication: (agent_id, id, rev)
+        - Upserts record if rev is higher than previously seen for this (agent_id, id)
+        - Returns the normalized record if ingested, None if rejected (duplicate/lower rev)
         """
         candle_id = str(record.get("id", ""))
         if not candle_id:
-            return record
+            return None
 
-        previous = self.latest_by_candle_id.get(candle_id)
+        # Normalize rev to integer
+        incoming_rev = record.get("rev", 0)
+        if isinstance(incoming_rev, str):
+            try:
+                incoming_rev = int(incoming_rev)
+            except (ValueError, TypeError):
+                incoming_rev = 0
+        elif not isinstance(incoming_rev, int):
+            incoming_rev = 0
+
+        # Deduplication key for OHLC
+        dedup_key = (self.agent_id, candle_id)
+        latest_rev = self.latest_rev_by_ohlc.get(dedup_key, -1)
+
+        # Reject if we've seen this or a higher rev
+        if incoming_rev <= latest_rev:
+            return None  # Duplicate or lower rev, skip
+
+        # Ingest: upsert canonical record and update rev tracker
         normalized = dict(record)
-
-        incoming_rev = normalized.get("rev")
-        if isinstance(incoming_rev, int):
-            rev = incoming_rev
-        elif previous and isinstance(previous.get("rev"), int):
-            rev = int(previous["rev"]) + 1
-        else:
-            rev = 0
-
-        normalized["rev"] = rev
+        normalized["rev"] = incoming_rev
         self.latest_by_candle_id[candle_id] = normalized
+        self.latest_rev_by_ohlc[dedup_key] = incoming_rev
         self.last_event_ts = str(normalized.get("ts") or self.last_event_ts)
 
+        # Track finalized bars
         if normalized.get("bar_state") == "final":
             self.finalized_bars.append(normalized)
 
         return normalized
+
+    def ingest_non_ohlc(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        Ingest a non-OHLC record (e.g., event, line) with deduplication.
+        
+        ACP v0.2.0 deduplication: (agent_id, id)
+        - Rejects if we've already seen this (agent_id, id)
+        """
+        record_id = str(record.get("id", ""))
+        if not record_id:
+            return None
+
+        dedup_key = (self.agent_id, record_id)
+        
+        # Simple dedup: if we've seen this id before, skip
+        if dedup_key in self.latest_by_candle_id:
+            return None  # Already ingested
+
+        # Ingest
+        normalized = dict(record)
+        self.latest_by_candle_id[record_id] = normalized
+        self.last_event_ts = str(normalized.get("ts") or self.last_event_ts)
+
+        return normalized
+
+    def update_heartbeat(self, last_event_ts: str | None = None) -> None:
+        """Update heartbeat and optional event timestamp"""
+        self.last_heartbeat_ts = datetime.now(timezone.utc).isoformat()
+        if last_event_ts:
+            self.last_event_ts = last_event_ts
+
+    def get_canonical_candles(self) -> list[dict[str, Any]]:
+        """Get all canonical candles, sorted by id"""
+        return sorted(self.latest_by_candle_id.values(), key=lambda x: x.get("id", ""))
+
+    def get_finalized_candles(self) -> list[dict[str, Any]]:
+        """Get finalized candles in order"""
+        return list(self.finalized_bars)

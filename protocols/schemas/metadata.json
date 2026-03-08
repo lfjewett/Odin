@@ -10,6 +10,7 @@
     "agent_name",
     "agent_version",
     "description",
+    "agent_type",
     "config_schema",
     "output_schema",
     "overlay"
@@ -19,7 +20,7 @@
       "type": "string",
       "description": "ACP protocol version",
       "pattern": "^ACP-[0-9]+\\.[0-9]+\\.[0-9]+$",
-      "examples": ["ACP-0.1.0"]
+      "examples": ["ACP-0.2.0"]
     },
     "agent_id": {
       "type": "string",
@@ -43,6 +44,23 @@
       "type": "string",
       "description": "Brief description of agent functionality",
       "minLength": 1
+    },
+    "agent_type": {
+      "type": "string",
+      "description": "Agent role in ACP session flow",
+      "enum": ["price", "overlay", "event"]
+    },
+    "data_dependency": {
+      "description": "Primary input dependency for this agent",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["ohlc", "event", "none"]
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "config_schema": {
       "type": "object",
