@@ -302,6 +302,56 @@
   word-break: break-word;
 }
 
+.agent-input {
+  background: #0f1113;
+  border: 1px solid #3d4147;
+  border-radius: 6px;
+  color: #d1d5da;
+  font-size: 14px;
+  padding: 8px 10px;
+}
+
+.agent-input-color {
+  padding: 4px;
+  min-height: 36px;
+}
+
+.agent-actions-row {
+  display: flex;
+  gap: 10px;
+}
+
+.btn-save,
+.btn-delete {
+  border: 1px solid #3d4147;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-save {
+  background: rgba(34, 197, 94, 0.18);
+  color: #22c55e;
+}
+
+.btn-delete {
+  background: rgba(239, 68, 68, 0.16);
+  color: #ef4444;
+}
+
+.btn-save:disabled,
+.btn-delete:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.agent-action-error {
+  margin: 0;
+  color: #f97316;
+  font-size: 13px;
+}
+
 .no-config {
   color: #6d6f74;
   font-style: italic;

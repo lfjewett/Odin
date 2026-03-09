@@ -1,8 +1,8 @@
 # Agent Chart Protocol (ACP)
 
-- Spec ID: `ACP-0.2.0`
+- Spec ID: `ACP-0.3.0`
 - Status: Draft (Authoritative in this repository)
-- Last updated: 2026-03-07
+- Last updated: 2026-03-08
 
 ## 1) Purpose
 
@@ -10,7 +10,7 @@ ACP defines a uniform contract for chart data agents used by Odin.
 
 ACP standardizes:
 - Session-scoped canonical candle distribution
-- Historical backfill (HTTP REST)
+- Historical backfill for price data (HTTP REST)
 - Real-time streaming (WebSocket)
 - Bidirectional backend/agent communication
 - Error handling
@@ -23,14 +23,14 @@ This repository is the source of truth for ACP behavior and schema.
 
 ### In Scope
 - Single-symbol chart sessions
-- One subscription maps to one agent + one session + one symbol + one interval + parameter set
+- One subscription maps to one logical indicator configuration
 - Session-scoped sequence tracking and replay
 - At-least-once delivery
 - JSON payloads
+- Base-URL agent discovery via metadata
 
-### Non-Goals (for `ACP-0.2.0`)
+### Non-Goals (for `ACP-0.3.0`)
 - Multi-symbol subscriptions
-- Agent discovery/registry protocol
 - Authentication/authorization (local-only deployment)
 - Binary serialization (e.g., Protobuf/MessagePack)
 - Trading decision policy (execution gating is out of protocol scope)
@@ -41,8 +41,8 @@ This repository is the source of truth for ACP behavior and schema.
 - Owns canonical candle data per session
 - Calls price agent REST `/history` for backfill
 - Opens and manages WebSocket subscriptions to agents
-- Pushes canonical candles to overlay agents
-- Merges overlays/events and forwards to UI
+- Pushes canonical candles to indicator agents
+- Merges indicator outputs/events and forwards to UI
 - Applies deduplication, gap handling, and replay
 
 ### Price Agent
@@ -51,25 +51,30 @@ This repository is the source of truth for ACP behavior and schema.
 - Streams live OHLC updates over WebSocket
 - Supports mutable candle revisions via `rev`
 
-### Overlay Agent
+### Indicator Agent
+- Exposes a discoverable indicator catalog at root metadata
 - Receives canonical candles from backend (`history_push`, `tick_update`, `candle_closed`, `candle_correction`)
-- Computes derived records and emits overlay updates
-- Requests replay on sequence gaps via `resync_request`
+- Computes derived records and emits typed outputs
+- Can host many logical indicators from one base URL
 
 ### Event Agent
 - Produces event markers independent of candle push workflow
 
 ### UI
 - Consumes merged backend stream
-- Renders price first, overlays asynchronously
+- Owns visual style configuration (color, shape, line style, panel placement)
 
 ## 4) Transport Model
 
-### 4.1 Mandatory Interfaces
-Each ACP agent MUST provide:
-1. REST API for agent metadata (`/metadata`)
-2. REST API for historical data (`/history`)
-3. WebSocket API for live/protocol traffic
+### 4.1 Mandatory Interfaces by Agent Type
+All agents MUST provide:
+1. REST `/metadata`
+2. WebSocket `/ws/live`
+
+Only `agent_type=price` MUST provide:
+3. REST `/history`
+
+`agent_type=indicator|event` MAY provide `/history`; backend MUST treat it as optional capability.
 
 Live data MUST NOT be polled over REST.
 
@@ -79,7 +84,11 @@ Live data MUST NOT be polled over REST.
 - Backend requests history from price agents via REST.
 - Backend and agents exchange live/session messages over WebSocket.
 
-No agent discovery protocol is defined in `ACP-0.2.0`.
+### 4.3 Discovery Model
+- User input is a base agent URL (e.g. `http://localhost:8020`).
+- Backend calls `GET {base_url}/metadata`.
+- For indicator agents, `/metadata` MUST include an `indicators[]` catalog describing selectable indicators and supported parameters.
+- Indicator selection occurs in subscription/config payload (`indicator_id`, params), not path routing.
 
 ## 5) Data Schemas
 
@@ -97,16 +106,27 @@ All records MUST include:
 
 See the `schemas/` directory for normative JSON Schemas.
 
-## 6) Canonical Intervals
+## 6) Supported Intervals
 
-For `ACP-0.2.0`, valid interval values are:
-- `1m`
-- `5m`
-- `15m`
-- `30m`
-- `1h`
-- `4h`
-- `1d`
+For `ACP-0.3.0`, valid interval values are:
+- `1m` (1 minute)
+- `2m` (2 minutes)
+- `3m` (3 minutes)
+- `4m` (4 minutes)
+- `5m` (5 minutes)
+- `10m` (10 minutes)
+- `15m` (15 minutes)
+- `20m` (20 minutes)
+- `30m` (30 minutes)
+- `1h` (1 hour)
+- `2h` (2 hours)
+- `4h` (4 hours)
+- `8h` (8 hours)
+- `12h` (12 hours)
+- `1d` (1 day)
+- `2d` (2 days)
+- `1w` (1 week)
+- `1M` (1 month)
 
 `interval` in all ACP requests and messages MUST use one of these values.
 
@@ -114,14 +134,8 @@ For `ACP-0.2.0`, valid interval values are:
 
 A `session_id` identifies one frontend chart window and its isolated backend state.
 
-A session is uniquely defined by:
-- `session_id`
-- `symbol`
-- `interval`
-- active subscriptions
-
 ### 7.1 Session Rules
-- `session_id` MUST be present on all WebSocket protocol messages in ACP-0.2.0.
+- `session_id` MUST be present on all WebSocket protocol messages.
 - Backend sequence (`seq`) is monotonic per session and assigned by backend for backend-originated session messages.
 - Sessions are isolated; replay, buffering, and correction fan-out are scoped per session.
 
@@ -148,7 +162,7 @@ A session is uniquely defined by:
 
 ## 9) Historical Backfill (REST)
 
-Required endpoint:
+Required only for `agent_type=price`:
 
 `GET /history?symbol={symbol}&from={iso8601}&to={iso8601}&interval={interval}`
 
@@ -163,7 +177,7 @@ Required endpoint:
 ### 9.2 Mutable History Behavior
 If backend detects that a REST history poll yields a higher `rev` (or changed values for same `id`), backend MUST:
 1. Upsert canonical candle state for that `id`
-2. Emit `candle_correction` to active overlay subscriptions in affected sessions
+2. Emit `candle_correction` to active indicator subscriptions in affected sessions
 3. Preserve monotonic revision ordering for that candle
 
 ## 10) OHLC Lifecycle and Revision Semantics
@@ -229,29 +243,40 @@ Required fields include:
 - `agent_name`
 - `agent_version`
 - `description`
-- `agent_type` (`price` | `overlay` | `event`)
+- `agent_type` (`price` | `indicator` | `event`)
 - `config_schema`
-- `output_schema`
-- `overlay`
+- `outputs`
+
+Required for `agent_type=indicator`:
+- `indicators[]`
 
 Optional:
 - `data_dependency` (`ohlc` | `event` | `none`)
 
-### 14.1 Multi-Output Agents
-`output_schema` describes the agent's primary output record structure.
+### 14.1 Typed Outputs
+`outputs[]` defines emitted data streams with stable `output_id` and schema typing.
 
-Agents MAY emit multiple distinct records or markers per session (e.g., a moving average pair indicator may emit two `line` records with different `id` values plus `event` crossover markers).
+Each output descriptor MUST include:
+- `output_id`
+- `schema`
+- `label`
+- `is_primary`
 
-Backend MUST support 1-to-N output multiplicity within a single subscription using record-level `id` for deduplication and tracking.
+Indicator agents MAY emit multiple outputs from a single subscription (e.g., MACD line, signal line, crossover events).
 
-Backend MUST:
-1. Call `/metadata` before subscription
-2. Enforce `spec_version` compatibility
-3. Route behavior by `agent_type`
+### 14.2 Indicator Catalog
+`indicators[]` entries define selectable indicators exposed by a single agent base URL.
+
+Each entry MUST include:
+- `indicator_id`
+- `name`
+- `description`
+- `params_schema`
+- `outputs`
 
 ## 15) Error Codes
 
-Structured error codes for `ACP-0.2.0`:
+Structured error codes for `ACP-0.3.0`:
 - `INVALID_REQUEST`
 - `INVALID_SYMBOL`
 - `INVALID_INTERVAL`

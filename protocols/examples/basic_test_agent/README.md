@@ -8,7 +8,7 @@ This folder includes two runnable ACP-0.2.0 examples:
 ## Price Agent Behavior
 
 - Supported symbol: `SPY`
-- Supported intervals: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`
+- Supported intervals: `1m`, `2m`, `3m`, `4m`, `5m`, `10m`, `15m`, `20m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d`, `2d`, `1w`, `1M`
 - Emits live OHLC updates with lifecycle:
   - `partial`
   - `provisional_close`

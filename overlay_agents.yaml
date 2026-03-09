@@ -1,16 +1,82 @@
-# Overlay Agents Configuration
-# ACP v0.2.0 agent definitions
-
 agents:
-  - spec_version: "ACP-0.2.0"
-    agent_url: "http://localhost:8010"
-    agent_id: "price_agent"
-    agent_name: "Price Data"
-    agent_version: "1.0.0"
-    description: "Live OHLCV candle data with bar_state lifecycle"
-    config_schema:
-      candle_type: "candlestick"
-      ticker: "follow_chart"
-      interval: "follow_chart"
-      show_volume: true
-    output_schema: "ohlc"
+- spec_version: ACP-0.3.0
+  agent_url: http://localhost:8010
+  agent_id: price_agent
+  agent_name: Price Data
+  agent_version: 1.0.0
+  description: Live OHLCV candle data with bar_state lifecycle
+  agent_type: price
+  config_schema:
+    candle_type: candlestick
+    ticker: follow_chart
+    interval: follow_chart
+    show_volume: true
+  outputs:
+  - output_id: price.ohlc
+    schema: ohlc
+    label: Price Candles
+    is_primary: true
+- spec_version: ACP-0.3.0
+  agent_url: http://localhost:8020
+  agent_id: odin_indicator_sma__sma
+  agent_name: SMA-20
+  agent_version: 0.1.0
+  description: Simple moving average over close price
+  agent_type: indicator
+  config_schema:
+    period: 20
+    line_color: '#2d6da9'
+  outputs:
+  - output_id: sma.line
+    schema: line
+    label: SMA
+    is_primary: true
+  indicators:
+  - indicator_id: sma
+    name: Simple Moving Average
+    description: Simple moving average over close price
+    params_schema:
+      period:
+        type: integer
+        description: Simple moving average period
+        required: false
+        default: 20
+        min: 1
+        max: 500
+    outputs:
+    - output_id: sma.line
+      schema: line
+      label: SMA
+      is_primary: true
+- spec_version: ACP-0.3.0
+  agent_url: http://localhost:8020
+  agent_id: odin_indicator_sma__sma__2
+  agent_name: SMA-50
+  agent_version: 0.1.0
+  description: Simple moving average over close price
+  agent_type: indicator
+  config_schema:
+    period: 50
+    line_color: '#5b3172'
+  outputs:
+  - output_id: sma.line
+    schema: line
+    label: SMA
+    is_primary: true
+  indicators:
+  - indicator_id: sma
+    name: Simple Moving Average
+    description: Simple moving average over close price
+    params_schema:
+      period:
+        type: integer
+        description: Simple moving average period
+        required: false
+        default: 20
+        min: 1
+        max: 500
+    outputs:
+    - output_id: sma.line
+      schema: line
+      label: SMA
+      is_primary: true

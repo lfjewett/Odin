@@ -4,12 +4,15 @@ Data models for Odin backend
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Literal
 import uuid
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class AgentConfig(BaseModel):
@@ -20,8 +23,10 @@ class AgentConfig(BaseModel):
     agent_name: str = Field(description="Human-readable agent name")
     agent_version: str = Field(description="Agent version string")
     description: str = Field(description="Agent description")
+    agent_type: Literal["price", "indicator", "event"] = Field(description="Agent role")
     config_schema: dict[str, Any] = Field(default_factory=dict, description="Agent-specific configuration")
-    output_schema: str = Field(description="Output schema type (ohlc, line, event, etc)")
+    outputs: list[dict[str, Any]] = Field(default_factory=list, description="Typed output descriptors")
+    indicators: list[dict[str, Any]] = Field(default_factory=list, description="Discoverable indicator catalog")
 
 
 class AgentStatus(BaseModel):
@@ -53,9 +58,11 @@ class Agent(BaseModel):
         return {
             "id": self.config.agent_id,
             "name": self.config.agent_name,
-            "agent_type": self.config.agent_id,
+            "agent_type": self.config.agent_type,
             "agent_url": self.config.agent_url,
-            "output_schema": self.config.output_schema,
+            "output_schema": self.config.outputs[0]["schema"] if self.config.outputs else None,
+            "outputs": self.config.outputs,
+            "indicators": self.config.indicators,
             "enabled": True,
             "status": self.status.status,
             "last_activity_ts": self.status.last_activity_ts,
@@ -69,7 +76,7 @@ class Agent(BaseModel):
         }
 
 # ============================================================================
-# ACP v0.2.0 Session & Sequence Management
+# ACP v0.3.0 Session & Sequence Management
 # ============================================================================
 
 
@@ -127,9 +134,9 @@ class ReplayBuffer:
 
 
 class Session(BaseModel):
-    """ACP v0.2.0 Session: isolated chart view for a client"""
+    """ACP v0.3.0 Session: isolated chart view for a client"""
     
-    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str  # Now required, no default
     client_id: str
     agent_id: str
     symbol: str
@@ -170,9 +177,20 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}  # session_id -> Session
         self._client_sessions: dict[str, list[str]] = {}  # client_id -> [session_ids]
     
-    def create_session(self, client_id: str, agent_id: str, symbol: str, interval: str) -> Session:
-        """Create a new session for a client"""
-        session = Session(client_id=client_id, agent_id=agent_id, symbol=symbol, interval=interval)
+    def create_session(self, session_id: str, client_id: str, agent_id: str, symbol: str, interval: str) -> Session:
+        """Create a new session with frontend-provided session_id"""
+        # Check if session already exists
+        if session_id in self._sessions:
+            logger.info(f"Session {session_id} already exists, returning existing session")
+            return self._sessions[session_id]
+        
+        session = Session(
+            session_id=session_id,
+            client_id=client_id,
+            agent_id=agent_id,
+            symbol=symbol,
+            interval=interval
+        )
         self._sessions[session.session_id] = session
         
         if client_id not in self._client_sessions:

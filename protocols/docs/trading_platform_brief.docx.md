@@ -4,6 +4,10 @@ Architecture & Implementation Brief
 
 *Prepared for: Continued Development with AI Assistant*
 
+**Implementation Note (2026-03-07)**: This document provides architectural context for the Odin platform. For normative ACP-0.2.0 protocol behavior, refer to `../spec/ACP.md` and `../schemas/*.json`. Where message format examples differ from current schemas, schemas take precedence.
+
+---
+
 # **1\. Project Vision**
 
 A personal stock trading platform modeled after TradingView, extended with multiple AI and algorithmic agents that add contextual overlay data to price charts. The platform unifies disparate data sources — news sentiment, technical indicators, options flow, pattern recognition — into a single coherent chart view.

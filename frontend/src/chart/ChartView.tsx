@@ -1,13 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { createChart, IChartApi, ISeriesApi, Time, ISeriesPrimitive, IPrimitivePaneView, IPrimitivePaneRenderer } from "lightweight-charts";
 import { CanvasRenderingTarget2D } from 'fancy-canvas';
-import { MarketCandle } from "../types/events";
+import { LineRecord, MarketCandle } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
 import { formatEasternChartTime, formatEasternDateTime } from "../utils/time";
 
 interface ChartViewProps {
   onCandleReceived: (handler: (candle: MarketCandle) => void) => void;
   onSnapshotRequested: (handler: (bars: OHLCBar[]) => void) => void;
+  overlayData: Map<string, LineRecord[]>;
+  overlayLineColors?: Map<string, string>;
   selectedSymbol: string;
   selectedInterval?: string;
   selectedTimeframe?: number;
@@ -89,6 +91,28 @@ class ExtendedHoursShadeRenderer implements IPrimitivePaneRenderer {
     this._chart = chart;
   }
 
+  // Determine if a given UTC date is in Eastern Daylight Time (EDT) or Standard Time (EST)
+  // EDT is UTC-4, EST is UTC-5. US DST is roughly 2nd Sunday March to 1st Sunday November
+  private isEasternDaylightTime(date: Date): boolean {
+    // Check what Eastern time this UTC moment corresponds to by using formatter
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    
+    // Use noon UTC as a test point since it's always unambiguous
+    const testDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 12, 0, 0));
+    const easternTimeStr = formatter.format(testDate);
+    const eastHour = parseInt(easternTimeStr.split(':')[0]);
+    
+    // UTC noon (12:00) converts to:
+    // - 07:00 Eastern in EST (UTC-5)
+    // - 08:00 Eastern in EDT (UTC-4)
+    return (12 - eastHour) === 4;
+  }
+
   draw(target: CanvasRenderingTarget2D) {
     target.useBitmapCoordinateSpace((scope) => {
       const ctx = scope.context;
@@ -111,24 +135,27 @@ class ExtendedHoursShadeRenderer implements IPrimitivePaneRenderer {
       ctx.fillStyle = this._shadeColor;
 
       while (currentDate <= endDate) {
-        // Pre-market: 00:00 - 09:30 EST
-        // UTC offset for EST: -5 hours from UTC
+        // Get the correct UTC offset for this date (EDT = 4, EST = 5)
+        const isDST = this.isEasternDaylightTime(currentDate);
+        const offsetHours = isDST ? 4 : 5;
+
+        // Pre-market: 00:00 - 09:30 Eastern Time
         const preMarketStart = new Date(currentDate);
-        preMarketStart.setUTCHours(5, 0, 0, 0); // 00:00 EST
+        preMarketStart.setUTCHours(offsetHours, 0, 0, 0);
         
         const preMarketEnd = new Date(currentDate);
-        preMarketEnd.setUTCHours(14, 30, 0, 0); // 09:30 EST
+        preMarketEnd.setUTCHours(offsetHours + 9, 30, 0, 0);
         
         const preMarketStartUnix = Math.floor(preMarketStart.getTime() / 1000);
         const preMarketEndUnix = Math.floor(preMarketEnd.getTime() / 1000);
 
-        // After-hours: 16:00 EST - 23:59 EST (21:00 UTC - 04:59 UTC next day)
+        // After-hours: 16:00 - 24:00 Eastern Time
         const afterHoursStart = new Date(currentDate);
-        afterHoursStart.setUTCHours(21, 0, 0, 0); // 16:00 EST
+        afterHoursStart.setUTCHours(offsetHours + 16, 0, 0, 0);
         
         const afterHoursEnd = new Date(currentDate);
         afterHoursEnd.setUTCDate(afterHoursEnd.getUTCDate() + 1);
-        afterHoursEnd.setUTCHours(5, 0, 0, 0); // 00:00 EST next day
+        afterHoursEnd.setUTCHours(offsetHours, 0, 0, 0);
         
         const afterHoursStartUnix = Math.floor(afterHoursStart.getTime() / 1000);
         const afterHoursEndUnix = Math.floor(afterHoursEnd.getTime() / 1000);
@@ -234,6 +261,8 @@ function normalizeHistoryBars(bars: OHLCBar[]): OHLCBar[] {
 export function ChartView({ 
   onCandleReceived,
   onSnapshotRequested,
+  overlayData,
+  overlayLineColors,
   selectedSymbol, 
   selectedInterval = "1m",
   selectedTimeframe = 1,
@@ -251,6 +280,7 @@ export function ChartView({
   
   // Store candle data by timestamp for lookup
   const candleDataRef = useRef<Map<number, MarketCandle>>(new Map());
+  const overlaySeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
 
   // Handle snapshot data from backend
   const handleSnapshot = useCallback((bars: OHLCBar[]) => {
@@ -266,6 +296,12 @@ export function ChartView({
     
     try {
       const normalizedBars = normalizeHistoryBars(bars);
+
+      if (normalizedBars.length === 0 && candleDataRef.current.size > 0) {
+        console.warn("[ChartView] Received empty snapshot; preserving existing chart data");
+        setHistoryError(null);
+        return;
+      }
       
       // Clear and rebuild candle data map
       candleDataRef.current.clear();
@@ -319,6 +355,15 @@ export function ChartView({
             } => bar !== null
           );
       }
+      
+      // Deduplicate by timestamp (keep last bar for each unique time)
+      // This prevents "data must be asc ordered by time" errors when multiple
+      // bars map to the same Unix second timestamp
+      const uniqueByTime = new Map<number, any>();
+      for (const bar of chartData) {
+        uniqueByTime.set(bar.time, bar);
+      }
+      chartData = Array.from(uniqueByTime.values()).sort((a, b) => a.time - b.time);
       
       seriesRef.current.setData(chartData);
       
@@ -694,6 +739,88 @@ export function ChartView({
       clearTimeout(timeoutId2);
     };
   }, [isLeftCollapsed, isRightCollapsed]);
+
+  useEffect(() => {
+    if (!chartRef.current) {
+      return;
+    }
+
+    try {
+      const chart = chartRef.current;
+      const existingSeries = overlaySeriesRef.current;
+      const incomingAgentIds = new Set(overlayData.keys());
+
+      console.log("[ChartView] Updating overlays:", {
+        overlayDataKeys: Array.from(overlayData.keys()),
+        overlayColorKeys: overlayLineColors ? Array.from(overlayLineColors.keys()) : [],
+        existingSeriesKeys: Array.from(existingSeries.keys())
+      });
+
+      for (const [agentId, overlaySeries] of existingSeries.entries()) {
+        if (!incomingAgentIds.has(agentId)) {
+          console.log(`[ChartView] Removing overlay series for ${agentId}`);
+          chart.removeSeries(overlaySeries);
+          existingSeries.delete(agentId);
+        }
+      }
+
+      for (const [agentId, records] of overlayData.entries()) {
+        try {
+          let overlaySeries = existingSeries.get(agentId);
+          const seriesColor = overlayLineColors?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
+          console.log(`[ChartView] Processing overlay for ${agentId}: color=${seriesColor}, records=${records.length}`);
+          
+          if (!overlaySeries) {
+            console.log(`[ChartView] Creating new line series for ${agentId} with color ${seriesColor}`);
+            overlaySeries = chart.addLineSeries({
+              color: seriesColor,
+              lineWidth: 2,
+              priceLineVisible: false,
+              lastValueVisible: false,
+            });
+            existingSeries.set(agentId, overlaySeries);
+          } else {
+            console.log(`[ChartView] Updating existing series for ${agentId} with color ${seriesColor}`);
+            overlaySeries.applyOptions({ color: seriesColor });
+          }
+
+          const lineData = records
+            .map((record) => {
+              const time = toUnixSeconds(record.ts);
+              const value = Number(record.value);
+              if (time === null || !Number.isFinite(value)) {
+                return null;
+              }
+
+              return {
+                time,
+                value,
+              };
+            })
+            .filter((point): point is { time: number; value: number } => point !== null)
+            .sort((a, b) => a.time - b.time);
+
+          const uniqueLineDataByTime = new Map<number, { time: number; value: number }>();
+          for (const point of lineData) {
+            uniqueLineDataByTime.set(point.time, point);
+          }
+
+          const deduplicatedLineData = Array.from(uniqueLineDataByTime.values()).sort(
+            (a, b) => a.time - b.time
+          );
+
+          if (deduplicatedLineData.length > 0) {
+            overlaySeries.setData(deduplicatedLineData);
+            console.log(`[ChartView] Set ${deduplicatedLineData.length} data points for ${agentId}`);
+          }
+        } catch (error) {
+          console.error(`[ChartView] Failed to render overlay for agent ${agentId}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error("[ChartView] Failed to update overlay series:", error);
+    }
+  }, [overlayData, overlayLineColors]);
 
   const timeframeOptions = [
     { label: "1D", days: 1 },

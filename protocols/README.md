@@ -9,22 +9,26 @@ This repository is the authoritative source of truth for:
 
 ## Current Version
 
-- Protocol: `ACP-0.2.0`
+- Protocol: `ACP-0.3.0`
 - Version file: `version/current.txt`
 
 ## Why ACP Exists
 
 Odin owns canonical candles per chart session and coordinates specialized agents (price, overlays, events). ACP provides a strict interface so independently built agents interoperate without ambiguity.
 
-## Key Protocol Decisions (ACP-0.2.0)
+## Key Protocol Decisions (ACP-0.3.0)
 
 - Transport model:
   - Backend calls price agent REST `/history` for snapshot backfill
+  - Indicator/event agents are not required to implement `/history`
+  - User discovery input is base URL; backend resolves `GET /metadata`
   - Backend uses WebSocket for live and bidirectional session traffic
 - Session model:
   - `session_id` required on ACP WebSocket protocol messages
   - single symbol per subscription
-- Intervals (canonical enum): `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`
+- Agent roles: `price`, `indicator`, `event`
+- Indicator metadata supports catalog + typed outputs (`indicators[]`, `outputs[]`)
+- Intervals (canonical enum): `1m`, `2m`, `3m`, `4m`, `5m`, `10m`, `15m`, `20m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d`, `2d`, `1w`, `1M`
 - Delivery: at-least-once
 - Dedup:
   - non-OHLC: `(agent_id, id)`

@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { MarketCandle } from "../types/events";
+import { MarketCandle, OverlayRecord } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
 
 interface UseEventStreamOptions {
@@ -11,6 +11,20 @@ export interface CandleEvent {
   candle: MarketCandle;
   sessionId: string;
   agentId: string;
+}
+
+export interface OverlayEvent {
+  sessionId: string;
+  agentId: string;
+  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  record: OverlayRecord;
+}
+
+export interface OverlayHistoryEvent {
+  sessionId: string;
+  agentId: string;
+  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  overlays: OverlayRecord[];
 }
 
 export interface StatusUpdate {
@@ -37,18 +51,21 @@ export interface SubscribeRequest {
 }
 
 /**
- * ACP v0.2.0 WebSocket hook for frontend market data streaming
+ * ACP v0.3.0 WebSocket hook for frontend market data streaming
  * 
  * Manages:
  * - Session-aware subscriptions (session_id per chart/view)
  * - Sequence tracking for gap detection
  * - Automatic resync requests on message loss
  * - Bidirectional communication with backend
+ * - Overlay data (line, event, etc.) from indicator agents
  */
 export function useEventStream(
   onEvent: (event: CandleEvent) => void,
   onStatusUpdate?: (update: StatusUpdate) => void,
   onSnapshot?: (event: SnapshotEvent) => void,
+  onOverlay?: (event: OverlayEvent) => void,
+  onOverlayHistory?: (event: OverlayHistoryEvent) => void,
   options: UseEventStreamOptions = {}
 ) {
   const {
@@ -74,6 +91,8 @@ export function useEventStream(
   const onEventRef = useRef(onEvent);
   const onStatusUpdateRef = useRef(onStatusUpdate);
   const onSnapshotRef = useRef(onSnapshot);
+  const onOverlayRef = useRef(onOverlay);
+  const onOverlayHistoryRef = useRef(onOverlayHistory);
 
   const sendSubscribePayload = useCallback((request: SubscribeRequest): boolean => {
     const ws = wsRef.current;
@@ -124,6 +143,14 @@ export function useEventStream(
   useEffect(() => {
     onSnapshotRef.current = onSnapshot;
   }, [onSnapshot]);
+  
+  useEffect(() => {
+    onOverlayRef.current = onOverlay;
+  }, [onOverlay]);
+  
+  useEffect(() => {
+    onOverlayHistoryRef.current = onOverlayHistory;
+  }, [onOverlayHistory]);
 
   const connect = useCallback(() => {
     console.log(`[WebSocket] Connecting to ${wsUrl}...`);
@@ -143,7 +170,7 @@ export function useEventStream(
           const message = JSON.parse(event.data);
           console.log("[WebSocket] Received message:", message.type);
           
-          // Handle different message types from backend (ACP v0.2.0)
+          // Handle different message types from backend (ACP v0.3.0)
           switch (message.type) {
             case "connection_ready":
               // Store client_id from backend for future use
@@ -162,6 +189,13 @@ export function useEventStream(
             
             case "heartbeat":
               console.log("[WebSocket] Heartbeat received");
+              if (onStatusUpdateRef.current && message.agent_id && message.status) {
+                onStatusUpdateRef.current({
+                  agent_id: message.agent_id,
+                  status: message.status,
+                  timestamp: message.timestamp || new Date().toISOString(),
+                });
+              }
               break;
             
             case "agent_status_update":
@@ -268,6 +302,45 @@ export function useEventStream(
                   status: "error",
                   error_message: `${message.code}: ${message.message}`,
                   timestamp: new Date().toISOString(),
+                });
+              }
+              break;
+            
+            case "history_response":
+              // Overlay agent's response with computed overlay values
+              console.log("[WebSocket] History response:", message.session_id, message.overlays?.length || 0, "overlays");
+              if (onOverlayHistoryRef.current && message.overlays) {
+                onOverlayHistoryRef.current({
+                  sessionId: message.session_id,
+                  agentId: message.agent_id,
+                  schema: message.schema as "line" | "event" | "band" | "histogram" | "forecast",
+                  overlays: message.overlays,
+                });
+              }
+              break;
+            
+            case "overlay_update":
+              // Live overlay value update
+              console.log("[WebSocket] Overlay update:", message.session_id, message.schema);
+              if (onOverlayRef.current && message.record) {
+                onOverlayRef.current({
+                  sessionId: message.session_id,
+                  agentId: message.agent_id,
+                  schema: message.schema as "line" | "event" | "band" | "histogram" | "forecast",
+                  record: message.record,
+                });
+              }
+              break;
+            
+            case "overlay_marker":
+              // Event marker from overlay agent
+              console.log("[WebSocket] Overlay marker:", message.session_id);
+              if (onOverlayRef.current && message.record) {
+                onOverlayRef.current({
+                  sessionId: message.session_id,
+                  agentId: message.agent_id,
+                  schema: "event",
+                  record: message.record,
                 });
               }
               break;

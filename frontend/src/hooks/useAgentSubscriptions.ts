@@ -25,12 +25,32 @@ export interface AgentSubscription {
   spec_version?: string;
   agent_version?: string;
   description?: string;
+  outputs?: Array<{ output_id: string; schema: string; label: string; is_primary: boolean }>;
+  indicators?: Array<{ indicator_id: string; name: string; description: string; params_schema?: Record<string, any>; outputs?: any[] }>;
+}
+
+export interface DiscoveredAgentMetadata {
+  spec_version: string;
+  agent_id: string;
+  agent_name: string;
+  agent_version: string;
+  description: string;
+  agent_type: "price" | "indicator" | "event";
+  outputs: Array<{ output_id: string; schema: string; label: string; is_primary: boolean }>;
+  indicators?: Array<{ indicator_id: string; name: string; description: string; params_schema?: Record<string, any>; outputs?: any[] }>;
+}
+
+export interface DiscoverAgentResult {
+  agent_url: string;
+  metadata: DiscoveredAgentMetadata;
+  discovered_at: string;
 }
 
 export interface CreateSubscriptionPayload {
   name: string;
   agent_type: string;
   agent_url?: string;
+  indicator_id?: string;
   output_schema?: string;
   symbol?: string;
   interval?: string;
@@ -59,6 +79,7 @@ export interface UseAgentSubscriptionsResult {
   refresh: (silent?: boolean) => Promise<void>;
   updateAgentStatus: (agentId: string, status: "online" | "offline" | "error" | "connecting", errorMessage?: string | null) => void;
   createSubscription: (payload: CreateSubscriptionPayload) => Promise<AgentSubscription>;
+  discoverAgent: (agentUrl: string) => Promise<DiscoverAgentResult>;
   updateSubscription: (id: string, payload: UpdateSubscriptionPayload) => Promise<AgentSubscription>;
   deleteSubscription: (id: string) => Promise<void>;
 }
@@ -116,6 +137,15 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
     refresh();
   }, [refresh]);
 
+  // Poll backend status in background to keep agent online/offline state current.
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      void refresh(true);
+    }, 5000);
+
+    return () => clearInterval(intervalId);
+  }, [refresh]);
+
   const updateAgentStatus = useCallback((agentId: string, status: "online" | "offline" | "error" | "connecting", errorMessage?: string | null) => {
     setSubscriptions((prev) => {
       if (!prev) return prev;
@@ -133,34 +163,88 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
     });
   }, []);
 
+  const discoverAgent = useCallback(async (agentUrl: string): Promise<DiscoverAgentResult> => {
+    const response = await fetch(`${BACKEND_URL}/api/agents/discover`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ agent_url: agentUrl }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.detail || `Discover failed: ${response.statusText}`);
+    }
+
+    return response.json();
+  }, []);
+
   const createSubscription = useCallback(
     async (payload: CreateSubscriptionPayload): Promise<AgentSubscription> => {
-      // TODO: Implement agent creation via backend API
-      // For now, agents are loaded from overlay_agents.yaml
-      console.warn("Agent creation not yet implemented - edit overlay_agents.yaml manually");
-      throw new Error("Agent creation not yet implemented. Edit overlay_agents.yaml manually and restart backend.");
+      const response = await fetch(`${BACKEND_URL}/api/agents`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          agent_url: payload.agent_url,
+          indicator_id: payload.indicator_id,
+          params: payload.config || {},
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Create failed: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      await refresh(true);
+      return data.agent as AgentSubscription;
     },
-    []
+    [refresh]
   );
 
   const updateSubscription = useCallback(
     async (id: string, payload: UpdateSubscriptionPayload): Promise<AgentSubscription> => {
-      // TODO: Implement agent updates via backend API
-      // For now, agents are loaded from overlay_agents.yaml
-      console.warn("Agent updates not yet implemented - edit overlay_agents.yaml manually");
-      throw new Error("Agent updates not yet implemented. Edit overlay_agents.yaml manually and restart backend.");
+      const response = await fetch(`${BACKEND_URL}/api/agents/${id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          agent_name: payload.name,
+          params: payload.config || {},
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Update failed: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      await refresh(true);
+      return data.agent as AgentSubscription;
     },
-    []
+    [refresh]
   );
 
   const deleteSubscription = useCallback(
     async (id: string): Promise<void> => {
-      // TODO: Implement agent deletion via backend API
-      // For now, agents are loaded from overlay_agents.yaml
-      console.warn("Agent deletion not yet implemented - edit overlay_agents.yaml manually");
-      throw new Error("Agent deletion not yet implemented. Edit overlay_agents.yaml manually and restart backend.");
+      const response = await fetch(`${BACKEND_URL}/api/agents/${id}`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Delete failed: ${response.statusText}`);
+      }
+
+      await refresh(true);
     },
-    []
+    [refresh]
   );
 
   return {
@@ -170,6 +254,7 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
     refresh,
     updateAgentStatus,
     createSubscription,
+    discoverAgent,
     updateSubscription,
     deleteSubscription,
   };

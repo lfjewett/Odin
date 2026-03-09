@@ -10,6 +10,7 @@ import inspect
 import logging
 from pathlib import Path
 from typing import Any, Callable
+from datetime import datetime, timezone
 
 import yaml
 
@@ -25,6 +26,7 @@ class AgentManager:
         self.agents: dict[str, Agent] = {}
         self.connections: dict[str, Any] = {}  # agent_id -> AgentConnection
         self.on_agent_message: Callable[[str, dict[str, Any]], Any] | None = None
+        self.config_file_path: Path | None = None
     
     def load_from_yaml(self, yaml_path: str | Path) -> None:
         """Load agent configurations from YAML file"""
@@ -87,6 +89,24 @@ class AgentManager:
     def get_connection(self, agent_id: str) -> Any | None:
         """Get agent connection by ID"""
         return self.connections.get(agent_id)
+
+    def add_or_update_agent(self, agent_config: AgentConfig) -> Agent:
+        """Register or update an agent at runtime."""
+        existing = self.agents.get(agent_config.agent_id)
+        if existing:
+            existing.config = agent_config
+            existing.updated_at = datetime.now(timezone.utc).isoformat()
+            return existing
+
+        agent_status = AgentStatus(agent_id=agent_config.agent_id)
+        agent = Agent(config=agent_config, status=agent_status)
+        self.agents[agent.agent_id] = agent
+        logger.info(f"✅ Registered runtime agent: {agent.agent_name} ({agent.agent_id})")
+        return agent
+
+    def list_indicator_agents(self) -> list[Agent]:
+        """Get all indicator agents."""
+        return [agent for agent in self.agents.values() if agent.config.agent_type == "indicator"]
     
     async def send_cached_snapshots_to_client(self, callback: Callable) -> None:
         """Send all cached snapshots to a newly connected client"""
@@ -110,13 +130,13 @@ class AgentManager:
             logger.debug(f"Removed connection for agent: {agent_id}")
     
     async def start_all_connections(self) -> None:
-        """Start WebSocket connections to all configured agents (ACP v0.2.0)."""
+        """Start WebSocket connections to all configured agents (ACP v0.3.0)."""
         from app.agent_connection import AgentConnection
         
         logger.info(f"🔌 Starting connections for {len(self.agents)} agents...")
         
         for agent in self.agents.values():
-            # ACP v0.2.0: Connect to all agents (price, overlay, event, etc.)
+            # ACP v0.3.0: Connect to all agents (price, indicator, event, etc.)
             logger.info(f"📡 Starting connection to {agent.agent_id} at {agent.config.agent_url}...")
             
             connection = AgentConnection(
@@ -141,6 +161,39 @@ class AgentManager:
             logger.info(f"Stopping connection to {agent_id}...")
             await connection.stop()
             self.remove_connection(agent_id)
+    
+    def persist_agents_to_yaml(self, yaml_path: str | Path) -> None:
+        """
+        Persist all current agents to YAML file.
+        
+        Converts Agent objects to their YAML representation and writes to file.
+        """
+        yaml_path = Path(yaml_path)
+        try:
+            agents_data = []
+            for agent in self.agents.values():
+                agent_dict = {
+                    "spec_version": agent.config.spec_version,
+                    "agent_url": agent.config.agent_url,
+                    "agent_id": agent.config.agent_id,
+                    "agent_name": agent.config.agent_name,
+                    "agent_version": agent.config.agent_version,
+                    "description": agent.config.description,
+                    "agent_type": agent.config.agent_type,
+                    "config_schema": agent.config.config_schema,
+                    "outputs": agent.config.outputs,
+                }
+                if agent.config.indicators:
+                    agent_dict["indicators"] = agent.config.indicators
+                agents_data.append(agent_dict)
+            
+            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(yaml_path, "w") as f:
+                yaml.dump({"agents": agents_data}, f, default_flow_style=False, sort_keys=False)
+            
+            logger.info(f"💾 Persisted {len(agents_data)} agent(s) to {yaml_path}")
+        except Exception as e:
+            logger.error(f"Failed to persist agents to {yaml_path}: {e}")
 
 
 # Global agent manager instance

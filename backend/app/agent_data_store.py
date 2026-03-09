@@ -37,6 +37,10 @@ class SessionDataStore:
     
     # Finalized bars rolling buffer
     finalized_bars: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
+
+    # Non-OHLC storage and dedup tracking:
+    # key: (source_agent_id, record_id) -> latest record
+    latest_non_ohlc_by_key: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     
     # Activity timestamps
     last_heartbeat_ts: str | None = None
@@ -62,6 +66,7 @@ class SessionDataStore:
         """Clear all in-memory market data while preserving retention settings."""
         self.latest_by_candle_id.clear()
         self.latest_rev_by_ohlc.clear()
+        self.latest_non_ohlc_by_key.clear()
         self.finalized_bars.clear()
         self.last_event_ts = None
 
@@ -124,7 +129,11 @@ class SessionDataStore:
 
         return normalized
 
-    def ingest_non_ohlc(self, record: dict[str, Any]) -> dict[str, Any] | None:
+    def ingest_non_ohlc(
+        self,
+        record: dict[str, Any],
+        source_agent_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """
         Ingest a non-OHLC record (e.g., event, line) with deduplication.
         
@@ -135,15 +144,16 @@ class SessionDataStore:
         if not record_id:
             return None
 
-        dedup_key = (self.agent_id, record_id)
+        dedup_agent_id = source_agent_id or self.agent_id
+        dedup_key = (dedup_agent_id, record_id)
         
         # Simple dedup: if we've seen this id before, skip
-        if dedup_key in self.latest_by_candle_id:
+        if dedup_key in self.latest_non_ohlc_by_key:
             return None  # Already ingested
 
         # Ingest
         normalized = dict(record)
-        self.latest_by_candle_id[record_id] = normalized
+        self.latest_non_ohlc_by_key[dedup_key] = normalized
         self.last_event_ts = str(normalized.get("ts") or self.last_event_ts)
 
         return normalized

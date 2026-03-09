@@ -8,16 +8,33 @@ import {
   useRef,
   useState,
 } from "react";
-import { useEventStream, CandleEvent, StatusUpdate, SnapshotEvent } from "./stream/useEventStream";
+import { 
+  useEventStream, 
+  CandleEvent, 
+  StatusUpdate, 
+  SnapshotEvent,
+  OverlayEvent,
+  OverlayHistoryEvent
+} from "./stream/useEventStream";
 import { ChartView } from "./chart/ChartView";
-import { MarketCandle } from "./types/events";
+import { MarketCandle, LineRecord } from "./types/events";
 import type { OHLCBar } from "./history/fetchHistory";
-import { useAgentSubscriptions } from "./hooks/useAgentSubscriptions";
+import { useAgentSubscriptions, type AgentSubscription } from "./hooks/useAgentSubscriptions";
 import AgentConfigModal from "./components/AgentConfigModal";
+import AddIndicatorAgentModal from "./components/AddIndicatorAgentModal";
 import { formatEasternTime24 } from "./utils/time";
+import {
+  activateWorkspace,
+  deleteWorkspace,
+  getWorkspace,
+  listWorkspaces,
+  saveWorkspace,
+  type WorkspaceState,
+} from "./workspace/workspaceApi";
 import "./App.css";
 
 const WATCHLIST_SYMBOLS = ["SPY", "QQQ", "IWM"];
+const DEFAULT_WORKSPACE_NAME = "Default";
 
 const MOCK_TRADE_RETURNS = [
   42, -36, 58, -22, 18, 64, -48, 29, -17, 53,
@@ -51,7 +68,7 @@ const TRADE_MANAGER_METRICS = [
 ];
 
 type PanelSide = "left" | "right";
-type WidgetId = "watchlist" | "overlayAgents" | "tradingBots" | "tradingBots2";
+type WidgetId = "watchlist" | "overlayAgents" | "tradingBots2";
 
 interface WidgetState {
   id: WidgetId;
@@ -60,10 +77,9 @@ interface WidgetState {
 }
 
 const INITIAL_WIDGETS: WidgetState[] = [
-  { id: "tradingBots2", side: "left", height: 420 },
   { id: "watchlist", side: "left", height: 330 },
   { id: "overlayAgents", side: "right", height: 240 },
-  { id: "tradingBots", side: "right", height: 420 },
+  { id: "tradingBots2", side: "right", height: 420 },
 ];
 
 export default function App() {
@@ -85,12 +101,23 @@ export default function App() {
     ((bars: OHLCBar[]) => void) | null
   >(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [modalAgentId, setModalAgentId] = useState<string | null>(null);
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
+  const [isAddAgentModalOpen, setIsAddAgentModalOpen] = useState(false);
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [isStrategyProfitable, setIsStrategyProfitable] = useState(true);
+  const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
+  const [currentWorkspaceName, setCurrentWorkspaceName] = useState<string>(DEFAULT_WORKSPACE_NAME);
+  const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false);
   const lastSubscribeKeyRef = useRef<string | null>(null);
+  const pendingSnapshotRef = useRef<SnapshotEvent | null>(null);
+  const hasInitializedWorkspaceRef = useRef(false);
+  const isApplyingWorkspaceRef = useRef(false);
   
-  // Session management for ACP v0.2.0
+  // Overlay data state for rendering overlays on chart
+  const [overlayData, setOverlayData] = useState<Map<string, LineRecord[]>>(new Map());
+  
+  // Session management for ACP v0.3.0
   const sessionIdRef = useRef<string | null>(null);
   const getSessionId = useCallback(() => {
     if (!sessionIdRef.current) {
@@ -104,9 +131,227 @@ export default function App() {
     loading: subscriptionsLoading,
     error: subscriptionsError,
     updateAgentStatus,
+    discoverAgent,
+    createSubscription,
+    updateSubscription,
+    deleteSubscription,
   } = useAgentSubscriptions();
 
+  const handleAgentCreated = useCallback((_agentId: string) => {
+  }, []);
+
   const selectedAgent = subscriptions?.find((a) => a.id === selectedAgentId) || null;
+  const modalAgent = subscriptions?.find((a) => a.id === modalAgentId) || null;
+
+  const captureWorkspaceState = useCallback((): WorkspaceState => {
+    const subscriptionSnapshot = (subscriptions || []).map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      agent_type: agent.agent_type,
+      agent_url: agent.agent_url,
+      config: (agent.config || {}) as Record<string, unknown>,
+    }));
+
+    return {
+      selectedSymbol,
+      intervalInput,
+      selectedTimeframe,
+      isLeftCollapsed,
+      isRightCollapsed,
+      widgets,
+      selectedAgentId,
+      agentSubscriptions: subscriptionSnapshot,
+    };
+  }, [
+    subscriptions,
+    selectedSymbol,
+    intervalInput,
+    selectedTimeframe,
+    isLeftCollapsed,
+    isRightCollapsed,
+    widgets,
+    selectedAgentId,
+  ]);
+
+  const applyWorkspaceState = useCallback(
+    async (state: WorkspaceState) => {
+      isApplyingWorkspaceRef.current = true;
+      try {
+        const normalizedSymbol = (state.selectedSymbol || "SPY").toUpperCase();
+        setSelectedSymbol(normalizedSymbol);
+        setTickerInput(normalizedSymbol);
+        setIntervalInput(state.intervalInput || "1m");
+        setSelectedTimeframe(state.selectedTimeframe || 7);
+        setIsLeftCollapsed(Boolean(state.isLeftCollapsed));
+        setIsRightCollapsed(Boolean(state.isRightCollapsed));
+
+        const knownWidgetIds: WidgetId[] = ["watchlist", "overlayAgents", "tradingBots2"];
+        const rawWidgets = Array.isArray(state.widgets) ? state.widgets : [];
+        const normalizedWidgets = rawWidgets
+          .filter((widget): widget is WidgetState => knownWidgetIds.includes(widget.id as WidgetId))
+          .map((widget) => ({
+            id: widget.id,
+            side: widget.side === "left" ? "left" : "right",
+            height: Math.max(160, Math.min(560, Number(widget.height) || 240)),
+          }));
+        setWidgets(normalizedWidgets.length > 0 ? normalizedWidgets : INITIAL_WIDGETS);
+
+        const snapshotSubscriptions = Array.isArray(state.agentSubscriptions)
+          ? state.agentSubscriptions
+          : [];
+        const subscriptionMap = new Map<string, AgentSubscription>();
+        (subscriptions || []).forEach((agent) => {
+          subscriptionMap.set(agent.id, agent);
+        });
+
+        for (const snapshot of snapshotSubscriptions) {
+          const existing = subscriptionMap.get(snapshot.id);
+          if (!existing) {
+            continue;
+          }
+
+          const existingConfig = existing.config || {};
+          const nextConfig = snapshot.config || {};
+          const configChanged = JSON.stringify(existingConfig) !== JSON.stringify(nextConfig);
+          const nameChanged = existing.name !== snapshot.name;
+
+          if (configChanged || nameChanged) {
+            await updateSubscription(snapshot.id, {
+              name: snapshot.name,
+              config: nextConfig,
+            });
+          }
+        }
+
+        setSelectedAgentId(state.selectedAgentId ?? null);
+      } finally {
+        isApplyingWorkspaceRef.current = false;
+      }
+    },
+    [subscriptions, updateSubscription]
+  );
+
+  const refreshWorkspaceNames = useCallback(async (): Promise<{ names: string[]; active: string | null }> => {
+    const listing = await listWorkspaces();
+    const names = listing.workspaces.map((workspace) => workspace.name);
+    setWorkspaceNames(names);
+    return { names, active: listing.active_workspace };
+  }, []);
+
+  const handleSaveCurrentWorkspace = useCallback(async () => {
+    const workspaceName = currentWorkspaceName || DEFAULT_WORKSPACE_NAME;
+    await saveWorkspace(workspaceName, captureWorkspaceState());
+    await activateWorkspace(workspaceName);
+    await refreshWorkspaceNames();
+    setIsWorkspaceMenuOpen(false);
+  }, [captureWorkspaceState, currentWorkspaceName, refreshWorkspaceNames]);
+
+  const handleSwitchWorkspace = useCallback(
+    async (workspaceName: string) => {
+      const record = await getWorkspace(workspaceName);
+      await applyWorkspaceState(record.state);
+      await activateWorkspace(workspaceName);
+      setCurrentWorkspaceName(workspaceName);
+      await refreshWorkspaceNames();
+      setIsWorkspaceMenuOpen(false);
+    },
+    [applyWorkspaceState, refreshWorkspaceNames]
+  );
+
+  const handleCreateWorkspace = useCallback(async () => {
+    const proposedName = window.prompt("New workspace name");
+    const workspaceName = proposedName?.trim();
+    if (!workspaceName) {
+      return;
+    }
+    if (workspaceNames.includes(workspaceName)) {
+      window.alert("A workspace with this name already exists.");
+      return;
+    }
+
+    await saveWorkspace(workspaceName, captureWorkspaceState());
+    await activateWorkspace(workspaceName);
+    setCurrentWorkspaceName(workspaceName);
+    await refreshWorkspaceNames();
+    setIsWorkspaceMenuOpen(false);
+  }, [captureWorkspaceState, refreshWorkspaceNames, workspaceNames]);
+
+  const handleDeleteCurrentWorkspace = useCallback(async () => {
+    if (!currentWorkspaceName) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete workspace \"${currentWorkspaceName}\"?`);
+    if (!confirmed) {
+      return;
+    }
+
+    const result = await deleteWorkspace(currentWorkspaceName);
+    await refreshWorkspaceNames();
+
+    if (result.active_workspace) {
+      const record = await getWorkspace(result.active_workspace);
+      await applyWorkspaceState(record.state);
+      setCurrentWorkspaceName(result.active_workspace);
+    }
+
+    setIsWorkspaceMenuOpen(false);
+  }, [applyWorkspaceState, currentWorkspaceName, refreshWorkspaceNames]);
+
+  useEffect(() => {
+    if (hasInitializedWorkspaceRef.current || subscriptionsLoading) {
+      return;
+    }
+
+    hasInitializedWorkspaceRef.current = true;
+    void (async () => {
+      try {
+        const listing = await listWorkspaces();
+        if (listing.workspaces.length === 0) {
+          await saveWorkspace(DEFAULT_WORKSPACE_NAME, captureWorkspaceState());
+          await activateWorkspace(DEFAULT_WORKSPACE_NAME);
+          setWorkspaceNames([DEFAULT_WORKSPACE_NAME]);
+          setCurrentWorkspaceName(DEFAULT_WORKSPACE_NAME);
+          return;
+        }
+
+        const workspaceName = listing.active_workspace || listing.workspaces[0].name;
+        setWorkspaceNames(listing.workspaces.map((workspace) => workspace.name));
+        setCurrentWorkspaceName(workspaceName);
+
+        const record = await getWorkspace(workspaceName);
+        await applyWorkspaceState(record.state);
+        await activateWorkspace(workspaceName);
+      } catch (error) {
+        console.error("Failed to initialize workspace state:", error);
+      }
+    })();
+  }, [applyWorkspaceState, captureWorkspaceState, subscriptionsLoading]);
+
+  const resolveOverlayAgentId = useCallback(
+    (incomingAgentId: string): string => {
+      // Use incoming agent ID directly - backend sends correct runtime IDs
+      // No prefix/suffix resolution needed for ACP v0.3.0 with unique instance IDs
+      return incomingAgentId;
+    },
+    []
+  );
+
+  const overlayLineColors = useMemo(() => {
+    const colors = new Map<string, string>();
+    (subscriptions || []).forEach((agent) => {
+      if (agent.agent_type !== "indicator") {
+        return;
+      }
+
+      const configuredColor = agent.config?.line_color;
+      if (typeof configuredColor === "string" && configuredColor.trim()) {
+        colors.set(agent.id, configuredColor);
+      }
+    });
+    console.log("[App] Overlay colors map:", Array.from(colors.entries()));
+    return colors;
+  }, [subscriptions]);
 
   useEffect(() => {
     console.log("[App] Agent selection effect triggered:", {
@@ -117,10 +362,11 @@ export default function App() {
     });
     
     if (!selectedAgentId && subscriptions && subscriptions.length > 0) {
-      const preferred =
-        subscriptions.find((agent) => agent.output_schema === "ohlc") || subscriptions[0];
-      console.log("[App] Auto-selecting agent:", preferred.id);
-      setSelectedAgentId(preferred.id);
+      const preferred = subscriptions.find((agent) => agent.output_schema === "ohlc");
+      if (preferred) {
+        console.log("[App] Auto-selecting agent:", preferred.id);
+        setSelectedAgentId(preferred.id);
+      }
     }
   }, [selectedAgentId, subscriptions, subscriptionsLoading, subscriptionsError]);
 
@@ -130,20 +376,66 @@ export default function App() {
   
   const handleSnapshot = useCallback((event: SnapshotEvent) => {
     const activeAgentId = selectedAgent?.id ?? selectedAgentId ?? null;
-    
-    // Only process snapshot if it's for the active agent
-    if (
-      activeAgentId &&
-      event.agentId === activeAgentId &&
-      event.symbol === selectedSymbol &&
-      event.interval === intervalInput
-    ) {
+    const isMatchingSubscription =
+      event.symbol === selectedSymbol && event.interval === intervalInput;
+
+    // If no active selection exists yet, accept first snapshot stream.
+    if (!activeAgentId && isMatchingSubscription) {
+      setSelectedAgentId(event.agentId);
+    }
+
+    const expectedAgentId = activeAgentId ?? event.agentId;
+
+    // Only process snapshots that match the current chart subscription.
+    if (event.agentId === expectedAgentId && isMatchingSubscription) {
       console.log(`[App] Received snapshot for ${event.agentId}:`, event.bars.length, "bars");
       if (snapshotHandler) {
         snapshotHandler(event.bars);
+      } else {
+        pendingSnapshotRef.current = event;
       }
     }
   }, [selectedAgent, selectedAgentId, selectedSymbol, intervalInput, snapshotHandler]);
+
+  const handleOverlayHistory = useCallback((event: OverlayHistoryEvent) => {
+    const resolvedAgentId = resolveOverlayAgentId(event.agentId);
+    console.log(`[App] Received overlay history for ${event.agentId} -> resolved to ${resolvedAgentId}:`, event.overlays.length, "records");
+    if (event.schema === "line") {
+      if (!event.overlays || event.overlays.length === 0) {
+        return;
+      }
+      setOverlayData((prev) => {
+        const updated = new Map(prev);
+        updated.set(resolvedAgentId, event.overlays as LineRecord[]);
+        console.log(`[App] Overlay data now has ${updated.size} agent(s):`, Array.from(updated.keys()));
+        return updated;
+      });
+    }
+  }, [resolveOverlayAgentId]);
+
+  const handleOverlay = useCallback((event: OverlayEvent) => {
+    const resolvedAgentId = resolveOverlayAgentId(event.agentId);
+    console.log(`[App] Received overlay update for ${event.agentId} -> resolved to ${resolvedAgentId}:`, event.schema);
+    if (event.schema === "line") {
+      setOverlayData((prev) => {
+        const updated = new Map(prev);
+        const existing = updated.get(resolvedAgentId) || [];
+        const record = event.record as LineRecord;
+        
+        // Find and update or append
+        const index = existing.findIndex((r) => r.id === record.id);
+        if (index >= 0) {
+          existing[index] = record;
+        } else {
+          existing.push(record);
+        }
+        
+        updated.set(resolvedAgentId, [...existing]);
+        console.log(`[App] Overlay data now has ${updated.size} agent(s):`, Array.from(updated.keys()));
+        return updated;
+      });
+    }
+  }, [resolveOverlayAgentId]);
 
   const { isConnected, sendSubscribeRequest } = useEventStream(
     (event: CandleEvent) => {
@@ -164,7 +456,9 @@ export default function App() {
       }
     },
     handleStatusUpdate,
-    handleSnapshot
+    handleSnapshot,
+    handleOverlay,
+    handleOverlayHistory
   );
 
   const handleCandleReceived = useCallback(
@@ -177,6 +471,12 @@ export default function App() {
   const handleSnapshotRequested = useCallback(
     (handler: (bars: OHLCBar[]) => void) => {
       setSnapshotHandler(() => handler);
+
+      const pendingSnapshot = pendingSnapshotRef.current;
+      if (pendingSnapshot) {
+        handler(pendingSnapshot.bars);
+        pendingSnapshotRef.current = null;
+      }
     },
     []
   );
@@ -191,6 +491,10 @@ export default function App() {
   }, [tickerInput, selectedSymbol]);
 
   useEffect(() => {
+    if (isApplyingWorkspaceRef.current) {
+      return;
+    }
+
     const agentId = selectedAgent?.id ?? selectedAgentId;
     console.log("[App] Subscribe effect triggered:", {
       agentId,
@@ -210,6 +514,8 @@ export default function App() {
       console.log("[App] Subscribe skipped: same key as last subscribe");
       return;
     }
+
+    setOverlayData(new Map());
 
     const sent = sendSubscribeRequest({
       sessionId: getSessionId(),
@@ -396,6 +702,13 @@ export default function App() {
         const agents = subscriptions || [];
         return (
           <>
+            <button
+              type="button"
+              className="widget-config-button"
+              onClick={() => setIsAddAgentModalOpen(true)}
+            >
+              Add Agent
+            </button>
             {subscriptionsLoading && <div className="loading-text">Loading agents...</div>}
             {!subscriptionsLoading && agents.length === 0 && subscriptionsError && (
               <div className="error-banner">⚠️ {subscriptionsError}</div>
@@ -408,7 +721,7 @@ export default function App() {
                       type="button"
                       className="agent-name-button"
                       onClick={() => {
-                        setSelectedAgentId(agent.id);
+                        setModalAgentId(agent.id);
                         setIsAgentModalOpen(true);
                       }}
                     >
@@ -512,7 +825,9 @@ export default function App() {
             ))}
           </div>
 
-          {isRightTradeManager && <div className="trade-manager-toggle-bottom">{profitToggle}</div>}
+          {(isRightTradeManager || isLeftTradeManager) && (
+            <div className="trade-manager-toggle-bottom">{profitToggle}</div>
+          )}
         </article>
       );
     },
@@ -531,8 +846,7 @@ export default function App() {
 
   const widgetTitle = (widgetId: WidgetId) => {
     if (widgetId === "watchlist") return "Watchlist";
-    if (widgetId === "overlayAgents") return "Overlay Agents";
-    if (widgetId === "tradingBots2") return "Trade Manager 2";
+    if (widgetId === "overlayAgents") return "Indicator Agents";
     return "Trade Manager";
   };
 
@@ -556,7 +870,7 @@ export default function App() {
                 onDragEnd={() => setDraggingWidgetId(null)}
               >
                 <h3>{widgetTitle(widget.id)}</h3>
-                {(widget.id === "tradingBots" || widget.id === "tradingBots2") && (
+                {widget.id === "tradingBots2" && (
                   <button
                     type="button"
                     className="widget-config-button"
@@ -593,13 +907,59 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.28</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.49</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
           <div className="topbar-status-group">
             <div className="clock-pill" aria-label="Current Eastern Time">
               <span>{topbarClock}</span>
+            </div>
+            <div className="workspace-control">
+              <button
+                type="button"
+                className="workspace-pill"
+                onClick={() => setIsWorkspaceMenuOpen((current) => !current)}
+                aria-haspopup="menu"
+                aria-expanded={isWorkspaceMenuOpen}
+                title="Workspace presets"
+              >
+                <span>Workspace: {currentWorkspaceName}</span>
+                <span className="workspace-pill-chevron" aria-hidden="true">⌄</span>
+              </button>
+              {isWorkspaceMenuOpen && (
+                <div className="workspace-menu" role="menu">
+                  <div className="workspace-menu-list">
+                    {workspaceNames.map((workspaceName) => (
+                      <button
+                        key={workspaceName}
+                        type="button"
+                        className={`workspace-menu-item ${workspaceName === currentWorkspaceName ? "active" : ""}`}
+                        onClick={() => {
+                          void handleSwitchWorkspace(workspaceName);
+                        }}
+                      >
+                        {workspaceName}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="workspace-menu-actions">
+                    <button type="button" className="workspace-menu-action" onClick={() => void handleCreateWorkspace()}>
+                      New Workspace
+                    </button>
+                    <button type="button" className="workspace-menu-action" onClick={() => void handleSaveCurrentWorkspace()}>
+                      Save Workspace
+                    </button>
+                    <button
+                      type="button"
+                      className="workspace-menu-action danger"
+                      onClick={() => void handleDeleteCurrentWorkspace()}
+                    >
+                      Delete Workspace
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="status-pill">
               <span
@@ -615,12 +975,7 @@ export default function App() {
               title="Settings"
               aria-label="User settings"
             >
-              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" fill="currentColor" opacity="0.1"/>
-                <circle cx="12" cy="12" r="10"/>
-                <path d="M8 10c0-1.1.9-2 2-2s2 .9 2 2-.9 2-2 2-2-.9-2-2zm6 0c0-1.1.9-2 2-2s2 .9 2 2-.9 2-2 2-2-.9-2-2z"/>
-                <path d="M12 18c-2.5 0-4.8-1-6.5-2.5"/>
-              </svg>
+              <img src="/logo.png" alt="Odin Logo" className="avatar-logo" />
             </button>
           </div>
         </div>
@@ -713,6 +1068,8 @@ export default function App() {
               <ChartView 
                 onCandleReceived={handleCandleReceived}
                 onSnapshotRequested={handleSnapshotRequested}
+                overlayData={overlayData}
+                overlayLineColors={overlayLineColors}
                 selectedSymbol={selectedSymbol}
                 selectedInterval={intervalInput}
                 selectedTimeframe={selectedTimeframe}
@@ -746,15 +1103,37 @@ export default function App() {
       </div>
 
       <footer className="workspace-footer">
-        <span>Workspace: Phase 2 UI</span>
+        <span>Session: {getSessionId()}</span>
         <span>Feed: {statusText}</span>
         <span>Selected: {selectedSymbol}</span>
       </footer>
 
       <AgentConfigModal
         isOpen={isAgentModalOpen}
-        subscription={selectedAgent}
-        onClose={() => setIsAgentModalOpen(false)}
+        subscription={modalAgent}
+        onUpdate={async (id, update) => {
+          await updateSubscription(id, { name: update.name, config: update.config });
+        }}
+        onDelete={async (id) => {
+          await deleteSubscription(id);
+          setOverlayData((current) => {
+            const next = new Map(current);
+            next.delete(id);
+            return next;
+          });
+        }}
+        onClose={() => {
+          setIsAgentModalOpen(false);
+          setModalAgentId(null);
+        }}
+      />
+
+      <AddIndicatorAgentModal
+        isOpen={isAddAgentModalOpen}
+        onClose={() => setIsAddAgentModalOpen(false)}
+        onCreated={(agent) => handleAgentCreated(agent.id)}
+        discoverAgent={discoverAgent}
+        createSubscription={createSubscription}
       />
     </div>
   );

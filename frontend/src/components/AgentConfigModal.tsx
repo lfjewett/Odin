@@ -10,6 +10,8 @@ import "./AgentConfigModal.css";
 export interface AgentConfigModalProps {
   isOpen: boolean;
   subscription?: AgentSubscription | null;
+  onUpdate?: (id: string, update: { name?: string; config: Record<string, unknown> }) => Promise<void>;
+  onDelete?: (id: string) => Promise<void>;
   onClose: () => void;
 }
 
@@ -37,9 +39,17 @@ const getStatusColor = (status: string): StatusColor => {
 export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   isOpen,
   subscription,
+  onUpdate,
+  onDelete,
   onClose,
 }) => {
   const [elapsed, setElapsed] = useState<string>("—");
+  const [agentNameInput, setAgentNameInput] = useState<string>("");
+  const [periodInput, setPeriodInput] = useState<string>("");
+  const [lineColorInput, setLineColorInput] = useState<string>("#cbd5e1");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Update elapsed time every second
   useEffect(() => {
@@ -66,10 +76,73 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     return () => clearInterval(interval);
   }, [isOpen, subscription?.created_at]);
 
+  useEffect(() => {
+    if (!isOpen || !subscription) {
+      return;
+    }
+
+    const nextPeriod = subscription.config?.period;
+    const nextColor = subscription.config?.line_color;
+
+    setAgentNameInput(subscription.name || "");
+    setPeriodInput(nextPeriod !== undefined && nextPeriod !== null ? String(nextPeriod) : "20");
+    setLineColorInput(typeof nextColor === "string" && nextColor.length > 0 ? nextColor : "#cbd5e1");
+    setActionError(null);
+    setSaving(false);
+    setDeleting(false);
+  }, [isOpen, subscription?.id]);
+
   if (!isOpen || !subscription) return null;
 
   const statusEmoji = getStatusEmoji(subscription.status);
   const statusColor = getStatusColor(subscription.status);
+  const isIndicator = subscription.agent_type === "indicator";
+
+  const handleSave = async () => {
+    if (!subscription || !onUpdate) {
+      return;
+    }
+
+    const parsedPeriod = Number.parseInt(periodInput, 10);
+    if (!Number.isFinite(parsedPeriod) || parsedPeriod < 1) {
+      setActionError("Period must be an integer greater than or equal to 1.");
+      return;
+    }
+
+    setSaving(true);
+    setActionError(null);
+    try {
+      await onUpdate(subscription.id, {
+        name: agentNameInput.trim() || subscription.name,
+        config: {
+          ...subscription.config,
+          period: parsedPeriod,
+          line_color: lineColorInput,
+        },
+      });
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Failed to save indicator settings.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!subscription || !onDelete) {
+      return;
+    }
+
+    setDeleting(true);
+    setActionError(null);
+    try {
+      await onDelete(subscription.id);
+      onClose();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Failed to remove indicator.");
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   return (
     <div className="agent-modal-overlay" onClick={onClose}>
@@ -191,6 +264,55 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                   </div>
                 ))}
               </div>
+            </section>
+          )}
+
+          {isIndicator && (
+            <section className="agent-section">
+              <h2 className="section-title">Indicator Controls</h2>
+              <div className="config-grid">
+                <div className="config-item">
+                  <span className="config-label">Agent Name</span>
+                  <input
+                    className="agent-input"
+                    type="text"
+                    value={agentNameInput}
+                    onChange={(event) => setAgentNameInput(event.target.value)}
+                    disabled={saving || deleting}
+                  />
+                </div>
+                <div className="config-item">
+                  <span className="config-label">Period</span>
+                  <input
+                    className="agent-input"
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={periodInput}
+                    onChange={(event) => setPeriodInput(event.target.value)}
+                    disabled={saving || deleting}
+                  />
+                </div>
+                <div className="config-item">
+                  <span className="config-label">Line Color</span>
+                  <input
+                    className="agent-input agent-input-color"
+                    type="color"
+                    value={lineColorInput}
+                    onChange={(event) => setLineColorInput(event.target.value)}
+                    disabled={saving || deleting}
+                  />
+                </div>
+              </div>
+              <div className="agent-actions-row">
+                <button className="btn-save" onClick={handleSave} disabled={saving || deleting}>
+                  {saving ? "Saving..." : "Save Settings"}
+                </button>
+                <button className="btn-delete" onClick={handleDelete} disabled={saving || deleting}>
+                  {deleting ? "Removing..." : "Remove Indicator"}
+                </button>
+              </div>
+              {actionError && <p className="agent-action-error">{actionError}</p>}
             </section>
           )}
 

@@ -1,11 +1,11 @@
 /**
- * ACP v0.2.0 Protocol Types
+ * ACP v0.3.0 Protocol Types
  * 
- * Defines TypeScript types for ACP (Agent Communication Protocol) v0.2.0
+ * Defines TypeScript types for ACP (Agent Communication Protocol) v0.3.0
  * with session isolation, sequence tracking, and bidirectional communication.
  */
 
-export type ACPSpecVersion = "ACP-0.2.0";
+export type ACPSpecVersion = "ACP-0.3.0";
 
 export type BarState = "partial" | "provisional_close" | "session_reconciled" | "final";
 
@@ -20,6 +20,9 @@ export type ACPMessageType =
   | "candle_correction"
   | "resync_request"
   | "resync_response"
+  | "history_response"
+  | "overlay_update"
+  | "overlay_marker"
   | "error"
   | "agent_status_update";
 
@@ -107,7 +110,7 @@ export interface SnapshotMessage {
 export interface ACPDataMessage {
   type: "data";
   spec_version: ACPSpecVersion;
-  session_id: string; // ACP v0.2.0 routing key
+  session_id: string; // ACP v0.3.0 routing key
   agent_id: string;
   schema: "ohlc" | "line" | "event" | "band" | "histogram" | "forecast";
   record: Record<string, unknown>;
@@ -208,7 +211,81 @@ export interface AgentStatusUpdateMessage {
 }
 
 /**
- * Union type for all ACP v0.2.0 message types
+ * Generic Overlay Record
+ * 
+ * Base structure for overlay data (line, event, band, histogram, forecast).
+ */
+export interface OverlayRecord {
+  id: string; // Unique record identifier
+  ts: string; // ISO-8601 timestamp
+  [key: string]: unknown; // Additional fields depend on schema
+}
+
+/**
+ * Line Overlay Record (e.g., EMA, SMA)
+ */
+export interface LineRecord extends OverlayRecord {
+  value: number;
+  label?: string;
+}
+
+/**
+ * Event Overlay Record (markers)
+ */
+export interface EventRecord extends OverlayRecord {
+  title: string;
+  description?: string;
+  severity?: "info" | "warning" | "critical";
+}
+
+/**
+ * History Response (Backend -> Frontend)
+ * 
+ * Overlay agent's response to history_push with computed overlay values.
+ */
+export interface HistoryResponseMessage {
+  type: "history_response";
+  spec_version: ACPSpecVersion;
+  session_id: string;
+  subscription_id: string;
+  agent_id: string;
+  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  overlays: OverlayRecord[];
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Overlay Update (Backend -> Frontend)
+ * 
+ * Live overlay value update from overlay agent.
+ */
+export interface OverlayUpdateMessage {
+  type: "overlay_update";
+  spec_version: ACPSpecVersion;
+  session_id: string;
+  subscription_id: string;
+  agent_id: string;
+  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  record: OverlayRecord;
+}
+
+/**
+ * Overlay Marker (Backend -> Frontend)
+ * 
+ * Event marker from overlay agent.
+ */
+export interface OverlayMarkerMessage {
+  type: "overlay_marker";
+  spec_version: ACPSpecVersion;
+  session_id: string;
+  subscription_id: string;
+  agent_id: string;
+  schema: "event";
+  record: EventRecord;
+}
+
+/**
+ * Union type for all ACP v0.3.0 message types
  */
 export type ACPMessageEnvelope =
   | ConnectionReadyMessage
@@ -221,6 +298,9 @@ export type ACPMessageEnvelope =
   | ResyncRequestMessage
   | ResyncResponseMessage
   | ACPErrorMessage
-  | AgentStatusUpdateMessage;
+  | AgentStatusUpdateMessage
+  | HistoryResponseMessage
+  | OverlayUpdateMessage
+  | OverlayMarkerMessage;
 
 export type MarketCandle = ACPOhlcRecord;

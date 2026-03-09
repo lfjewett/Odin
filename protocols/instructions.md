@@ -21,9 +21,11 @@ Before making any changes, read:
 
 Then enforce these rules exactly:
 - spec_version equals version/current.txt
-- interval is one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d
+- interval is one of: 1m, 2m, 3m, 4m, 5m, 10m, 15m, 20m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 2d, 1w, 1M
 - subscriptions are single-symbol only
-- transport is REST backfill snapshots + WebSocket live/bidirectional stream
+- transport is REST metadata + WebSocket live/bidirectional stream
+- `/history` is required only for `agent_type=price`
+- indicator discovery is metadata-driven from base URL (`indicators[]`)
 - delivery is at-least-once
 - dedup is:
   - non-OHLC (agent_id,id)
@@ -31,8 +33,8 @@ Then enforce these rules exactly:
 - OHLC supports lifecycle updates with:
   - bar_state in {partial, provisional_close, session_reconciled, final}
   - monotonic rev per bar id
-- session_id required on ACP-0.2.0 WebSocket protocol messages
-- no auth and no discovery assumptions for ACP-0.2.0
+- session_id required on ACP-0.3.0 WebSocket protocol messages
+- no auth assumptions for ACP-0.3.0
 - do not introduce protocol fields outside ACP unless proposed as a versioned change
 
 For every protocol-related task response, include:

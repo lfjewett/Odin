@@ -1,5 +1,5 @@
 """
-Agent WebSocket Connection Manager (ACP v0.2.0)
+Agent WebSocket Connection Manager (ACP v0.3.0)
 
 Manages WebSocket connections to ACP agents and handles session-based subscriptions.
 Each agent connection can serve multiple sessions (clients).
@@ -28,7 +28,7 @@ class AgentConnection:
     """
     Manages WebSocket connection and subscriptions for a single agent.
     
-    ACP v0.2.0: Supports multiple concurrent sessions per agent.
+    ACP v0.3.0: Supports multiple concurrent sessions per agent.
     Each session is isolated (session_id in all messages).
     """
     
@@ -55,6 +55,10 @@ class AgentConnection:
         # }
         self.subscriptions: dict[str, dict[str, Any]] = {}
         
+        # Metadata from agent (fetched before first subscribe)
+        self.metadata: dict[str, Any] | None = None
+        self.metadata_fetched: bool = False
+        
         self.running = False
         self.reconnect_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
@@ -66,7 +70,7 @@ class AgentConnection:
     @property
     def ws_url(self) -> str:
         """Build WebSocket URL from agent's base URL"""
-        base_url = self.agent.config.agent_url
+        base_url = self.agent.config.agent_url.rstrip("/")
         # Convert http:// to ws://
         ws_base = base_url.replace("http://", "ws://").replace("https://", "wss://")
         return f"{ws_base}/ws/live"
@@ -74,12 +78,122 @@ class AgentConnection:
     @property
     def http_base_url(self) -> str:
         """Get HTTP base URL for REST API calls"""
-        return self.agent.config.agent_url
+        return self.agent.config.agent_url.rstrip("/")
+
+    def _build_subscription_id(self, session_id: str) -> str:
+        """Build a stable, per-connection subscription id for a session."""
+        return f"{session_id}::{self.agent_id}"
 
     @staticmethod
     def _format_history_timestamp(value: datetime) -> str:
         """Format timestamps for agent /history queries as UTC ISO-8601 with Z suffix."""
         return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    
+    async def fetch_metadata(self) -> bool:
+        """
+        Fetch and validate agent metadata (ACP v0.3.0).
+        
+        Must be called before first subscribe.
+        Returns True if metadata is valid, False otherwise.
+        """
+        if self.metadata_fetched:
+            return self.metadata is not None
+        
+        try:
+            url = f"{self.http_base_url}/metadata"
+            logger.info(f"[{self.agent_id}] Fetching metadata from {url}")
+            
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                metadata = response.json()
+                
+                # Validate required fields per ACP v0.3.0
+                required_fields = [
+                    "spec_version",
+                    "agent_id",
+                    "agent_name",
+                    "agent_version",
+                    "description",
+                    "agent_type",
+                    "config_schema",
+                    "outputs",
+                ]
+                
+                missing_fields = [f for f in required_fields if f not in metadata]
+                if missing_fields:
+                    logger.error(
+                        f"[{self.agent_id}] Metadata validation failed: missing fields {missing_fields}"
+                    )
+                    self.metadata_fetched = True
+                    self.metadata = None
+                    return False
+                
+                # Validate spec_version compatibility
+                spec_version = metadata.get("spec_version")
+                if spec_version != "ACP-0.3.0":
+                    logger.error(
+                        f"[{self.agent_id}] Incompatible spec_version: {spec_version} (expected ACP-0.3.0)"
+                    )
+                    self.metadata_fetched = True
+                    self.metadata = None
+                    return False
+                
+                # Validate agent_type (allow variations like "price_agent" for "price")
+                agent_type = metadata.get("agent_type", "").lower()
+                valid_types = ["price", "indicator", "event"]
+                # Check if agent_type starts with any valid type
+                if not any(agent_type.startswith(vtype) for vtype in valid_types):
+                    logger.error(
+                        f"[{self.agent_id}] Invalid agent_type: {metadata.get('agent_type')} "
+                        f"(expected one of: {valid_types})"
+                    )
+                    self.metadata_fetched = True
+                    self.metadata = None
+                    return False
+                
+                # Normalize agent_type to standard value
+                for vtype in valid_types:
+                    if agent_type.startswith(vtype):
+                        metadata["agent_type"] = vtype
+                        agent_type = vtype
+                        break
+
+                if agent_type == "indicator":
+                    indicators = metadata.get("indicators")
+                    if not isinstance(indicators, list) or not indicators:
+                        logger.error(f"[{self.agent_id}] Indicator agent missing required indicators[] catalog")
+                        self.metadata_fetched = True
+                        self.metadata = None
+                        return False
+                
+                # Store metadata
+                self.metadata = metadata
+                self.metadata_fetched = True
+                
+                logger.info(
+                    f"[{self.agent_id}] ✅ Metadata validated: type={agent_type}, "
+                    f"outputs={len(metadata.get('outputs', []))}, spec={spec_version}"
+                )
+                
+                return True
+                
+        except httpx.TimeoutException:
+            logger.error(f"[{self.agent_id}] ⏱️  Metadata fetch timeout")
+            self.metadata_fetched = True
+            self.metadata = None
+            return False
+        except httpx.HTTPError as e:
+            logger.error(f"[{self.agent_id}] ❌ Metadata fetch HTTP error: {e}")
+            self.metadata_fetched = True
+            self.metadata = None
+            return False
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] ❌ Metadata fetch failed: {e}")
+            self.metadata_fetched = True
+            self.metadata = None
+            return False
     
     async def connect(self) -> bool:
         """Establish WebSocket connection to agent"""
@@ -205,6 +319,14 @@ class AgentConnection:
             interval: Candle interval (e.g., "1m")
             params: Optional parameters like timeframe_days
         """
+        # ACP v0.3.0: Fetch and validate metadata before first subscribe
+        if not self.metadata_fetched:
+            logger.info(f"[{self.agent_id}] Fetching metadata before first subscribe...")
+            metadata_valid = await self.fetch_metadata()
+            if not metadata_valid:
+                logger.error(f"[{self.agent_id}] Cannot subscribe: metadata validation failed")
+                return False
+        
         if not self.websocket or self.websocket.closed:
             logger.error(f"[{self.agent_id}] Cannot subscribe: not connected")
             return False
@@ -212,23 +334,26 @@ class AgentConnection:
         normalized_params = params or {}
         existing = self.subscriptions.get(session_id)
         if existing:
-            existing_timeframe = int((existing.get("params") or {}).get("timeframe_days", 7))
-            requested_timeframe = int(normalized_params.get("timeframe_days", 7))
+            existing_params = existing.get("params") or {}
             if (
                 existing.get("symbol") == symbol
                 and existing.get("interval") == interval
-                and existing_timeframe == requested_timeframe
+                and existing_params == normalized_params
             ):
                 logger.info(
                     f"[{self.agent_id}] Subscribe request unchanged for {session_id}, skipping"
                 )
                 return True
         
-        # ACP v0.2.0: Include session_id in subscribe message
+        # ACP v0.3.0: Include session_id and per-connection subscription_id.
+        # Multiple indicator instances can share a session_id, so subscription_id
+        # must be unique per connection to avoid sequence/state collisions.
+        subscription_id = self._build_subscription_id(session_id)
         message = {
             "type": "subscribe",
-            "spec_version": self.agent.config.spec_version,
+            "spec_version": "ACP-0.3.0",
             "session_id": session_id,
+            "subscription_id": subscription_id,
             "agent_id": self.agent_id,
             "symbol": symbol,
             "interval": interval,
@@ -239,6 +364,7 @@ class AgentConnection:
         if success:
             self.subscriptions[session_id] = {
                 "session_id": session_id,
+                "subscription_id": subscription_id,
                 "symbol": symbol,
                 "interval": interval,
                 "params": normalized_params
@@ -246,6 +372,40 @@ class AgentConnection:
             logger.info(f"📊 [{self.agent_id}] Subscribed session {session_id}: {symbol} @ {interval}")
         
         return success
+    
+    async def send_history_push(
+        self,
+        session_id: str,
+        symbol: str,
+        interval: str,
+        candles: list[dict[str, Any]]
+    ) -> bool:
+        """
+        Send history_push message to overlay agent with canonical candles.
+        
+        Used to initialize overlay agents with historical OHLC data.
+        """
+        if not self.websocket or self.websocket.closed:
+            logger.error(f"[{self.agent_id}] Cannot send history_push: not connected")
+            return False
+        
+        subscription = self.subscriptions.get(session_id) or {}
+        subscription_id = str(subscription.get("subscription_id") or self._build_subscription_id(session_id))
+
+        message = {
+            "type": "history_push",
+            "spec_version": "ACP-0.3.0",
+            "session_id": session_id,
+            "subscription_id": subscription_id,
+            "agent_id": self.agent_id,
+            "symbol": symbol,
+            "interval": interval,
+            "candles": candles,
+            "count": len(candles)
+        }
+        
+        logger.info(f"📚 [{self.agent_id}] Sending history_push with {len(candles)} candles for session {session_id}")
+        return await self.send_message(message)
     
     async def unsubscribe(self, session_id: str) -> bool:
         """
@@ -258,18 +418,32 @@ class AgentConnection:
             logger.warning(f"[{self.agent_id}] Session {session_id} not found")
             return False
         
-        # ACP v0.2.0: Include session_id in unsubscribe message
+        # ACP v0.3.0: Include required envelope fields in unsubscribe message
+        subscription = self.subscriptions.get(session_id) or {}
+        subscription_id = str(subscription.get("subscription_id") or self._build_subscription_id(session_id))
+
         message = {
             "type": "unsubscribe",
-            "spec_version": self.agent.config.spec_version,
-            "session_id": session_id
+            "spec_version": "ACP-0.3.0",
+            "session_id": session_id,
+            "subscription_id": subscription_id,
+            "agent_id": self.agent_id
         }
         
         success = await self.send_message(message)
+
+        # Always clear local subscription state to avoid stale-session reuse,
+        # even if the agent connection is unavailable during cleanup.
+        self.subscriptions.pop(session_id, None)
+
         if success:
-            del self.subscriptions[session_id]
             logger.info(f"🚫 [{self.agent_id}] Unsubscribed session: {session_id}")
-        
+        else:
+            logger.warning(
+                f"[{self.agent_id}] Unsubscribe send failed for {session_id}; "
+                "local subscription state was still cleared"
+            )
+
         return success
     
     async def listen(self) -> None:

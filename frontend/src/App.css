@@ -117,6 +117,105 @@ body {
   justify-content: center;
 }
 
+.workspace-control {
+  position: relative;
+}
+
+.workspace-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  cursor: pointer;
+  min-width: 150px;
+  justify-content: space-between;
+}
+
+.workspace-pill:hover {
+  background: var(--surface-3);
+}
+
+.workspace-pill-chevron {
+  font-size: 14px;
+  line-height: 1;
+  color: #cfcfcf;
+}
+
+.workspace-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 220px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  padding: 8px;
+  z-index: 50;
+}
+
+.workspace-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-menu-item {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  padding: 7px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.workspace-menu-item:hover {
+  background: var(--surface-3);
+  border-color: #3b3b3b;
+}
+
+.workspace-menu-item.active {
+  background: color-mix(in srgb, var(--surface-3) 82%, black);
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+
+.workspace-menu-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+}
+
+.workspace-menu-action {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--text-primary);
+  text-align: left;
+  padding: 7px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.workspace-menu-action:hover {
+  border-color: #4a4a4a;
+}
+
+.workspace-menu-action.danger {
+  color: #ffb4b4;
+}
+
 .status-pill:hover {
   background: var(--surface-3);
 }
@@ -155,28 +254,29 @@ body {
 }
 
 .avatar-button {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  border-radius: 6px;
   border: 1px solid var(--border);
-  background: linear-gradient(135deg, #1e40af 0%, #0284c7 50%, #0369a1 100%);
-  color: #e0f2fe;
+  background: var(--surface-2);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: all 0.18s ease;
   flex-shrink: 0;
+  padding: 4px;
+  overflow: hidden;
 }
 
 .avatar-button:hover {
-  background: linear-gradient(135deg, #1e3a8a 0%, #0369a1 50%, #0c4a6e 100%);
-  border-color: #0284c7;
+  background: var(--surface-3);
+  border-color: #4f4f4f;
   transform: scale(1.05);
 }
 
 .avatar-button:focus-visible {
-  outline: 2px solid #0284c7;
+  outline: 2px solid #666;
   outline-offset: 2px;
 }
 
@@ -184,9 +284,10 @@ body {
   transform: scale(0.95);
 }
 
-.avatar-button svg {
-  width: 20px;
-  height: 20px;
+.avatar-logo {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .workspace-grid {
@@ -860,15 +961,16 @@ body {
 }
 
 .trade-manager-content--left .trade-manager-metric-label {
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .trade-manager-content--left .trade-manager-metric-value {
-  font-size: 13px;
+  font-size: 15px;
 }
 
 .trade-manager-metrics-grid--left {
   grid-template-columns: 1fr 1fr;
+  gap: 10px;
 }
 
 .trade-manager-metric-item--left {
@@ -877,6 +979,10 @@ body {
   justify-content: flex-start;
   gap: 4px;
   text-align: center;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-3) 70%, var(--surface-2));
 }
 
 .trade-manager-metric-item--left .trade-manager-metric-label {

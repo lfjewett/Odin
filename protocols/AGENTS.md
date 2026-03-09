@@ -24,12 +24,12 @@ If there is any conflict between implementation code and ACP docs/schemas, ACP d
 ## Mandatory Implementation Rules
 
 - spec_version must equal the value in version/current.txt
-- Subscription interval must be one of: 1m, 5m, 15m, 30m, 1h, 4h, 1d
+- Subscription interval must be one of: 1m, 2m, 3m, 4m, 5m, 10m, 15m, 20m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 2d, 1w, 1M
 - Subscriptions are single-symbol only
-- No auth/discovery assumptions for ACP-0.2.0
+- No auth assumptions for ACP-0.3.0
 - Transport model:
-  - REST /metadata endpoint for agent configuration discovery
-  - REST /history endpoint for backfill snapshots (with mutable candle status/revision)
+  - REST /metadata endpoint for base-URL discovery and capability negotiation
+  - REST /history endpoint required only for `agent_type=price`
   - WebSocket for live data and bidirectional session traffic (not polled)
 - Delivery semantics: at-least-once
 - Dedup semantics:
@@ -41,7 +41,10 @@ If there is any conflict between implementation code and ACP docs/schemas, ACP d
   - emit reconciliation updates as session_reconciled when backend confirms/polls REST state
   - emit final only when backend finalization policy marks a bar terminal
   - rev must be monotonic per bar id
-  - session_id is required on ACP-0.2.0 WebSocket protocol messages
+  - session_id is required on ACP-0.3.0 WebSocket protocol messages
+- Agent roles:
+  - `price` | `indicator` | `event`
+  - indicator selection is metadata-driven via `indicator_id` and params
 
 ## Required Output Contract For Agents
 
