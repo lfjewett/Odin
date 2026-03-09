@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from app.agent_data_store import SessionDataStore
 from app.agent_manager import agent_manager
-from app.models import AgentConfig, SessionManager
+from app.models import AgentConfig, SessionManager, Variable, build_variable_name
 from app.workspace_store import WorkspaceStore
 
 ACP_SPEC_VERSION = "ACP-0.3.0"
@@ -531,6 +531,100 @@ async def delete_workspace(workspace_name: str):
     return {
         "deleted": workspace_name,
         "active_workspace": active_workspace,
+    }
+
+
+@app.get("/api/sessions/{session_id}/variables")
+async def get_session_variables(session_id: str):
+    """
+    Get all available data variables for a session.
+    
+    Returns OHLCV fields (OPEN, HIGH, LOW, CLOSE, VOLUME) plus all active indicator outputs.
+    For multi-output indicators (bands, etc.), each field is returned as a separate variable.
+    """
+    # Check if session exists
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Check if we have a data store for this session
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        raise HTTPException(status_code=404, detail="Session data store not found")
+    
+    variables: list[Variable] = []
+    
+    # Add OHLCV base variables
+    ohlcv_fields = ["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]
+    for field in ohlcv_fields:
+        variables.append(Variable(
+            name=field,
+            type="ohlcv",
+            schema="number",
+            agent_id=None,
+            output_id=None
+        ))
+    
+    # Get all indicator agents that have data in this session
+    # The data_store.latest_non_ohlc_by_key is keyed by (agent_id, record_id)
+    indicator_agent_ids = set()
+    for (agent_id, _) in data_store.latest_non_ohlc_by_key.keys():
+        indicator_agent_ids.add(agent_id)
+    
+    # For each indicator agent, get its outputs from metadata
+    for agent_id in indicator_agent_ids:
+        agent = agent_manager.get_agent(agent_id)
+        if not agent:
+            continue
+        
+        agent_name = agent.config.agent_name
+        outputs = agent.config.outputs
+        
+        for output in outputs:
+            output_schema = output.get("schema", "line")
+            output_id = output.get("output_id", "")
+            
+            # For simple schemas (line, histogram), create one variable
+            if output_schema in ["line", "histogram", "event", "forecast"]:
+                var_name = build_variable_name(agent_name, output)
+                variables.append(Variable(
+                    name=var_name,
+                    type="indicator",
+                    schema=output_schema,
+                    agent_id=agent_id,
+                    output_id=output_id
+                ))
+            
+            # For band schema, create separate variables for each field
+            elif output_schema == "band":
+                label = output.get("label", output_id)
+                for field in ["upper", "lower", "center"]:
+                    var_name = f"{agent_name}:{label}:{field}"
+                    variables.append(Variable(
+                        name=var_name,
+                        type="indicator",
+                        schema="band",
+                        agent_id=agent_id,
+                        output_id=output_id
+                    ))
+            
+            # For ohlc schema (though unlikely for indicators)
+            elif output_schema == "ohlc":
+                label = output.get("label", output_id)
+                for field in ["open", "high", "low", "close", "volume"]:
+                    var_name = f"{agent_name}:{label}:{field}"
+                    variables.append(Variable(
+                        name=var_name,
+                        type="indicator",
+                        schema="ohlc",
+                        agent_id=agent_id,
+                        output_id=output_id
+                    ))
+    
+    return {
+        "session_id": session_id,
+        "variables": [v.model_dump() for v in variables],
+        "count": len(variables)
     }
 
 

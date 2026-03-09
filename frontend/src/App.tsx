@@ -22,6 +22,7 @@ import type { OHLCBar } from "./history/fetchHistory";
 import { useAgentSubscriptions, type AgentSubscription } from "./hooks/useAgentSubscriptions";
 import AgentConfigModal from "./components/AgentConfigModal";
 import AddIndicatorAgentModal from "./components/AddIndicatorAgentModal";
+import { TradeManagerModal } from "./components/TradeManagerModal";
 import { formatEasternTime24 } from "./utils/time";
 import {
   activateWorkspace,
@@ -109,6 +110,7 @@ export default function App() {
   const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
   const [currentWorkspaceName, setCurrentWorkspaceName] = useState<string>(DEFAULT_WORKSPACE_NAME);
   const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false);
+  const [showTradeManager, setShowTradeManager] = useState(false);
   const lastSubscribeKeyRef = useRef<string | null>(null);
   const pendingSnapshotRef = useRef<SnapshotEvent | null>(null);
   const hasInitializedWorkspaceRef = useRef(false);
@@ -771,8 +773,7 @@ export default function App() {
       const isLeftTradeManager = widget.id === "tradingBots2";
 
       return (
-        <article className={`trade-manager-content ${isRightTradeManager ? "trade-manager-content--right" : ""} ${isLeftTradeManager ? "trade-manager-content--left" : ""}`}>
-
+        <>
           <div
             className={`trade-manager-sparkline-wrap ${isRightTradeManager ? "trade-manager-sparkline-wrap--compact" : ""}`}
             aria-label="Equity curve mock"
@@ -828,7 +829,7 @@ export default function App() {
           {(isRightTradeManager || isLeftTradeManager) && (
             <div className="trade-manager-toggle-bottom">{profitToggle}</div>
           )}
-        </article>
+        </>
       );
     },
     [
@@ -876,7 +877,7 @@ export default function App() {
                     className="widget-config-button"
                     onMouseDown={(event) => event.stopPropagation()}
                     onClick={() => {
-                      console.log("[Trade Manager] Configure clicked");
+                      setShowTradeManager(true);
                     }}
                   >
                     Configure
@@ -907,7 +908,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.49</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.50</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
@@ -1135,6 +1136,13 @@ export default function App() {
         discoverAgent={discoverAgent}
         createSubscription={createSubscription}
       />
+
+      {showTradeManager && (
+        <TradeManagerModal
+          sessionId={getSessionId()}
+          onClose={() => setShowTradeManager(false)}
+        />
+      )}
     </div>
   );
 }

@@ -107,3 +107,26 @@ export async function deleteWorkspace(name: string): Promise<{ deleted: string; 
 
   return response.json();
 }
+
+export interface Variable {
+  name: string;
+  type: "ohlcv" | "indicator";
+  schema: string;
+  agent_id: string | null;
+  output_id: string | null;
+}
+
+export interface SessionVariablesResponse {
+  session_id: string;
+  variables: Variable[];
+  count: number;
+}
+
+export async function getSessionVariables(sessionId: string): Promise<SessionVariablesResponse> {
+  const response = await fetch(`${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/variables`);
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to get session variables: ${response.statusText}`);
+  }
+  return response.json();
+}

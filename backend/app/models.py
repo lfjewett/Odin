@@ -170,6 +170,26 @@ class Session(BaseModel):
         self.last_activity_at = datetime.now(timezone.utc).isoformat()
 
 
+class Variable(BaseModel):
+    """Represents a data variable available in a trading session"""
+    name: str = Field(description="Display name for the variable (e.g., 'OPEN', 'SMA-20:value')")
+    type: Literal["ohlcv", "indicator"] = Field(description="Variable type")
+    schema: str = Field(description="Data schema (e.g., 'number', 'line', 'band', 'histogram')")
+    agent_id: str | None = Field(default=None, description="Source agent ID for indicators")
+    output_id: str | None = Field(default=None, description="Output ID from agent metadata")
+
+
+def build_variable_name(agent_name: str, output: dict[str, Any]) -> str:
+    """
+    Construct variable name from agent name and output descriptor.
+    
+    Format: {agent-name}:{output-label} or {agent-name}:{output-id}
+    For multi-output indicators, field names are appended: {agent-name}:{label}:field
+    """
+    label = output.get("label", output.get("output_id", "value"))
+    return f"{agent_name}:{label}"
+
+
 class SessionManager:
     """Manages session lifecycle"""
     
