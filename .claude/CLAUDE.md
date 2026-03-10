@@ -1,5 +1,7 @@
 - Everytime you edit the frontend app change the string at the top that says ODIN Market Workspace v0.xx to increment it to the next number
 
+- For any UI/Backend state, event-stream, sync, subscription, or reconciliation change, consult and update `docs/ui-backend-sync-contract.md` in the same change.
+
 ## Chart Enhancements & Custom Primitives
 
 For advanced chart modifications (time-region shading, overlays, etc.) in lightweight-charts, use the **custom primitive plugin pattern** rather than DOM overlays:

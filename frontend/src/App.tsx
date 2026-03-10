@@ -14,12 +14,15 @@ import {
   StatusUpdate, 
   SnapshotEvent,
   OverlayEvent,
-  OverlayHistoryEvent
+  OverlayHistoryEvent,
+  StateEvent,
+  SyncSnapshot,
 } from "./stream/useEventStream";
 import { ChartView } from "./chart/ChartView";
 import { MarketCandle, OverlayRecord, OverlaySchema } from "./types/events";
 import type { OHLCBar } from "./history/fetchHistory";
 import { useAgentSubscriptions, type AgentSubscription } from "./hooks/useAgentSubscriptions";
+import { useSyncCoordinator } from "./hooks/useSyncCoordinator";
 import AgentConfigModal from "./components/AgentConfigModal";
 import AddIndicatorAgentModal from "./components/AddIndicatorAgentModal";
 import { TradeManagerModal } from "./components/TradeManagerModal";
@@ -106,6 +109,8 @@ export default function App() {
   const markersHydratedKeyRef = useRef<string | null>(null);
   const performanceHydratedKeyRef = useRef<string | null>(null);
   const lastAutoApplyKeyRef = useRef<string | null>(null);
+  const lastTradeAutoHealKeyRef = useRef<string | null>(null);
+  const lastTradeAutoHealAtRef = useRef<number>(0);
   
   // Session management for ACP v0.4.x
   const sessionIdRef = useRef<string | null>(null);
@@ -145,12 +150,25 @@ export default function App() {
     subscriptions,
     loading: subscriptionsLoading,
     error: subscriptionsError,
+    stale: subscriptionsStale,
+    lastSuccessfulRefreshAt,
+    refresh: refreshSubscriptions,
     updateAgentStatus,
     discoverAgent,
     createSubscription,
     updateSubscription,
     deleteSubscription,
   } = useAgentSubscriptions();
+
+  const {
+    clientRevisions,
+    staleDomains,
+    tradeFreshness,
+    onStateEvent,
+    onSyncSnapshot,
+    markTradeFresh,
+    markTradeSyncing,
+  } = useSyncCoordinator();
 
   const handleAgentCreated = useCallback((_agentId: string) => {
   }, []);
@@ -511,6 +529,117 @@ export default function App() {
     });
   }, [resolveOverlayAgentId, buildOverlaySeriesKey]);
 
+  const handleStateEvent = useCallback(
+    (event: StateEvent) => {
+      onStateEvent(event as any);
+
+      if (event.domain === "agent") {
+        void refreshSubscriptions(true);
+      }
+
+      const currentSessionId = getSessionId();
+      if (!event.session_id || event.session_id !== currentSessionId) {
+        return;
+      }
+
+      if (event.event_name === "trade.results.invalidated") {
+        markTradeSyncing();
+        return;
+      }
+
+      if (event.event_name === "trade.results.recomputed") {
+        const payload = event.payload || {};
+        const result = (payload.result || null) as ApplyTradeStrategyResponse | null;
+        if (!result) {
+          return;
+        }
+        setTradeMarkers(result.markers || []);
+        setTradePerformance(result.performance || null);
+        if (result.strategy_name) {
+          setAppliedStrategyName(result.strategy_name);
+        }
+        markTradeFresh();
+      }
+    },
+    [getSessionId, markTradeFresh, markTradeSyncing, onStateEvent, refreshSubscriptions]
+  );
+
+  const handleSyncSnapshot = useCallback(
+    (snapshot: SyncSnapshot) => {
+      onSyncSnapshot(snapshot as any);
+
+      if (snapshot.stale_domains.includes("agent")) {
+        void refreshSubscriptions(true);
+      }
+
+      if (!snapshot.stale_domains.includes("trade")) {
+        return;
+      }
+
+      const currentSessionId = getSessionId();
+      const tradeSession = (snapshot.trade_sessions || []).find(
+        (entry) => entry.session_id === currentSessionId
+      );
+      if (!tradeSession) {
+        if (!appliedStrategyName || strategyCandlesById.size === 0) {
+          return;
+        }
+
+        const tradeRevision = snapshot.server_revisions?.trade ?? 0;
+        const healKey = `${currentSessionId}:${appliedStrategyName}:${tradeRevision}`;
+        const now = Date.now();
+        const recentlyAttempted =
+          lastTradeAutoHealKeyRef.current === healKey && now - lastTradeAutoHealAtRef.current < 15000;
+
+        if (recentlyAttempted) {
+          return;
+        }
+
+        lastTradeAutoHealKeyRef.current = healKey;
+        lastTradeAutoHealAtRef.current = now;
+
+        console.log("[TradeManager] Auto-healing stale trade state", {
+          currentSessionId,
+          appliedStrategyName,
+          tradeRevision,
+        });
+
+        void (async () => {
+          try {
+            markTradeSyncing();
+            const applied = await applyTradeStrategy(currentSessionId, { strategy_name: appliedStrategyName });
+            setTradeMarkers(applied.markers || []);
+            setTradePerformance(applied.performance || null);
+            if (applied.strategy_name) {
+              setAppliedStrategyName(applied.strategy_name);
+            }
+            markTradeFresh();
+          } catch (error) {
+            console.warn("[TradeManager] Auto-heal apply failed", error);
+          }
+        })();
+        return;
+      }
+
+      const result = tradeSession.result as ApplyTradeStrategyResponse;
+      setTradeMarkers(result.markers || []);
+      setTradePerformance(result.performance || null);
+      if (result.strategy_name) {
+        setAppliedStrategyName(result.strategy_name);
+      }
+      markTradeFresh();
+    },
+    [
+      appliedStrategyName,
+      getSessionId,
+      markTradeFresh,
+      markTradeSyncing,
+      onSyncSnapshot,
+      refreshSubscriptions,
+      strategyCandlesById.size,
+    ]
+  );
+
   const { isConnected, sendSubscribeRequest } = useEventStream(
     (event: CandleEvent) => {
       const activeAgentId = selectedAgent?.id ?? selectedAgentId ?? null;
@@ -549,7 +678,10 @@ export default function App() {
     handleStatusUpdate,
     handleSnapshot,
     handleOverlay,
-    handleOverlayHistory
+    handleOverlayHistory,
+    handleStateEvent,
+    handleSyncSnapshot,
+    () => clientRevisions
   );
 
   const handleCandleReceived = useCallback(
@@ -1071,6 +1203,11 @@ export default function App() {
                 ))}
               </ul>
             )}
+            {subscriptionsStale && (
+              <div className="error-banner">
+                ⚠️ Agent state may be stale{lastSuccessfulRefreshAt ? ` (last sync ${new Date(lastSuccessfulRefreshAt).toLocaleTimeString()})` : ""}
+              </div>
+            )}
           </>
         );
       }
@@ -1100,6 +1237,11 @@ export default function App() {
             <div className="widget-active-strategy">
               <span className="widget-active-strategy-label">Active Strategy</span>
               <span className="widget-active-strategy-name">{appliedStrategyName}</span>
+              {(tradeFreshness !== "fresh" || staleDomains.includes("trade")) && (
+                <span className="widget-active-strategy-label">
+                  {tradeFreshness === "syncing" ? "Syncing…" : "Stale"}
+                </span>
+              )}
             </div>
           )}
           <div
@@ -1159,6 +1301,8 @@ export default function App() {
     [
       subscriptionsLoading,
       subscriptionsError,
+      subscriptionsStale,
+      lastSuccessfulRefreshAt,
       subscriptions,
       strategyPerformance,
       selectedAgentId,
@@ -1167,6 +1311,8 @@ export default function App() {
       selectedSymbol,
       symbolSearch,
       appliedStrategyName,
+      tradeFreshness,
+      staleDomains,
     ]
   );
 
@@ -1254,7 +1400,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.80</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.84</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
@@ -1468,8 +1614,7 @@ export default function App() {
           // then re-apply the strategy to get fresh results based on new indicator values
           if (appliedStrategyName) {
             console.log("[Indicator Update] Invalidating trades and re-applying strategy", { appliedStrategyName });
-            setTradeMarkers([]);
-            setTradePerformance(null);
+            markTradeSyncing();
             
             try {
               const sessionId = getSessionId();
@@ -1477,6 +1622,7 @@ export default function App() {
               const applied = await applyTradeStrategy(sessionId, { strategy_name: appliedStrategyName });
               setTradeMarkers(applied.markers || []);
               setTradePerformance(applied.performance || null);
+              markTradeFresh();
               console.log("[Indicator Update] Strategy re-applied successfully", {
                 markerCount: applied.marker_count,
                 hasPerformance: Boolean(applied.performance),

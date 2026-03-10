@@ -64,7 +64,7 @@ agents:
   description: Simple moving average over close price
   agent_type: indicator
   config_schema:
-    period: 200
+    period: 5000
     line_color: '#5d1b93'
   outputs:
   - output_id: sma.line

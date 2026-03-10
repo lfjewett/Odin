@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from typing import Any, Set
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -37,6 +38,7 @@ ACP_SPEC_VERSION = "ACP-0.4.1"
 ACP_API_VERSION = "0.4.1"
 COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
+SUBSCRIBE_PROPAGATION_DELAY_SECONDS = 0.05
 INDICATOR_OHLC_FIELDS = {
     "id",
     "seq",
@@ -130,6 +132,68 @@ def _normalize_strategy_rules_payload(payload: dict[str, Any]) -> tuple[str, lis
 
     return long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules
 
+
+def sanitize_indicator_params(
+    params: dict[str, Any] | None,
+    indicators_catalog: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """
+    Normalize indicator params to agent-declared schema ranges/types.
+
+    Prevents subscribe rejection (e.g., period out of allowed bounds).
+    Unknown params are passed through unchanged.
+    """
+    incoming = dict(params or {})
+    catalog = indicators_catalog or []
+
+    schema_by_name: dict[str, dict[str, Any]] = {}
+    for indicator in catalog:
+        params_schema = indicator.get("params_schema")
+        if isinstance(params_schema, dict):
+            for key, schema in params_schema.items():
+                if isinstance(schema, dict):
+                    schema_by_name.setdefault(str(key), schema)
+
+    if not schema_by_name:
+        return incoming
+
+    normalized: dict[str, Any] = dict(incoming)
+    for key, schema in schema_by_name.items():
+        if key not in incoming:
+            continue
+
+        value = incoming.get(key)
+        field_type = str(schema.get("type") or "").lower()
+        min_value = schema.get("min")
+        max_value = schema.get("max")
+
+        try:
+            if field_type == "integer":
+                if isinstance(value, bool):
+                    raise ValueError("bool is not valid integer param")
+                coerced = int(value)
+                if isinstance(min_value, (int, float)):
+                    coerced = max(coerced, int(min_value))
+                if isinstance(max_value, (int, float)):
+                    coerced = min(coerced, int(max_value))
+                normalized[key] = coerced
+            elif field_type in {"number", "float"}:
+                coerced_float = float(value)
+                if isinstance(min_value, (int, float)):
+                    coerced_float = max(coerced_float, float(min_value))
+                if isinstance(max_value, (int, float)):
+                    coerced_float = min(coerced_float, float(max_value))
+                normalized[key] = coerced_float
+        except (TypeError, ValueError):
+            if "default" in schema:
+                normalized[key] = schema.get("default")
+            elif isinstance(min_value, (int, float)):
+                normalized[key] = int(min_value) if field_type == "integer" else float(min_value)
+            else:
+                normalized.pop(key, None)
+
+    return normalized
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -160,6 +224,99 @@ history_response_chunks: dict[tuple[str, str, str], dict[str, Any]] = {}
 # Workspace persistence store
 workspace_store: WorkspaceStore | None = None
 trade_strategy_store: TradeStrategyStore | None = None
+
+# Domain revision tracking for frontend/backend sync reconciliation.
+domain_revisions: dict[str, int] = {
+    "agent": 0,
+    "overlay": 0,
+    "trade": 0,
+    "workspace": 0,
+}
+
+# Per-session trade revision and latest computed trade result cache.
+session_trade_revisions: dict[str, int] = {}
+latest_trade_results_by_session: dict[str, dict[str, Any]] = {}
+
+# Last applied strategy state per session so backend can auto-recompute.
+applied_trade_strategy_by_session: dict[str, dict[str, Any]] = {}
+
+# Cooldown guard for indicator subscription recovery attempts.
+indicator_recovery_last_attempt: dict[tuple[str, str], datetime] = {}
+
+
+def _bump_domain_revision(domain: str) -> int:
+    current = int(domain_revisions.get(domain, 0)) + 1
+    domain_revisions[domain] = current
+    return current
+
+
+def _bump_trade_revision_for_session(session_id: str) -> int:
+    next_rev = int(session_trade_revisions.get(session_id, 0)) + 1
+    session_trade_revisions[session_id] = next_rev
+    return next_rev
+
+
+def _snapshot_domain_revisions() -> dict[str, int]:
+    return {
+        "agent": int(domain_revisions.get("agent", 0)),
+        "overlay": int(domain_revisions.get("overlay", 0)),
+        "trade": int(domain_revisions.get("trade", 0)),
+        "workspace": int(domain_revisions.get("workspace", 0)),
+    }
+
+
+async def _send_json_to_client(client_id: str, payload: dict[str, Any]) -> None:
+    websocket = active_connections.get(client_id)
+    if not websocket:
+        return
+    try:
+        await websocket.send_json(payload)
+    except Exception as exc:
+        logger.debug("Failed to send payload to client %s: %s", client_id, exc)
+
+
+async def emit_state_event(
+    *,
+    event_name: str,
+    domain: str,
+    payload: dict[str, Any],
+    session_id: str | None = None,
+    target_client_id: str | None = None,
+    causation_id: str | None = None,
+) -> None:
+    domain_revision = _bump_domain_revision(domain)
+
+    message: dict[str, Any] = {
+        "type": "state_event",
+        "event_id": str(uuid4()),
+        "event_name": event_name,
+        "domain": domain,
+        "revision": domain_revision,
+        "server_revisions": _snapshot_domain_revisions(),
+        "emitted_at": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+    }
+
+    if session_id:
+        message["session_id"] = session_id
+        if domain == "trade":
+            message["session_revision"] = _bump_trade_revision_for_session(session_id)
+
+    if causation_id:
+        message["causation_id"] = causation_id
+
+    if target_client_id:
+        await _send_json_to_client(target_client_id, message)
+        return
+
+    if session_id:
+        session = session_manager.get_session(session_id)
+        if session:
+            await _send_json_to_client(session.client_id, message)
+        return
+
+    for client_id in list(active_connections.keys()):
+        await _send_json_to_client(client_id, message)
 
 
 def get_workspace_store() -> WorkspaceStore:
@@ -391,11 +548,94 @@ async def rebootstrap_indicator_subscription(indicator_agent_id: str, session_id
     canonical_candles = data_store.get_canonical_candles()
     candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
 
+    await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
+
     await indicator_connection.send_history_push(
         session_id=session_id,
         symbol=str(subscription.get("symbol") or ""),
         interval=str(subscription.get("interval") or ""),
         candles=candles_for_indicator,
+    )
+
+
+async def recover_indicator_subscription(indicator_agent_id: str, session_id: str) -> None:
+    """
+    Recover indicator subscription state when agent rejects history_push with SUBSCRIPTION_NOT_FOUND.
+
+    This can occur during transient ordering/race conditions inside indicator agents.
+    """
+    recovery_key = (indicator_agent_id, session_id)
+    now = datetime.now(timezone.utc)
+    last_attempt = indicator_recovery_last_attempt.get(recovery_key)
+    if last_attempt and (now - last_attempt).total_seconds() < 5:
+        logger.info(
+            "[Recovery] Skipping rapid retry for indicator=%s session=%s",
+            indicator_agent_id,
+            session_id,
+        )
+        return
+
+    indicator_recovery_last_attempt[recovery_key] = now
+
+    indicator_connection = agent_manager.get_connection(indicator_agent_id)
+    if not indicator_connection:
+        return
+
+    subscription = indicator_connection.subscriptions.get(session_id)
+    if not subscription:
+        logger.warning(
+            "[Recovery] No local subscription found for indicator=%s session=%s",
+            indicator_agent_id,
+            session_id,
+        )
+        return
+
+    symbol = str(subscription.get("symbol") or "")
+    interval = str(subscription.get("interval") or "")
+    params = sanitize_indicator_params(
+        subscription.get("params") or {},
+        indicator_connection.agent.config.indicators,
+    )
+    if not symbol or not interval:
+        return
+
+    subscribe_ok = await indicator_connection.subscribe(
+        session_id=session_id,
+        symbol=symbol,
+        interval=interval,
+        params=params,
+        force=True,
+    )
+    if not subscribe_ok:
+        logger.warning(
+            "[Recovery] Re-subscribe failed for indicator=%s session=%s",
+            indicator_agent_id,
+            session_id,
+        )
+        return
+
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        return
+
+    canonical_candles = data_store.get_canonical_candles()
+    if not canonical_candles:
+        return
+
+    candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
+    await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
+
+    await indicator_connection.send_history_push(
+        session_id=session_id,
+        symbol=symbol,
+        interval=interval,
+        candles=candles_for_indicator,
+    )
+    logger.info(
+        "[Recovery] Recovered indicator subscription for %s (session=%s, candles=%s)",
+        indicator_agent_id,
+        session_id,
+        len(candles_for_indicator),
     )
 
 
@@ -426,7 +666,7 @@ async def add_agent(request: AddAgentRequest):
     base_agent_id = metadata["agent_id"]
     agent_type = metadata["agent_type"]
     selected_indicator = None
-    runtime_config = request.params or {}
+    runtime_config = sanitize_indicator_params(request.params or {}, metadata.get("indicators") or [])
     outputs = metadata.get("outputs") or []
     description = metadata.get("description", "")
 
@@ -505,6 +745,8 @@ async def add_agent(request: AddAgentRequest):
 
             candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
 
+            await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
+
             await connection.send_history_push(
                 session_id=session_id,
                 symbol=symbol,
@@ -515,6 +757,15 @@ async def add_agent(request: AddAgentRequest):
     # Persist agents to YAML after adding
     if agent_manager.config_file_path:
         agent_manager.persist_agents_to_yaml(agent_manager.config_file_path)
+
+    await emit_state_event(
+        event_name="agent.config.changed",
+        domain="agent",
+        payload={
+            "agent_id": final_agent_id,
+            "action": "added",
+        },
+    )
 
     return {
         "agent": agent.to_frontend_format(),
@@ -531,6 +782,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
 
     updated_config = dict(agent.config.config_schema or {})
     updated_config.update(request.params or {})
+    updated_config = sanitize_indicator_params(updated_config, agent.config.indicators)
 
     updated_agent_config = AgentConfig(
         spec_version=agent.config.spec_version,
@@ -549,6 +801,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
     updated_agent = agent_manager.add_or_update_agent(updated_agent_config)
 
     connection = agent_manager.get_connection(agent_id)
+    affected_sessions: list[str] = []
     if connection and updated_agent.config.agent_type == "indicator":
         subscriptions = list(connection.subscriptions.items())
         for session_id, subscription in subscriptions:
@@ -556,6 +809,8 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
             interval = str(subscription.get("interval") or "")
             if not symbol or not interval:
                 continue
+
+            affected_sessions.append(session_id)
 
             await connection.subscribe(
                 session_id=session_id,
@@ -569,6 +824,8 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                 if canonical_candles:
                     candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
 
+                    await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
+
                     await connection.send_history_push(
                         session_id=session_id,
                         symbol=symbol,
@@ -579,6 +836,57 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
     # Persist agents to YAML after updating
     if agent_manager.config_file_path:
         agent_manager.persist_agents_to_yaml(agent_manager.config_file_path)
+
+    await emit_state_event(
+        event_name="agent.config.changed",
+        domain="agent",
+        payload={
+            "agent_id": agent_id,
+            "action": "updated",
+            "params": updated_config,
+        },
+    )
+
+    for session_id in sorted(set(affected_sessions)):
+        await emit_state_event(
+            event_name="trade.results.invalidated",
+            domain="trade",
+            session_id=session_id,
+            payload={
+                "session_id": session_id,
+                "reason": "indicator_config_changed",
+                "agent_id": agent_id,
+            },
+        )
+
+        strategy = applied_trade_strategy_by_session.get(session_id)
+        data_store = session_data_stores.get(session_id)
+        if not strategy or not data_store:
+            continue
+
+        try:
+            result = evaluate_strategy(
+                session_id=session_id,
+                strategy_name=str(strategy.get("strategy_name") or "Unsaved Strategy"),
+                long_entry_rule=str(strategy.get("long_entry_rule") or ""),
+                long_exit_rules=list(strategy.get("long_exit_rules") or []),
+                short_entry_rule=str(strategy.get("short_entry_rule") or ""),
+                short_exit_rules=list(strategy.get("short_exit_rules") or []),
+                data_store=data_store,
+            )
+            latest_trade_results_by_session[session_id] = result
+            await emit_state_event(
+                event_name="trade.results.recomputed",
+                domain="trade",
+                session_id=session_id,
+                payload={
+                    "session_id": session_id,
+                    "strategy_name": strategy.get("strategy_name"),
+                    "result": result,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Auto-recompute failed for session %s after agent update: %s", session_id, exc)
 
     return {"agent": updated_agent.to_frontend_format()}
 
@@ -604,6 +912,15 @@ async def delete_agent(agent_id: str):
     # Persist agents to YAML after deleting
     if agent_manager.config_file_path:
         agent_manager.persist_agents_to_yaml(agent_manager.config_file_path)
+
+    await emit_state_event(
+        event_name="agent.config.changed",
+        domain="agent",
+        payload={
+            "agent_id": agent_id,
+            "action": "deleted",
+        },
+    )
 
     return {"deleted": agent_id}
 
@@ -634,6 +951,11 @@ async def upsert_workspace(workspace_name: str, request: UpsertWorkspaceRequest)
 
     store = get_workspace_store()
     workspace = store.upsert_workspace(name, request.state, request.schema_version)
+    await emit_state_event(
+        event_name="workspace.changed",
+        domain="workspace",
+        payload={"workspace": name, "action": "saved"},
+    )
     return workspace
 
 
@@ -645,6 +967,11 @@ async def activate_workspace(workspace_name: str):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     store.set_active_workspace(workspace_name)
+    await emit_state_event(
+        event_name="workspace.changed",
+        domain="workspace",
+        payload={"workspace": workspace_name, "action": "activated"},
+    )
     return {
         "active_workspace": workspace_name,
         "workspace": workspace,
@@ -672,6 +999,12 @@ async def delete_workspace(workspace_name: str):
         if remaining:
             store.set_active_workspace(remaining[0]["name"])
             active_workspace = remaining[0]["name"]
+
+    await emit_state_event(
+        event_name="workspace.changed",
+        domain="workspace",
+        payload={"workspace": workspace_name, "action": "deleted", "active_workspace": active_workspace},
+    )
 
     return {
         "deleted": workspace_name,
@@ -923,6 +1256,26 @@ async def apply_trade_strategy(session_id: str, request: ApplyTradeStrategyReque
         len(performance.get("equity_curve", [])) if isinstance(performance, dict) else None,
     )
 
+    latest_trade_results_by_session[session_id] = result
+    applied_trade_strategy_by_session[session_id] = {
+        "strategy_name": strategy_name,
+        "long_entry_rule": long_entry_rule,
+        "long_exit_rules": long_exit_rules,
+        "short_entry_rule": short_entry_rule,
+        "short_exit_rules": short_exit_rules,
+    }
+
+    await emit_state_event(
+        event_name="trade.results.recomputed",
+        domain="trade",
+        session_id=session_id,
+        payload={
+            "session_id": session_id,
+            "strategy_name": strategy_name,
+            "result": result,
+        },
+    )
+
     return result
 
 
@@ -983,6 +1336,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 elif message_type == "resync_request":
                     await handle_resync_request(websocket, client_id, payload)
+
+                elif message_type == "client_sync":
+                    await handle_client_sync_request(websocket, client_id, payload)
                 
                 else:
                     logger.debug(f"📨 Received {message_type} from client {client_id}")
@@ -1015,6 +1371,9 @@ async def websocket_endpoint(websocket: WebSocket):
             if session_id in session_data_stores:
                 del session_data_stores[session_id]
             session_seq_counters.pop(session_id, None)
+            session_trade_revisions.pop(session_id, None)
+            latest_trade_results_by_session.pop(session_id, None)
+            applied_trade_strategy_by_session.pop(session_id, None)
             clear_history_response_state_for_session(session_id)
             for key in [k for k in indicator_seq_counters.keys() if k[1] == session_id]:
                 indicator_seq_counters.pop(key, None)
@@ -1169,15 +1528,21 @@ async def handle_subscribe_request(
             continue
 
         logger.info(f"🎯 Subscribing indicator agent {indicator_config.agent_id} for session {session_id}")
+        indicator_params = sanitize_indicator_params(
+            indicator_config.config_schema,
+            indicator_config.indicators,
+        )
+
         indicator_subscribe_result = await indicator_connection.subscribe(
             session_id=session_id,
             symbol=symbol,
             interval=interval,
-            params=indicator_config.config_schema,
+            params=indicator_params,
         )
 
         if indicator_subscribe_result and canonical_candles:
             candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
+            await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
             await indicator_connection.send_history_push(
                 session_id=session_id,
                 symbol=symbol,
@@ -1227,6 +1592,9 @@ async def handle_unsubscribe_request(
     if session_id in session_data_stores:
         del session_data_stores[session_id]
     session_seq_counters.pop(session_id, None)
+    session_trade_revisions.pop(session_id, None)
+    latest_trade_results_by_session.pop(session_id, None)
+    applied_trade_strategy_by_session.pop(session_id, None)
     clear_history_response_state_for_session(session_id)
     for key in [k for k in indicator_seq_counters.keys() if k[1] == session_id]:
         indicator_seq_counters.pop(key, None)
@@ -1271,6 +1639,52 @@ async def handle_resync_request(
         logger.error(f"Failed to send resync_response to {client_id}: {e}")
 
 
+async def handle_client_sync_request(
+    websocket: WebSocket,
+    client_id: str,
+    payload: dict,
+) -> None:
+    """Handle revision-based client sync requests for stale-domain reconciliation."""
+    incoming = payload.get("revisions")
+    client_revisions = incoming if isinstance(incoming, dict) else {}
+
+    stale_domains: list[str] = []
+    server_revisions = _snapshot_domain_revisions()
+
+    for domain, server_rev in server_revisions.items():
+        try:
+            client_rev = int(client_revisions.get(domain, -1))
+        except (TypeError, ValueError):
+            client_rev = -1
+        if client_rev < server_rev:
+            stale_domains.append(domain)
+
+    trade_sessions: list[dict[str, Any]] = []
+    if "trade" in stale_domains:
+        for session in session_manager.get_client_sessions(client_id):
+            result = latest_trade_results_by_session.get(session.session_id)
+            if result:
+                trade_sessions.append(
+                    {
+                        "session_id": session.session_id,
+                        "result": result,
+                    }
+                )
+
+    response = {
+        "type": "sync_snapshot",
+        "emitted_at": datetime.now(timezone.utc).isoformat(),
+        "server_revisions": server_revisions,
+        "stale_domains": stale_domains,
+        "trade_sessions": trade_sessions,
+    }
+
+    try:
+        await websocket.send_json(response)
+    except Exception as exc:
+        logger.debug("Failed to send sync_snapshot to %s: %s", client_id, exc)
+
+
 async def send_heartbeats(websocket: WebSocket, client_id: str):
     """Send periodic heartbeat messages to keep connection alive"""
     while True:
@@ -1311,10 +1725,25 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
     if message_type == "heartbeat":
         # Update agent status and forward
         agent = agent_manager.get_agent(agent_id)
+        previous_status: str | None = None
         if agent:
+            previous_status = agent.status.status
             agent.status.status = "online"
             agent.status.last_activity_ts = datetime.now(timezone.utc).isoformat()
             agent.status.error_message = None
+
+        if previous_status and previous_status != "online":
+            await emit_state_event(
+                event_name="agent.status.changed",
+                domain="agent",
+                session_id=session_id,
+                target_client_id=client_id,
+                payload={
+                    "agent_id": agent_id,
+                    "status": "online",
+                    "previous_status": previous_status,
+                },
+            )
         
         status_message = {
             "type": "heartbeat",
@@ -1431,6 +1860,47 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
     elif message_type == "error":
         # Forward error message
         logger.error(f"❌ Agent {agent_id} error: {message.get('code')} - {message.get('message')}")
+        error_code = str(message.get("code") or "")
+        error_text = str(message.get("message") or "")
+
+        if error_code == "SUBSCRIPTION_NOT_FOUND":
+            logger.warning(
+                "[Recovery] Triggered by %s for indicator=%s session=%s message=%s",
+                error_code,
+                agent_id,
+                session_id,
+                error_text,
+            )
+            try:
+                await recover_indicator_subscription(agent_id, session_id)
+            except Exception as exc:
+                logger.warning(
+                    "[Recovery] Failed for indicator=%s session=%s: %s",
+                    agent_id,
+                    session_id,
+                    exc,
+                )
+
+        agent = agent_manager.get_agent(agent_id)
+        previous_status: str | None = None
+        if agent:
+            previous_status = agent.status.status
+            agent.status.status = "error"
+            agent.status.error_message = str(message.get("message") or message.get("code") or "Unknown error")
+
+        if previous_status != "error":
+            await emit_state_event(
+                event_name="agent.status.changed",
+                domain="agent",
+                session_id=session_id,
+                target_client_id=client_id,
+                payload={
+                    "agent_id": agent_id,
+                    "status": "error",
+                    "previous_status": previous_status,
+                    "error": message.get("message") or message.get("code"),
+                },
+            )
         try:
             await websocket.send_json(message)
         except Exception as e:
@@ -1580,6 +2050,18 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             logger.info(f"📤 Forwarded history_response with {len(merged_overlays)} overlays to {client_id}")
         except Exception as e:
             logger.debug(f"Failed to forward history_response to {client_id}: {e}")
+
+        await emit_state_event(
+            event_name="overlay.history.updated",
+            domain="overlay",
+            session_id=session_id,
+            target_client_id=client_id,
+            payload={
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "count": len(merged_overlays),
+            },
+        )
     
     elif message_type == "overlay_update":
         # Live overlay value update from overlay agent (suppress logs for noise reduction)

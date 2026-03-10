@@ -50,6 +50,38 @@ export interface SubscribeRequest {
   timeframeDays: number;
 }
 
+export interface StateEvent {
+  type: "state_event";
+  event_name: string;
+  domain: "agent" | "overlay" | "trade" | "workspace";
+  revision: number;
+  session_id?: string;
+  emitted_at: string;
+  payload?: Record<string, unknown>;
+  server_revisions?: {
+    agent?: number;
+    overlay?: number;
+    trade?: number;
+    workspace?: number;
+  };
+}
+
+export interface SyncSnapshot {
+  type: "sync_snapshot";
+  emitted_at: string;
+  stale_domains: Array<"agent" | "overlay" | "trade" | "workspace">;
+  server_revisions: {
+    agent: number;
+    overlay: number;
+    trade: number;
+    workspace: number;
+  };
+  trade_sessions?: Array<{
+    session_id: string;
+    result: Record<string, unknown>;
+  }>;
+}
+
 /**
  * ACP v0.4.1 WebSocket hook for frontend market data streaming
  * 
@@ -66,6 +98,9 @@ export function useEventStream(
   onSnapshot?: (event: SnapshotEvent) => void,
   onOverlay?: (event: OverlayEvent) => void,
   onOverlayHistory?: (event: OverlayHistoryEvent) => void,
+  onStateEvent?: (event: StateEvent) => void,
+  onSyncSnapshot?: (snapshot: SyncSnapshot) => void,
+  getClientRevisions?: () => { agent: number; overlay: number; trade: number; workspace: number },
   options: UseEventStreamOptions = {}
 ) {
   const {
@@ -93,6 +128,10 @@ export function useEventStream(
   const onSnapshotRef = useRef(onSnapshot);
   const onOverlayRef = useRef(onOverlay);
   const onOverlayHistoryRef = useRef(onOverlayHistory);
+  const onStateEventRef = useRef(onStateEvent);
+  const onSyncSnapshotRef = useRef(onSyncSnapshot);
+  const getClientRevisionsRef = useRef(getClientRevisions);
+  const clientSyncIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const sendSubscribePayload = useCallback((request: SubscribeRequest): boolean => {
     const ws = wsRef.current;
@@ -152,6 +191,36 @@ export function useEventStream(
     onOverlayHistoryRef.current = onOverlayHistory;
   }, [onOverlayHistory]);
 
+  useEffect(() => {
+    onStateEventRef.current = onStateEvent;
+  }, [onStateEvent]);
+
+  useEffect(() => {
+    onSyncSnapshotRef.current = onSyncSnapshot;
+  }, [onSyncSnapshot]);
+
+  useEffect(() => {
+    getClientRevisionsRef.current = getClientRevisions;
+  }, [getClientRevisions]);
+
+  const sendClientSync = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const revisions = getClientRevisionsRef.current
+      ? getClientRevisionsRef.current()
+      : { agent: 0, overlay: 0, trade: 0, workspace: 0 };
+
+    ws.send(
+      JSON.stringify({
+        type: "client_sync",
+        revisions,
+      })
+    );
+  }, []);
+
   const connect = useCallback(() => {
     console.log(`[WebSocket] Connecting to ${wsUrl}...`);
     
@@ -185,6 +254,15 @@ export function useEventStream(
                   pendingSubscribeRef.current = null;
                 }
               }
+
+              sendClientSync();
+
+              if (clientSyncIntervalRef.current) {
+                clearInterval(clientSyncIntervalRef.current);
+              }
+              clientSyncIntervalRef.current = setInterval(() => {
+                sendClientSync();
+              }, 10000);
               break;
             
             case "heartbeat":
@@ -344,6 +422,18 @@ export function useEventStream(
                 });
               }
               break;
+
+            case "state_event":
+              if (onStateEventRef.current) {
+                onStateEventRef.current(message as StateEvent);
+              }
+              break;
+
+            case "sync_snapshot":
+              if (onSyncSnapshotRef.current) {
+                onSyncSnapshotRef.current(message as SyncSnapshot);
+              }
+              break;
             
             default:
               console.log("[WebSocket] Received message type:", message.type);
@@ -363,6 +453,11 @@ export function useEventStream(
         setClientId(null);
         wsRef.current = null;
 
+        if (clientSyncIntervalRef.current) {
+          clearInterval(clientSyncIntervalRef.current);
+          clientSyncIntervalRef.current = null;
+        }
+
         // Attempt to reconnect after delay
         if (reconnectTimeoutRef.current) {
           clearTimeout(reconnectTimeoutRef.current);
@@ -377,7 +472,7 @@ export function useEventStream(
       console.error("[WebSocket] Failed to create connection:", err);
       setIsConnected(false);
     }
-    }, [wsUrl, reconnectDelay, sendSubscribePayload]);
+    }, [wsUrl, reconnectDelay, sendSubscribePayload, sendClientSync]);
 
   useEffect(() => {
     connect();
@@ -393,6 +488,11 @@ export function useEventStream(
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
+      }
+
+      if (clientSyncIntervalRef.current) {
+        clearInterval(clientSyncIntervalRef.current);
+        clientSyncIntervalRef.current = null;
       }
     };
   }, [connect]);

@@ -76,6 +76,8 @@ export interface UseAgentSubscriptionsResult {
   subscriptions: AgentSubscription[] | null;
   loading: boolean;
   error: string | null;
+  stale: boolean;
+  lastSuccessfulRefreshAt: string | null;
   refresh: (silent?: boolean) => Promise<void>;
   updateAgentStatus: (agentId: string, status: "online" | "offline" | "error" | "connecting", errorMessage?: string | null) => void;
   createSubscription: (payload: CreateSubscriptionPayload) => Promise<AgentSubscription>;
@@ -88,7 +90,8 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
   const [subscriptions, setSubscriptions] = useState<AgentSubscription[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [cachedSubscriptions, setCachedSubscriptions] = useState<AgentSubscription[] | null>(null);
+  const [stale, setStale] = useState(false);
+  const [lastSuccessfulRefreshAt, setLastSuccessfulRefreshAt] = useState<string | null>(null);
 
   const refresh = useCallback(async (silent: boolean = false) => {
     try {
@@ -108,23 +111,16 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
       const agents = data.agents || [];
       
       setSubscriptions(agents);
-      setCachedSubscriptions(agents); // Cache successful response
+      setStale(false);
+      setLastSuccessfulRefreshAt(new Date().toISOString());
       console.log(`✅ Loaded ${agents.length} agent(s) from backend`);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Unknown error";
       console.error("Failed to fetch subscriptions:", err);
-      
-      // Use the cached data from state if available
-      setCachedSubscriptions((prev) => {
-        if (prev && prev.length > 0) {
-          console.log(`📦 Using cached agents (${prev.length})`);
-          setSubscriptions(prev);
-        } else {
-          setError(errorMessage);
-          setSubscriptions([]);
-        }
-        return prev;
-      });
+
+      setStale(true);
+      setSubscriptions((prev) => (prev && prev.length > 0 ? prev : []));
+      setError(`Showing cached agent state. ${errorMessage}`);
     } finally {
       if (!silent) {
         setLoading(false);
@@ -251,6 +247,8 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
     subscriptions,
     loading,
     error,
+    stale,
+    lastSuccessfulRefreshAt,
     refresh,
     updateAgentStatus,
     createSubscription,

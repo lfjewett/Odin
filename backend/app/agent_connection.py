@@ -362,7 +362,8 @@ class AgentConnection:
         session_id: str,
         symbol: str,
         interval: str,
-        params: dict[str, Any] | None = None
+        params: dict[str, Any] | None = None,
+        force: bool = False,
     ) -> bool:
         """
         Subscribe to live data stream for a session.
@@ -387,7 +388,7 @@ class AgentConnection:
 
         normalized_params = params or {}
         existing = self.subscriptions.get(session_id)
-        if existing:
+        if existing and not force:
             existing_params = existing.get("params") or {}
             if (
                 existing.get("symbol") == symbol
@@ -631,7 +632,8 @@ class AgentConnection:
                         session_id,
                         sub_info["symbol"],
                         sub_info["interval"],
-                        sub_info["params"]
+                        sub_info["params"],
+                        force=True,
                     )
                     if subscribe_ok and self.on_rebootstrap:
                         try:
