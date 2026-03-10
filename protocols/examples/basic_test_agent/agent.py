@@ -10,9 +10,9 @@ from typing import Any
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 
-app = FastAPI(title="Basic ACP Price Agent", version="0.2.0")
+app = FastAPI(title="Basic ACP Price Agent", version="0.4.0")
 
-SPEC_VERSION = "ACP-0.2.0"
+SPEC_VERSION = "ACP-0.4.0"
 AGENT_ID = "basic_price_agent"
 ALLOWED_SYMBOLS = {"SPY"}
 INTERVAL_SECONDS = {
@@ -139,17 +139,23 @@ async def metadata() -> dict[str, Any]:
         "spec_version": SPEC_VERSION,
         "agent_id": AGENT_ID,
         "agent_name": "Basic Price Agent",
-        "agent_version": "0.2.0",
-        "description": "Generates synthetic OHLC price data for testing ACP 0.2.0 lifecycle behavior",
+        "agent_version": "0.4.0",
+        "description": "Generates synthetic OHLC price data for testing ACP 0.4.0 lifecycle behavior",
         "agent_type": "price",
         "data_dependency": "none",
         "config_schema": {},
-        "output_schema": "ohlc",
-        "overlay": {
-            "kind": "ohlc",
-            "panel": "price",
-            "color": "#3b82f6",
-            "legend": f"{AGENT_ID} candles",
+        "outputs": [
+            {
+                "output_id": "price.ohlc",
+                "schema": "ohlc",
+                "label": "Price Candles",
+                "is_primary": True,
+            }
+        ],
+        "transport_limits": {
+            "max_records_per_chunk": 5000,
+            "max_websocket_message_bytes": 10485760,
+            "chunk_timeout_seconds": 30,
         },
     }
 

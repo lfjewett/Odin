@@ -18,6 +18,10 @@
     "high": { "type": "number" },
     "low": { "type": "number" },
     "close": { "type": "number" },
-    "volume": { "type": "number", "minimum": 0 }
+    "volume": { "type": "number", "minimum": 0 },
+    "metadata": {
+      "type": "object",
+      "description": "Agent-specific extension data not rendered on chart"
+    }
   }
 }

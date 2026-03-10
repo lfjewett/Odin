@@ -1,9 +1,9 @@
 """
-Odin Backend - FastAPI WebSocket Server (ACP v0.3.0)
+Odin Backend - FastAPI WebSocket Server (ACP v0.4.1)
 
 Manages WebSocket connections from the frontend and routes them to ACP agents:
 - Accepts WebSocket connections from the frontend (each is a client_id)
-- Loads agent configurations from overlay_agents.yaml (ACP v0.3.0)
+- Loads agent configurations from overlay_agents.yaml (ACP v0.4.1)
 - Connects to ACP agents via WebSocket
 - Routes ACP messages to specific sessions (not broadcast-all)
 - Maintains canonical candle store per session with deduplication
@@ -29,11 +29,14 @@ from pydantic import BaseModel, Field
 from app.agent_data_store import SessionDataStore
 from app.agent_manager import agent_manager
 from app.models import AgentConfig, SessionManager, Variable, build_variable_name
+from app.trade_engine import evaluate_strategy, validate_strategy_v2
+from app.trade_strategy_store import TradeStrategyStore
 from app.workspace_store import WorkspaceStore
 
-ACP_SPEC_VERSION = "ACP-0.3.0"
-ACP_API_VERSION = "0.3.0"
-MAX_HISTORY_PUSH_CANDLES = 1500
+ACP_SPEC_VERSION = "ACP-0.4.1"
+ACP_API_VERSION = "0.4.1"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1"}
+DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
 INDICATOR_OHLC_FIELDS = {
     "id",
     "seq",
@@ -85,6 +88,48 @@ class UpsertWorkspaceRequest(BaseModel):
     schema_version: int = 1
     state: dict[str, Any] = Field(default_factory=dict)
 
+
+class UpsertTradeStrategyRequest(BaseModel):
+    description: str = ""
+    long_entry_rule: str
+    long_exit_rules: list[str] = Field(default_factory=list)
+    short_entry_rule: str = ""
+    short_exit_rules: list[str] = Field(default_factory=list)
+
+
+class ValidateTradeStrategyRequest(BaseModel):
+    long_entry_rule: str
+    long_exit_rules: list[str] = Field(default_factory=list)
+    short_entry_rule: str = ""
+    short_exit_rules: list[str] = Field(default_factory=list)
+
+
+class ApplyTradeStrategyRequest(BaseModel):
+    strategy_name: str | None = None
+    long_entry_rule: str = ""
+    long_exit_rules: list[str] = Field(default_factory=list)
+    short_entry_rule: str = ""
+    short_exit_rules: list[str] = Field(default_factory=list)
+
+
+def _normalize_strategy_rules_payload(payload: dict[str, Any]) -> tuple[str, list[str], str, list[str]]:
+    long_entry_rule = str(payload.get("long_entry_rule") or "").strip()
+
+    raw_long_exits = payload.get("long_exit_rules")
+    if isinstance(raw_long_exits, list):
+        long_exit_rules = [str(rule).strip() for rule in raw_long_exits if str(rule).strip()]
+    else:
+        long_exit_rules = []
+
+    short_entry_rule = str(payload.get("short_entry_rule") or "").strip()
+    raw_short_exits = payload.get("short_exit_rules")
+    if isinstance(raw_short_exits, list):
+        short_exit_rules = [str(rule).strip() for rule in raw_short_exits if str(rule).strip()]
+    else:
+        short_exit_rules = []
+
+    return long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -108,14 +153,25 @@ session_seq_counters: dict[str, int] = {}
 # (indicator_agent_id, session_id) -> latest_seq
 indicator_seq_counters: dict[tuple[str, str], int] = {}
 
+# Track history_response chunk accumulation state:
+# (agent_id, session_id, subscription_id) -> accumulator state
+history_response_chunks: dict[tuple[str, str, str], dict[str, Any]] = {}
+
 # Workspace persistence store
 workspace_store: WorkspaceStore | None = None
+trade_strategy_store: TradeStrategyStore | None = None
 
 
 def get_workspace_store() -> WorkspaceStore:
     if workspace_store is None:
         raise HTTPException(status_code=500, detail="Workspace store not initialized")
     return workspace_store
+
+
+def get_trade_strategy_store() -> TradeStrategyStore:
+    if trade_strategy_store is None:
+        raise HTTPException(status_code=500, detail="Trade strategy store not initialized")
+    return trade_strategy_store
 
 
 def buffer_replay_message(session, message: dict) -> dict:
@@ -140,11 +196,12 @@ def next_indicator_seq(indicator_agent_id: str, session_id: str) -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle"""
-    global workspace_store
+    global workspace_store, trade_strategy_store
     logger.info(f"🚀 Odin backend starting ({ACP_SPEC_VERSION})...")
 
     workspace_db_path = Path(__file__).parent.parent / "data" / "user_config.db"
     workspace_store = WorkspaceStore(workspace_db_path)
+    trade_strategy_store = TradeStrategyStore(workspace_db_path)
     
     # Load agent configurations from YAML
     config_path = Path(__file__).parent.parent.parent / "overlay_agents.yaml"
@@ -152,8 +209,9 @@ async def lifespan(app: FastAPI):
     agent_manager.load_from_yaml(config_path)
     agent_manager.config_file_path = config_path  # Store path for persistence
     
-    # Set up message callback to forward ACP messages to the right session
+    # Set up message callbacks for ACP routing and reconnect re-bootstrap
     agent_manager.on_agent_message = route_agent_message
+    agent_manager.on_rebootstrap = rebootstrap_indicator_subscription
     
     # Start WebSocket connections to all agents
     logger.info("🔌 Connecting to agents...")
@@ -170,7 +228,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Odin Backend",
-    description="Trading platform backend - ACP v0.3.0 session router",
+    description="Trading platform backend - ACP v0.4.0 session router",
     version=ACP_API_VERSION,
     lifespan=lifespan,
 )
@@ -235,10 +293,14 @@ async def fetch_agent_metadata(agent_url: str) -> dict:
         response.raise_for_status()
     metadata = response.json()
 
-    if metadata.get("spec_version") != ACP_SPEC_VERSION:
+    discovered_spec_version = metadata.get("spec_version")
+    if discovered_spec_version not in COMPATIBLE_ACP_SPEC_VERSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Incompatible spec_version: {metadata.get('spec_version')} (expected {ACP_SPEC_VERSION})",
+            detail=(
+                f"Incompatible spec_version: {discovered_spec_version} "
+                f"(expected one of {sorted(COMPATIBLE_ACP_SPEC_VERSIONS)})"
+            ),
         )
 
     if metadata.get("agent_type") not in {"price", "indicator", "event"}:
@@ -248,12 +310,93 @@ async def fetch_agent_metadata(agent_url: str) -> dict:
     if not isinstance(outputs, list) or not outputs:
         raise HTTPException(status_code=400, detail="Metadata outputs[] is required")
 
+    transport_limits = metadata.get("transport_limits")
+    if not isinstance(transport_limits, dict):
+        raise HTTPException(status_code=400, detail="Metadata transport_limits is required")
+
+    max_records_per_chunk = int(transport_limits.get("max_records_per_chunk") or 0)
+    max_websocket_message_bytes = int(transport_limits.get("max_websocket_message_bytes") or 0)
+    chunk_timeout_seconds = int(
+        transport_limits.get("chunk_timeout_seconds") or DEFAULT_CHUNK_TIMEOUT_SECONDS
+    )
+
+    if max_records_per_chunk < 1000 or max_records_per_chunk > 10000:
+        raise HTTPException(status_code=400, detail="transport_limits.max_records_per_chunk must be 1000-10000")
+
+    if max_websocket_message_bytes < 1048576:
+        raise HTTPException(status_code=400, detail="transport_limits.max_websocket_message_bytes must be >= 1048576")
+
+    if chunk_timeout_seconds < 1:
+        raise HTTPException(status_code=400, detail="transport_limits.chunk_timeout_seconds must be >= 1")
+
+    metadata["transport_limits"] = {
+        "max_records_per_chunk": max_records_per_chunk,
+        "max_websocket_message_bytes": max_websocket_message_bytes,
+        "chunk_timeout_seconds": chunk_timeout_seconds,
+    }
+
     if metadata.get("agent_type") == "indicator":
         indicators = metadata.get("indicators")
         if not isinstance(indicators, list) or not indicators:
             raise HTTPException(status_code=400, detail="Indicator agents must expose indicators[]")
 
     return metadata
+
+
+def clear_history_response_state_for_session(session_id: str) -> None:
+    keys_to_remove = [key for key in history_response_chunks.keys() if key[1] == session_id]
+    for key in keys_to_remove:
+        history_response_chunks.pop(key, None)
+
+
+async def send_protocol_error_to_agent(
+    agent_id: str,
+    session_id: str,
+    subscription_id: str,
+    code: str,
+    message_text: str,
+) -> None:
+    connection = agent_manager.get_connection(agent_id)
+    if not connection:
+        return
+
+    await connection.send_message(
+        {
+            "type": "error",
+            "spec_version": ACP_SPEC_VERSION,
+            "session_id": session_id,
+            "subscription_id": subscription_id,
+            "agent_id": agent_id,
+            "code": code,
+            "message": message_text,
+            "retryable": False,
+        }
+    )
+
+
+async def rebootstrap_indicator_subscription(indicator_agent_id: str, session_id: str) -> None:
+    """ACP-0.4.0 reconnect contract: subscribe + full chunked history_push."""
+    indicator_connection = agent_manager.get_connection(indicator_agent_id)
+    if not indicator_connection:
+        return
+
+    subscription = indicator_connection.subscriptions.get(session_id)
+    if not subscription:
+        return
+
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        return
+
+    canonical_candles = data_store.get_canonical_candles()
+    candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
+
+    await indicator_connection.send_history_push(
+        session_id=session_id,
+        symbol=str(subscription.get("symbol") or ""),
+        interval=str(subscription.get("interval") or ""),
+        candles=candles_for_indicator,
+    )
 
 
 @app.post("/api/agents/discover")
@@ -316,6 +459,7 @@ async def add_agent(request: AddAgentRequest):
         config_schema=runtime_config,
         outputs=outputs,
         indicators=metadata.get("indicators") or [],
+        transport_limits=metadata.get("transport_limits") or {},
     )
 
     agent = agent_manager.add_or_update_agent(agent_config)
@@ -324,7 +468,11 @@ async def add_agent(request: AddAgentRequest):
     if not existing_connection:
         from app.agent_connection import AgentConnection
 
-        connection = AgentConnection(agent=agent, on_message=route_agent_message)
+        connection = AgentConnection(
+            agent=agent,
+            on_message=route_agent_message,
+            on_rebootstrap=rebootstrap_indicator_subscription,
+        )
         agent_manager.add_connection(final_agent_id, connection)
         await connection.start()
     else:
@@ -356,8 +504,6 @@ async def add_agent(request: AddAgentRequest):
                 continue
 
             candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
-            if len(canonical_candles) > MAX_HISTORY_PUSH_CANDLES:
-                candles_for_indicator = candles_for_indicator[-MAX_HISTORY_PUSH_CANDLES:]
 
             await connection.send_history_push(
                 session_id=session_id,
@@ -397,6 +543,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
         config_schema=updated_config,
         outputs=agent.config.outputs,
         indicators=agent.config.indicators,
+        transport_limits=agent.config.transport_limits,
     )
 
     updated_agent = agent_manager.add_or_update_agent(updated_agent_config)
@@ -421,8 +568,6 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                 canonical_candles = session_data_stores[session_id].get_canonical_candles()
                 if canonical_candles:
                     candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
-                    if len(canonical_candles) > MAX_HISTORY_PUSH_CANDLES:
-                        candles_for_indicator = candles_for_indicator[-MAX_HISTORY_PUSH_CANDLES:]
 
                     await connection.send_history_push(
                         session_id=session_id,
@@ -584,7 +729,7 @@ async def get_session_variables(session_id: str):
             output_schema = output.get("schema", "line")
             output_id = output.get("output_id", "")
             
-            # For simple schemas (line, histogram), create one variable
+            # For simple schemas, create one primary variable
             if output_schema in ["line", "histogram", "event", "forecast"]:
                 var_name = build_variable_name(agent_name, output)
                 variables.append(Variable(
@@ -604,6 +749,19 @@ async def get_session_variables(session_id: str):
                         name=var_name,
                         type="indicator",
                         schema="band",
+                        agent_id=agent_id,
+                        output_id=output_id
+                    ))
+
+            # For area schema, expose upper/lower bounds as independent variables
+            elif output_schema == "area":
+                label = output.get("label", output_id)
+                for field in ["upper", "lower"]:
+                    var_name = f"{agent_name}:{label}:{field}"
+                    variables.append(Variable(
+                        name=var_name,
+                        type="indicator",
+                        schema="area",
                         agent_id=agent_id,
                         output_id=output_id
                     ))
@@ -628,10 +786,150 @@ async def get_session_variables(session_id: str):
     }
 
 
+@app.get("/api/sessions/{session_id}/trade-strategies")
+async def list_trade_strategies(session_id: str):
+    store = get_trade_strategy_store()
+    strategies = store.list_strategies(session_id)
+    return {
+        "session_id": session_id,
+        "strategies": strategies,
+        "count": len(strategies),
+    }
+
+
+@app.get("/api/sessions/{session_id}/trade-strategies/{strategy_name}")
+async def get_trade_strategy(session_id: str, strategy_name: str):
+    store = get_trade_strategy_store()
+    strategy = store.get_strategy(session_id, strategy_name)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return strategy
+
+
+@app.put("/api/sessions/{session_id}/trade-strategies/{strategy_name}")
+async def upsert_trade_strategy(session_id: str, strategy_name: str, request: UpsertTradeStrategyRequest):
+    long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(
+        request.model_dump()
+    )
+
+    validation = validate_strategy_v2(
+        long_entry_rule=long_entry_rule,
+        long_exit_rules=long_exit_rules,
+        short_entry_rule=short_entry_rule,
+        short_exit_rules=short_exit_rules,
+    )
+    if not validation.valid:
+        raise HTTPException(status_code=400, detail={"valid": False, "errors": validation.errors})
+
+    store = get_trade_strategy_store()
+    saved = store.upsert_strategy(
+        session_id=session_id,
+        name=strategy_name,
+        description=request.description,
+        long_entry_rule=long_entry_rule,
+        long_exit_rules=long_exit_rules,
+        short_entry_rule=short_entry_rule,
+        short_exit_rules=short_exit_rules,
+    )
+    return saved
+
+
+@app.delete("/api/sessions/{session_id}/trade-strategies/{strategy_name}")
+async def delete_trade_strategy(session_id: str, strategy_name: str):
+    store = get_trade_strategy_store()
+    deleted = store.delete_strategy(session_id, strategy_name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    return {
+        "deleted": strategy_name,
+        "session_id": session_id,
+    }
+
+
+@app.post("/api/sessions/{session_id}/trade-strategies/validate")
+async def validate_trade_strategy(session_id: str, request: ValidateTradeStrategyRequest):
+    long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(
+        request.model_dump()
+    )
+
+    validation = validate_strategy_v2(
+        long_entry_rule=long_entry_rule,
+        long_exit_rules=long_exit_rules,
+        short_entry_rule=short_entry_rule,
+        short_exit_rules=short_exit_rules,
+    )
+    return {
+        "session_id": session_id,
+        "valid": validation.valid,
+        "errors": validation.errors,
+    }
+
+
+@app.post("/api/sessions/{session_id}/trade-strategies/apply")
+async def apply_trade_strategy(session_id: str, request: ApplyTradeStrategyRequest):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=409, detail="Session not ready. Wait for stream connection and retry apply.")
+
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        raise HTTPException(status_code=404, detail="Session data store not found")
+
+    strategy_name = (request.strategy_name or "").strip()
+    long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(
+        request.model_dump()
+    )
+
+    if strategy_name and not long_entry_rule and not long_exit_rules and not short_entry_rule and not short_exit_rules:
+        store = get_trade_strategy_store()
+        saved = store.get_strategy(session_id, strategy_name)
+        if not saved:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(saved)
+
+    if not strategy_name:
+        strategy_name = "Unsaved Strategy"
+
+    if not long_entry_rule and not short_entry_rule:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide strategy rules (long and/or short), or provide strategy_name for a saved strategy",
+        )
+
+    try:
+        result = evaluate_strategy(
+            session_id=session_id,
+            strategy_name=strategy_name,
+            long_entry_rule=long_entry_rule,
+            long_exit_rules=long_exit_rules,
+            short_entry_rule=short_entry_rule,
+            short_exit_rules=short_exit_rules,
+            data_store=data_store,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    performance = result.get("performance") if isinstance(result, dict) else None
+    logger.info(
+        "[TradeApply] Returning apply result session=%s strategy=%s markers=%s has_performance=%s trades=%s total_pl=%s win_rate=%s curve_points=%s",
+        session_id,
+        strategy_name,
+        result.get("marker_count") if isinstance(result, dict) else None,
+        bool(performance),
+        performance.get("total_trades") if isinstance(performance, dict) else None,
+        performance.get("total_pl") if isinstance(performance, dict) else None,
+        performance.get("win_rate") if isinstance(performance, dict) else None,
+        len(performance.get("equity_curve", [])) if isinstance(performance, dict) else None,
+    )
+
+    return result
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    ACP v0.3.0 WebSocket endpoint for frontend connections.
+    ACP v0.4.0 WebSocket endpoint for frontend connections.
     
     Protocol flow:
     1. Client connects -> server sends connection_ready with client_id
@@ -658,7 +956,7 @@ async def websocket_endpoint(websocket: WebSocket):
             "client_id": client_id,
             "acp_version": ACP_API_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "message": "Connected to Odin backend (ACP v0.3.0)"
+            "message": "Connected to Odin backend (ACP v0.4.0)"
         })
         
         # Start heartbeat loop
@@ -717,6 +1015,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if session_id in session_data_stores:
                 del session_data_stores[session_id]
             session_seq_counters.pop(session_id, None)
+            clear_history_response_state_for_session(session_id)
             for key in [k for k in indicator_seq_counters.keys() if k[1] == session_id]:
                 indicator_seq_counters.pop(key, None)
         
@@ -729,7 +1028,7 @@ async def handle_subscribe_request(
     client_id: str,
     payload: dict
 ) -> None:
-    """Handle a subscription request from the frontend (ACP v0.3.0)"""
+    """Handle a subscription request from the frontend (ACP v0.4.0)"""
     logger.info(f"🔔 [handle_subscribe_request] Received from client {client_id}: {payload}")
     
     session_id = str(payload.get("session_id") or "").strip()
@@ -879,15 +1178,6 @@ async def handle_subscribe_request(
 
         if indicator_subscribe_result and canonical_candles:
             candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
-            if len(canonical_candles) > MAX_HISTORY_PUSH_CANDLES:
-                candles_for_indicator = candles_for_indicator[-MAX_HISTORY_PUSH_CANDLES:]
-                logger.info(
-                    "📉 Trimming history_push for %s: %s -> %s candles",
-                    indicator_config.agent_id,
-                    len(canonical_candles),
-                    len(candles_for_indicator),
-                )
-
             await indicator_connection.send_history_push(
                 session_id=session_id,
                 symbol=symbol,
@@ -937,6 +1227,7 @@ async def handle_unsubscribe_request(
     if session_id in session_data_stores:
         del session_data_stores[session_id]
     session_seq_counters.pop(session_id, None)
+    clear_history_response_state_for_session(session_id)
     for key in [k for k in indicator_seq_counters.keys() if k[1] == session_id]:
         indicator_seq_counters.pop(key, None)
     
@@ -1000,7 +1291,7 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
     """
     Route ACP messages from agents to the appropriate session's WebSocket.
     
-    ACP v0.3.0: Messages include session_id for routing.
+    ACP v0.4.0: Messages include session_id for routing.
     """
     message_type = message.get("type")
     
@@ -1048,7 +1339,8 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
 
             if result:
                 message["record"] = result
-                logger.info(
+                # Suppress OHLC logs for noise reduction
+                logger.debug(
                     f"📥 OHLC ingested for session {session_id}: id={result.get('id')} rev={result.get('rev')} state={result.get('bar_state')}"
                 )
 
@@ -1145,15 +1437,133 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             logger.debug(f"Failed to forward error to {client_id}: {e}")
     
     elif message_type == "history_response":
-        # Overlay agent response to history_push
-        original_agent_id = message.get("agent_id", "not_set")
-        logger.info(f"📚 Received history_response from agent connection {agent_id}, message.agent_id was '{original_agent_id}' for session {session_id}")
+        # Overlay agent response to history_push (ACP-0.4.0 chunk-aware).
+        subscription_id = str(message.get("subscription_id") or f"{session_id}::{agent_id}")
         overlays = message.get("overlays", [])
+        if not isinstance(overlays, list):
+            overlays = []
+
+        chunk_index_raw = message.get("chunk_index")
+        total_chunks_raw = message.get("total_chunks")
+        is_final_chunk = bool(message.get("is_final_chunk"))
+        merged_overlays = overlays
+
+        if chunk_index_raw is not None:
+            try:
+                chunk_index = int(chunk_index_raw)
+                total_chunks = int(total_chunks_raw)
+            except (TypeError, ValueError):
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "CHUNK_SEQUENCE_ERROR",
+                    "Chunk fields must be integers",
+                )
+                return
+
+            chunk_key = (agent_id, session_id, subscription_id)
+            now = datetime.now(timezone.utc)
+
+            if chunk_index == 0:
+                history_response_chunks[chunk_key] = {
+                    "expected_chunk": 0,
+                    "total_chunks": total_chunks,
+                    "overlays": [],
+                    "updated_at": now,
+                }
+
+            chunk_state = history_response_chunks.get(chunk_key)
+            if not chunk_state:
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "CHUNK_SEQUENCE_ERROR",
+                    f"Missing chunk state for chunk_index={chunk_index}",
+                )
+                return
+
+            connection = agent_manager.get_connection(agent_id)
+            timeout_seconds = DEFAULT_CHUNK_TIMEOUT_SECONDS
+            if connection and connection.metadata:
+                timeout_seconds = int(
+                    connection.metadata.get("transport_limits", {}).get("chunk_timeout_seconds")
+                    or DEFAULT_CHUNK_TIMEOUT_SECONDS
+                )
+
+            last_update: datetime = chunk_state["updated_at"]
+            if (now - last_update).total_seconds() > timeout_seconds:
+                history_response_chunks.pop(chunk_key, None)
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "CHUNK_SEQUENCE_ERROR",
+                    f"Chunk timeout exceeded ({timeout_seconds}s)",
+                )
+                return
+
+            expected_chunk = int(chunk_state["expected_chunk"])
+            if chunk_index != expected_chunk:
+                history_response_chunks.pop(chunk_key, None)
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "CHUNK_SEQUENCE_ERROR",
+                    f"Expected chunk {expected_chunk}, received {chunk_index}",
+                )
+                return
+
+            expected_total_chunks = int(chunk_state["total_chunks"])
+            if total_chunks != expected_total_chunks:
+                history_response_chunks.pop(chunk_key, None)
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "CHUNK_SEQUENCE_ERROR",
+                    f"total_chunks changed from {expected_total_chunks} to {total_chunks}",
+                )
+                return
+
+            chunk_state["overlays"].extend(overlays)
+            chunk_state["expected_chunk"] = expected_chunk + 1
+            chunk_state["updated_at"] = now
+
+            if not is_final_chunk:
+                return
+
+            if int(chunk_state["expected_chunk"]) != expected_total_chunks:
+                history_response_chunks.pop(chunk_key, None)
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "CHUNK_SEQUENCE_ERROR",
+                    "Final chunk received before all chunks were delivered",
+                )
+                return
+
+            merged_overlays = list(chunk_state["overlays"])
+            history_response_chunks.pop(chunk_key, None)
+            message["chunk_index"] = 0
+            message["total_chunks"] = 1
+            message["is_final_chunk"] = True
+            message["count"] = len(merged_overlays)
+
+        logger.info(
+            "📚 Received history_response from %s for session %s with %s overlays",
+            agent_id,
+            session_id,
+            len(merged_overlays),
+        )
         
         # Ingest overlay records into session data store
         if session_id in session_data_stores:
             data_store = session_data_stores[session_id]
-            for overlay_record in overlays:
+            for overlay_record in merged_overlays:
                 # Non-OHLC records use simple id-based dedup
                 result = data_store.ingest_non_ohlc(overlay_record, source_agent_id=agent_id)
                 if result:
@@ -1161,21 +1571,19 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         
         # Ensure agent_id is set to the runtime instance ID
         message["agent_id"] = agent_id
-        logger.info(f"📚 Set message agent_id to runtime instance ID: {agent_id}")
+        message["overlays"] = merged_overlays
         
         # Forward to frontend
         try:
             replay_message = buffer_replay_message(session, message)
-            logger.info(f"📤 Forwarding history_response: replay_message agent_id={replay_message.get('agent_id')}")
             await websocket.send_json(replay_message)
-            logger.info(f"📤 Forwarded history_response with {len(overlays)} overlays to {client_id} (agent_id={replay_message.get('agent_id')})")
+            logger.info(f"📤 Forwarded history_response with {len(merged_overlays)} overlays to {client_id}")
         except Exception as e:
             logger.debug(f"Failed to forward history_response to {client_id}: {e}")
     
     elif message_type == "overlay_update":
-        # Live overlay value update from overlay agent
+        # Live overlay value update from overlay agent (suppress logs for noise reduction)
         original_agent_id = message.get("agent_id", "not_set")
-        logger.info(f"📊 Received overlay_update from agent connection {agent_id}, message.agent_id was '{original_agent_id}' for session {session_id}")
         record = message.get("record")
         schema = message.get("schema")
         
@@ -1185,24 +1593,16 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             
             if result:
                 message["record"] = result
-                logger.info(
-                    f"📥 Overlay update ingested for session {session_id}: "
-                    f"schema={schema} id={result.get('id')}"
-                )
             else:
-                logger.debug(f"⏭️  Duplicate overlay update skipped for session {session_id}")
                 return
         
         # Ensure agent_id is set to the runtime instance ID
         message["agent_id"] = agent_id
-        logger.info(f"📊 Set message agent_id to runtime instance ID: {agent_id}")
         
         # Forward to frontend
         try:
             replay_message = buffer_replay_message(session, message)
-            logger.info(f"📤 Forwarding overlay_update: replay_message agent_id={replay_message.get('agent_id')}")
             await websocket.send_json(replay_message)
-            logger.debug(f"📤 Forwarded overlay_update to {client_id} for session {session_id} (agent_id={replay_message.get('agent_id')})")
         except Exception as e:
             logger.debug(f"Failed to forward overlay_update to {client_id}: {e}")
     

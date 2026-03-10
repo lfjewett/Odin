@@ -13,6 +13,10 @@
     "value": { "type": "number" },
     "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
     "upper": { "type": "number" },
-    "lower": { "type": "number" }
+    "lower": { "type": "number" },
+    "metadata": {
+      "type": "object",
+      "description": "Agent-specific extension data not rendered on chart"
+    }
   }
 }

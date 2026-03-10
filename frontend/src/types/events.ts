@@ -1,11 +1,12 @@
 /**
- * ACP v0.3.0 Protocol Types
+ * ACP v0.4.1 Protocol Types
  * 
- * Defines TypeScript types for ACP (Agent Communication Protocol) v0.3.0
+ * Defines TypeScript types for ACP (Agent Communication Protocol) v0.4.1
  * with session isolation, sequence tracking, and bidirectional communication.
  */
 
-export type ACPSpecVersion = "ACP-0.3.0";
+export type ACPSpecVersion = "ACP-0.4.0" | "ACP-0.4.1";
+export type OverlaySchema = "line" | "event" | "band" | "area" | "histogram" | "forecast";
 
 export type BarState = "partial" | "provisional_close" | "session_reconciled" | "final";
 
@@ -110,9 +111,9 @@ export interface SnapshotMessage {
 export interface ACPDataMessage {
   type: "data";
   spec_version: ACPSpecVersion;
-  session_id: string; // ACP v0.3.0 routing key
+  session_id: string; // ACP v0.4.x routing key
   agent_id: string;
-  schema: "ohlc" | "line" | "event" | "band" | "histogram" | "forecast";
+  schema: "ohlc" | OverlaySchema;
   record: Record<string, unknown>;
   seq?: number; // For gap detection
 }
@@ -191,7 +192,10 @@ export interface ACPErrorMessage {
     | "SUBSCRIPTION_NOT_FOUND"
     | "AGENT_OVERLOADED"
     | "BACKFILL_TIMEOUT"
-    | "INTERNAL_ERROR";
+    | "RESYNC_FAILED"
+    | "INTERNAL_ERROR"
+    | "PAYLOAD_TOO_LARGE"
+    | "CHUNK_SEQUENCE_ERROR";
   message: string;
   retryable?: boolean;
   details?: Record<string, unknown>;
@@ -218,6 +222,7 @@ export interface AgentStatusUpdateMessage {
 export interface OverlayRecord {
   id: string; // Unique record identifier
   ts: string; // ISO-8601 timestamp
+  metadata?: Record<string, unknown>; // Optional ACP v0.4.1 metadata extension
   [key: string]: unknown; // Additional fields depend on schema
 }
 
@@ -227,6 +232,11 @@ export interface OverlayRecord {
 export interface LineRecord extends OverlayRecord {
   value: number;
   label?: string;
+}
+
+export interface AreaRecord extends OverlayRecord {
+  upper: number;
+  lower: number;
 }
 
 /**
@@ -249,9 +259,12 @@ export interface HistoryResponseMessage {
   session_id: string;
   subscription_id: string;
   agent_id: string;
-  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  schema: OverlaySchema;
   overlays: OverlayRecord[];
   metadata?: Record<string, unknown>;
+  chunk_index?: number;
+  total_chunks?: number;
+  is_final_chunk?: boolean;
 }
 
 /**
@@ -265,7 +278,7 @@ export interface OverlayUpdateMessage {
   session_id: string;
   subscription_id: string;
   agent_id: string;
-  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  schema: OverlaySchema;
   record: OverlayRecord;
 }
 
@@ -285,7 +298,7 @@ export interface OverlayMarkerMessage {
 }
 
 /**
- * Union type for all ACP v0.3.0 message types
+ * Union type for all ACP v0.4.0 message types
  */
 export type ACPMessageEnvelope =
   | ConnectionReadyMessage

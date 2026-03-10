@@ -17,56 +17,36 @@ import {
   OverlayHistoryEvent
 } from "./stream/useEventStream";
 import { ChartView } from "./chart/ChartView";
-import { MarketCandle, LineRecord } from "./types/events";
+import { MarketCandle, OverlayRecord, OverlaySchema } from "./types/events";
 import type { OHLCBar } from "./history/fetchHistory";
 import { useAgentSubscriptions, type AgentSubscription } from "./hooks/useAgentSubscriptions";
 import AgentConfigModal from "./components/AgentConfigModal";
 import AddIndicatorAgentModal from "./components/AddIndicatorAgentModal";
 import { TradeManagerModal } from "./components/TradeManagerModal";
+import { TradesModal } from "./components/TradesModal";
 import { formatEasternTime24 } from "./utils/time";
 import {
+  applyTradeStrategy,
   activateWorkspace,
   deleteWorkspace,
+  listTradeStrategies,
   getWorkspace,
   listWorkspaces,
   saveWorkspace,
+  type ApplyTradeStrategyResponse,
+  type TradePerformance,
+  type TradeMarker,
   type WorkspaceState,
 } from "./workspace/workspaceApi";
 import "./App.css";
 
 const WATCHLIST_SYMBOLS = ["SPY", "QQQ", "IWM"];
 const DEFAULT_WORKSPACE_NAME = "Default";
+const SESSION_STORAGE_KEY = "odin.sessionId";
+const TRADE_MARKERS_STORAGE_PREFIX = "odin.tradeMarkers";
+const TRADE_PERFORMANCE_STORAGE_PREFIX = "odin.tradePerformance";
 
-const MOCK_TRADE_RETURNS = [
-  42, -36, 58, -22, 18, 64, -48, 29, -17, 53,
-  -11, 35, -62, 72, -28, 19, 44, -31, 67, -39,
-  24, -14, 39, -55, 71, -27, 15, 46, -33, 61,
-  -41, 22, 37, -18, 55, -29, 48, -34, 69, -26,
-  17, 41, -57, 75, -32, 21, 52, -37, 63, -24,
-  26, -19, 43, -61, 79, -35, 20, 50, -38, 66,
-  -25, 28, 40, -21, 57, -30, 49, -42, 73, -23,
-  30, -16, 45, -53, 68, -34, 23, 54, -40, 62,
-];
-
-const MOCK_EQUITY_CURVE = [
-  ...MOCK_TRADE_RETURNS.reduce<number[]>((curve, tradeReturn, index) => {
-    const previousValue = index === 0 ? 10000 : curve[index - 1];
-    curve.push(previousValue + tradeReturn);
-    return curve;
-  }, []),
-];
-
-const TOTAL_PL_VALUE = 18420;
-
-const TRADE_MANAGER_METRICS = [
-  { label: "Total Trades", value: "284" },
-  { label: "Win Rate", value: "62.7%" },
-  { label: "Max DD", value: "-$3,260" },
-  { label: "Sharpe Ratio", value: "1.84" },
-  { label: "Average Win", value: "+$210" },
-  { label: "Average Loss", value: "-$128" },
-  { label: "Max Loss", value: "-$740" },
-];
+const STARTING_CAPITAL = 10_000;
 
 type PanelSide = "left" | "right";
 type WidgetId = "watchlist" | "overlayAgents" | "tradingBots2";
@@ -106,27 +86,60 @@ export default function App() {
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
   const [isAddAgentModalOpen, setIsAddAgentModalOpen] = useState(false);
   const [clockNow, setClockNow] = useState(() => Date.now());
-  const [isStrategyProfitable, setIsStrategyProfitable] = useState(true);
   const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
   const [currentWorkspaceName, setCurrentWorkspaceName] = useState<string>(DEFAULT_WORKSPACE_NAME);
   const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false);
   const [showTradeManager, setShowTradeManager] = useState(false);
+  const [showTradesModal, setShowTradesModal] = useState(false);
   const lastSubscribeKeyRef = useRef<string | null>(null);
   const pendingSnapshotRef = useRef<SnapshotEvent | null>(null);
   const hasInitializedWorkspaceRef = useRef(false);
   const isApplyingWorkspaceRef = useRef(false);
   
   // Overlay data state for rendering overlays on chart
-  const [overlayData, setOverlayData] = useState<Map<string, LineRecord[]>>(new Map());
+  const [overlayData, setOverlayData] = useState<Map<string, OverlayRecord[]>>(new Map());
+  const [overlaySchemas, setOverlaySchemas] = useState<Map<string, OverlaySchema>>(new Map());
+  const [tradeMarkers, setTradeMarkers] = useState<TradeMarker[]>([]);
+  const [tradePerformance, setTradePerformance] = useState<TradePerformance | null>(null);
+  const [appliedStrategyName, setAppliedStrategyName] = useState<string | null>(null);
+  const [strategyCandlesById, setStrategyCandlesById] = useState<Map<string, OHLCBar>>(new Map());
+  const markersHydratedKeyRef = useRef<string | null>(null);
+  const performanceHydratedKeyRef = useRef<string | null>(null);
+  const lastAutoApplyKeyRef = useRef<string | null>(null);
   
-  // Session management for ACP v0.3.0
+  // Session management for ACP v0.4.x
   const sessionIdRef = useRef<string | null>(null);
   const getSessionId = useCallback(() => {
     if (!sessionIdRef.current) {
-      sessionIdRef.current = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      try {
+        const persisted = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (persisted && persisted.trim()) {
+          sessionIdRef.current = persisted;
+        }
+      } catch {
+        // ignore storage access failures
+      }
+
+      if (!sessionIdRef.current) {
+        sessionIdRef.current = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        try {
+          localStorage.setItem(SESSION_STORAGE_KEY, sessionIdRef.current);
+        } catch {
+          // ignore storage access failures
+        }
+      }
     }
     return sessionIdRef.current;
   }, []);
+
+  const tradeMarkerStorageKey = useMemo(
+    () => `${TRADE_MARKERS_STORAGE_PREFIX}:${getSessionId()}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`,
+    [getSessionId, selectedSymbol, intervalInput, selectedTimeframe]
+  );
+  const tradePerformanceStorageKey = useMemo(
+    () => `${TRADE_PERFORMANCE_STORAGE_PREFIX}:${getSessionId()}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`,
+    [getSessionId, selectedSymbol, intervalInput, selectedTimeframe]
+  );
 
   const {
     subscriptions,
@@ -163,6 +176,9 @@ export default function App() {
       widgets,
       selectedAgentId,
       agentSubscriptions: subscriptionSnapshot,
+      appliedStrategyName,
+      tradeMarkers,
+      tradePerformance,
     };
   }, [
     subscriptions,
@@ -173,6 +189,9 @@ export default function App() {
     isRightCollapsed,
     widgets,
     selectedAgentId,
+    appliedStrategyName,
+    tradeMarkers,
+    tradePerformance,
   ]);
 
   const applyWorkspaceState = useCallback(
@@ -226,6 +245,9 @@ export default function App() {
         }
 
         setSelectedAgentId(state.selectedAgentId ?? null);
+        setAppliedStrategyName(state.appliedStrategyName ?? null);
+        setTradeMarkers(Array.isArray(state.tradeMarkers) ? state.tradeMarkers : []);
+        setTradePerformance(state.tradePerformance ?? null);
       } finally {
         isApplyingWorkspaceRef.current = false;
       }
@@ -242,7 +264,17 @@ export default function App() {
 
   const handleSaveCurrentWorkspace = useCallback(async () => {
     const workspaceName = currentWorkspaceName || DEFAULT_WORKSPACE_NAME;
-    await saveWorkspace(workspaceName, captureWorkspaceState());
+    const stateToSave = captureWorkspaceState();
+    console.log("[Workspace] Saving workspace state", {
+      workspaceName,
+      appliedStrategyName: stateToSave.appliedStrategyName,
+      markerCount: stateToSave.tradeMarkers?.length || 0,
+      hasPerformance: Boolean(stateToSave.tradePerformance),
+      symbol: stateToSave.selectedSymbol,
+      interval: stateToSave.intervalInput,
+      timeframe: stateToSave.selectedTimeframe,
+    });
+    await saveWorkspace(workspaceName, stateToSave);
     await activateWorkspace(workspaceName);
     await refreshWorkspaceNames();
     setIsWorkspaceMenuOpen(false);
@@ -333,8 +365,16 @@ export default function App() {
   const resolveOverlayAgentId = useCallback(
     (incomingAgentId: string): string => {
       // Use incoming agent ID directly - backend sends correct runtime IDs
-      // No prefix/suffix resolution needed for ACP v0.3.0 with unique instance IDs
+      // No prefix/suffix resolution needed for ACP v0.4.x with unique instance IDs
       return incomingAgentId;
+    },
+    []
+  );
+
+  const buildOverlaySeriesKey = useCallback(
+    (agentId: string, schema: OverlaySchema, outputId?: string | null): string => {
+      const resolvedOutputId = outputId && outputId.trim() ? outputId.trim() : "default";
+      return `${agentId}::${schema}::${resolvedOutputId}`;
     },
     []
   );
@@ -391,6 +431,13 @@ export default function App() {
     // Only process snapshots that match the current chart subscription.
     if (event.agentId === expectedAgentId && isMatchingSubscription) {
       console.log(`[App] Received snapshot for ${event.agentId}:`, event.bars.length, "bars");
+      setStrategyCandlesById(() => {
+        const next = new Map<string, OHLCBar>();
+        event.bars.forEach((bar) => {
+          next.set(bar.id, bar);
+        });
+        return next;
+      });
       if (snapshotHandler) {
         snapshotHandler(event.bars);
       } else {
@@ -402,42 +449,67 @@ export default function App() {
   const handleOverlayHistory = useCallback((event: OverlayHistoryEvent) => {
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
     console.log(`[App] Received overlay history for ${event.agentId} -> resolved to ${resolvedAgentId}:`, event.overlays.length, "records");
-    if (event.schema === "line") {
-      if (!event.overlays || event.overlays.length === 0) {
-        return;
-      }
-      setOverlayData((prev) => {
-        const updated = new Map(prev);
-        updated.set(resolvedAgentId, event.overlays as LineRecord[]);
-        console.log(`[App] Overlay data now has ${updated.size} agent(s):`, Array.from(updated.keys()));
-        return updated;
-      });
+    if (!event.overlays || event.overlays.length === 0) {
+      return;
     }
-  }, [resolveOverlayAgentId]);
+
+    const groupedByOutputId = new Map<string, OverlayRecord[]>();
+    for (const overlay of event.overlays) {
+      const outputId = String((overlay as Record<string, unknown>).output_id ?? "default");
+      const existing = groupedByOutputId.get(outputId) || [];
+      existing.push(overlay);
+      groupedByOutputId.set(outputId, existing);
+    }
+
+    setOverlayData((prev) => {
+      const updated = new Map(prev);
+      for (const [outputId, overlays] of groupedByOutputId.entries()) {
+        const key = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
+        updated.set(key, overlays);
+      }
+      console.log(`[App] Overlay data now has ${updated.size} series:`, Array.from(updated.keys()));
+      return updated;
+    });
+
+    setOverlaySchemas((prev) => {
+      const updated = new Map(prev);
+      for (const outputId of groupedByOutputId.keys()) {
+        const key = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
+        updated.set(key, event.schema);
+      }
+      return updated;
+    });
+  }, [resolveOverlayAgentId, buildOverlaySeriesKey]);
 
   const handleOverlay = useCallback((event: OverlayEvent) => {
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
     console.log(`[App] Received overlay update for ${event.agentId} -> resolved to ${resolvedAgentId}:`, event.schema);
-    if (event.schema === "line") {
-      setOverlayData((prev) => {
-        const updated = new Map(prev);
-        const existing = updated.get(resolvedAgentId) || [];
-        const record = event.record as LineRecord;
-        
-        // Find and update or append
-        const index = existing.findIndex((r) => r.id === record.id);
-        if (index >= 0) {
-          existing[index] = record;
-        } else {
-          existing.push(record);
-        }
-        
-        updated.set(resolvedAgentId, [...existing]);
-        console.log(`[App] Overlay data now has ${updated.size} agent(s):`, Array.from(updated.keys()));
-        return updated;
-      });
-    }
-  }, [resolveOverlayAgentId]);
+    const outputId = String((event.record as Record<string, unknown>).output_id ?? "default");
+    const seriesKey = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
+
+    setOverlayData((prev) => {
+      const updated = new Map(prev);
+      const existing = [...(updated.get(seriesKey) || [])];
+      const record = event.record as OverlayRecord;
+
+      const index = existing.findIndex((r) => r.id === record.id);
+      if (index >= 0) {
+        existing[index] = record;
+      } else {
+        existing.push(record);
+      }
+
+      updated.set(seriesKey, existing);
+      console.log(`[App] Overlay data now has ${updated.size} series:`, Array.from(updated.keys()));
+      return updated;
+    });
+
+    setOverlaySchemas((prev) => {
+      const updated = new Map(prev);
+      updated.set(seriesKey, event.schema);
+      return updated;
+    });
+  }, [resolveOverlayAgentId, buildOverlaySeriesKey]);
 
   const { isConnected, sendSubscribeRequest } = useEventStream(
     (event: CandleEvent) => {
@@ -448,6 +520,23 @@ export default function App() {
         if (!activeAgentId) {
           setSelectedAgentId(event.agentId);
         }
+
+        setStrategyCandlesById((prev) => {
+          const next = new Map(prev);
+          next.set(event.candle.id, {
+            id: event.candle.id,
+            seq: event.candle.seq,
+            rev: event.candle.rev,
+            bar_state: event.candle.bar_state as OHLCBar["bar_state"],
+            ts: event.candle.ts,
+            open: event.candle.open,
+            high: event.candle.high,
+            low: event.candle.low,
+            close: event.candle.close,
+            volume: event.candle.volume,
+          });
+          return next;
+        });
 
         if (candleHandler) {
           candleHandler(event.candle);
@@ -518,6 +607,8 @@ export default function App() {
     }
 
     setOverlayData(new Map());
+    setOverlaySchemas(new Map());
+    setStrategyCandlesById(new Map());
 
     const sent = sendSubscribeRequest({
       sessionId: getSessionId(),
@@ -550,6 +641,133 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(tradeMarkerStorageKey);
+      const parsed = raw ? (JSON.parse(raw) as TradeMarker[]) : [];
+      setTradeMarkers(Array.isArray(parsed) ? parsed : []);
+      markersHydratedKeyRef.current = tradeMarkerStorageKey;
+    } catch {
+      setTradeMarkers([]);
+      markersHydratedKeyRef.current = tradeMarkerStorageKey;
+    }
+  }, [tradeMarkerStorageKey]);
+
+  useEffect(() => {
+    if (markersHydratedKeyRef.current !== tradeMarkerStorageKey) {
+      return;
+    }
+    try {
+      localStorage.setItem(tradeMarkerStorageKey, JSON.stringify(tradeMarkers));
+    } catch {
+      // ignore storage access failures
+    }
+  }, [tradeMarkers, tradeMarkerStorageKey]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(tradePerformanceStorageKey);
+      const parsed = raw ? (JSON.parse(raw) as TradePerformance) : null;
+      setTradePerformance(parsed && typeof parsed === "object" ? parsed : null);
+      performanceHydratedKeyRef.current = tradePerformanceStorageKey;
+    } catch {
+      setTradePerformance(null);
+      performanceHydratedKeyRef.current = tradePerformanceStorageKey;
+    }
+  }, [tradePerformanceStorageKey]);
+
+  useEffect(() => {
+    if (performanceHydratedKeyRef.current !== tradePerformanceStorageKey) {
+      return;
+    }
+    try {
+      if (tradePerformance) {
+        localStorage.setItem(tradePerformanceStorageKey, JSON.stringify(tradePerformance));
+      } else {
+        localStorage.removeItem(tradePerformanceStorageKey);
+      }
+    } catch {
+      // ignore storage access failures
+    }
+  }, [tradePerformance, tradePerformanceStorageKey]);
+
+  useEffect(() => {
+    const autoApplyStrategy = async () => {
+      const sessionId = getSessionId();
+      const applyKey = `${sessionId}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`;
+      if (lastAutoApplyKeyRef.current === applyKey) {
+        console.log("[TradeManager] Auto-apply skipped (already attempted)", { applyKey });
+        return;
+      }
+
+      if (strategyCandlesById.size === 0 || !isConnected) {
+        console.log("[TradeManager] Auto-apply waiting for candles/connection", {
+          candles: strategyCandlesById.size,
+          isConnected,
+          applyKey,
+        });
+        return;
+      }
+
+      if (appliedStrategyName && tradeMarkers.length > 0 && Boolean(tradePerformance)) {
+        console.log("[TradeManager] Auto-apply skipped (using hydrated strategy state)", {
+          applyKey,
+          appliedStrategyName,
+          markerCount: tradeMarkers.length,
+          hasPerformance: Boolean(tradePerformance),
+        });
+        lastAutoApplyKeyRef.current = applyKey;
+        return;
+      }
+
+      try {
+        console.log("[TradeManager] Auto-apply checking saved strategies", { sessionId, applyKey });
+        const listed = await listTradeStrategies(sessionId);
+        if (!listed.strategies || listed.strategies.length === 0) {
+          console.log("[TradeManager] Auto-apply found no saved strategies", { sessionId });
+          lastAutoApplyKeyRef.current = applyKey;
+          return;
+        }
+
+        const strategyName = listed.strategies[0].name;
+        console.log("[TradeManager] Auto-applying strategy", { strategyName, sessionId, applyKey });
+        const applied = await applyTradeStrategy(sessionId, { strategy_name: strategyName });
+        setTradeMarkers(applied.markers || []);
+        setTradePerformance(applied.performance || null);
+        setAppliedStrategyName(applied.strategy_name || strategyName);
+        console.log("[TradeManager] Auto-apply completed", {
+          strategyName: applied.strategy_name || strategyName,
+          markerCount: applied.marker_count,
+          hasPerformance: Boolean(applied.performance),
+        });
+        lastAutoApplyKeyRef.current = applyKey;
+      } catch (err) {
+        console.warn("[TradeManager] Auto-apply failed:", err);
+      }
+    };
+
+    void autoApplyStrategy();
+  }, [
+    getSessionId,
+    selectedSymbol,
+    intervalInput,
+    selectedTimeframe,
+    strategyCandlesById.size,
+    isConnected,
+    appliedStrategyName,
+    tradeMarkers.length,
+    tradePerformance,
+  ]);
+
+  useEffect(() => {
+    console.log("[TradeManager] Stats inputs changed", {
+      appliedStrategyName,
+      markerCount: tradeMarkers.length,
+      hasPerformance: Boolean(tradePerformance),
+      candleCount: strategyCandlesById.size,
+    });
+  }, [appliedStrategyName, tradeMarkers.length, tradePerformance, strategyCandlesById.size]);
+
   const statusColor = isConnected ? "#22c55e" : "#ef4444";
   const statusText = isConnected ? "Connected" : "Disconnected";
 
@@ -563,6 +781,67 @@ export default function App() {
       symbol.toLowerCase().includes(query)
     );
   }, [symbolSearch]);
+
+  const strategyPerformance = useMemo(() => {
+    const formatCurrency = (value: number) =>
+      `${value > 0 ? "+" : value < 0 ? "-" : ""}$${Math.abs(value).toLocaleString(undefined, {
+        maximumFractionDigits: 0,
+      })}`;
+    if (!tradePerformance) {
+      return {
+        equityCurve: [STARTING_CAPITAL],
+        metrics: [
+          { label: "Total P/L", value: "—", tone: "neutral" as const },
+          { label: "Total Trades", value: "—", tone: "neutral" as const },
+          { label: "Win Rate", value: "—", tone: "neutral" as const },
+          { label: "Max DD", value: "—", tone: "neutral" as const },
+          { label: "Sharpe Ratio", value: "—", tone: "neutral" as const },
+          { label: "Average Win", value: "—", tone: "neutral" as const },
+          { label: "Average Loss", value: "—", tone: "neutral" as const },
+          { label: "Max Loss", value: "—", tone: "neutral" as const },
+        ],
+      };
+    }
+
+    const curve = (tradePerformance.equity_curve || [])
+      .map((point) => Number(point?.equity))
+      .filter((value) => Number.isFinite(value));
+
+    const totalPl = Number(tradePerformance.total_pl ?? 0);
+    const totalTrades = Number(tradePerformance.total_trades ?? 0);
+    const winRate = Number(tradePerformance.win_rate ?? 0);
+    const maxDrawdown = Math.abs(Number(tradePerformance.max_drawdown ?? 0));
+    const sharpe = Number(tradePerformance.sharpe_ratio ?? 0);
+    const averageWin = Number(tradePerformance.average_win ?? 0);
+    const averageLoss = Number(tradePerformance.average_loss ?? 0);
+    const maxLoss = Number(tradePerformance.max_loss ?? 0);
+
+    console.log("[TradeManager] Rendering backend performance", {
+      curvePoints: curve.length,
+      totalPl,
+      totalTrades,
+      winRate,
+      maxDrawdown,
+      sharpe,
+      averageWin,
+      averageLoss,
+      maxLoss,
+    });
+
+    return {
+      equityCurve: curve.length > 0 ? curve : [STARTING_CAPITAL],
+      metrics: [
+        { label: "Total P/L", value: formatCurrency(totalPl), tone: totalPl > 0 ? "positive" as const : totalPl < 0 ? "negative" as const : "neutral" as const },
+        { label: "Total Trades", value: Number.isFinite(totalTrades) ? String(Math.trunc(totalTrades)) : "—", tone: "neutral" as const },
+        { label: "Win Rate", value: Number.isFinite(winRate) ? `${winRate.toFixed(1)}%` : "—", tone: winRate >= 50 ? "positive" as const : totalTrades > 0 ? "negative" as const : "neutral" as const },
+        { label: "Max DD", value: formatCurrency(-maxDrawdown), tone: maxDrawdown > 0 ? "negative" as const : "neutral" as const },
+        { label: "Sharpe Ratio", value: Number.isFinite(sharpe) ? sharpe.toFixed(2) : "—", tone: sharpe > 1 ? "positive" as const : sharpe < 0 ? "negative" as const : "neutral" as const },
+        { label: "Average Win", value: formatCurrency(averageWin), tone: averageWin > 0 ? "positive" as const : "neutral" as const },
+        { label: "Average Loss", value: formatCurrency(averageLoss), tone: averageLoss < 0 ? "negative" as const : "neutral" as const },
+        { label: "Max Loss", value: formatCurrency(maxLoss), tone: maxLoss < 0 ? "negative" as const : "neutral" as const },
+      ],
+    };
+  }, [tradePerformance]);
 
   const formattedPrice = lastPrice === null ? "—" : lastPrice.toFixed(2);
   const formattedEventTime = lastEventTime
@@ -579,7 +858,65 @@ export default function App() {
     console.log(`[App] candleType being used:`, candleType);
   }
 
+  const handleRunTest = async () => {
+    try {
+      const sessionId = getSessionId();
+      console.log("[RunTest] Starting manual test...", { 
+        sessionId, 
+        appliedStrategyName,
+        markerCount: tradeMarkers.length,
+        hasPerformance: Boolean(tradePerformance),
+        candleCount: strategyCandlesById.size,
+      });
 
+      // List saved strategies
+      const listed = await listTradeStrategies(sessionId);
+      console.log("[RunTest] Listed strategies:", listed);
+
+      if (!listed.strategies || listed.strategies.length === 0) {
+        console.warn("[RunTest] No saved strategies found!");
+        alert("No saved strategies found. Please configure a strategy first.");
+        return;
+      }
+
+      const strategyName = listed.strategies[0].name;
+      console.log("[RunTest] Applying strategy:", strategyName);
+
+      // Apply the strategy
+      const applied = await applyTradeStrategy(sessionId, { strategy_name: strategyName });
+      
+      console.log("[RunTest] ========== APPLY RESULT ==========");
+      console.log("[RunTest] Strategy Name:", applied.strategy_name);
+      console.log("[RunTest] Marker Count:", applied.marker_count);
+      console.log("[RunTest] Markers:", applied.markers);
+      console.log("[RunTest] Performance Object:", applied.performance);
+      if (applied.performance) {
+        console.log("[RunTest] Performance Details:");
+        console.log("  - Total P/L:", applied.performance.total_pl);
+        console.log("  - Total Trades:", applied.performance.total_trades);
+        console.log("  - Win Rate:", applied.performance.win_rate);
+        console.log("  - Max Drawdown:", applied.performance.max_drawdown);
+        console.log("  - Sharpe Ratio:", applied.performance.sharpe_ratio);
+        console.log("  - Equity Curve Points:", applied.performance.equity_curve?.length || 0);
+      } else {
+        console.log("[RunTest] ⚠️ Performance is NULL or undefined!");
+      }
+      console.log("[RunTest] =====================================");
+
+      // Update state
+      setTradeMarkers(applied.markers || []);
+      setTradePerformance(applied.performance || null);
+      setAppliedStrategyName(applied.strategy_name || strategyName);
+
+      console.log("[RunTest] State updated. New values:");
+      console.log("  - Markers:", applied.markers?.length || 0);
+      console.log("  - Performance:", applied.performance ? "Present" : "NULL");
+      
+    } catch (err) {
+      console.error("[RunTest] Failed:", err);
+      alert(`Test failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   const moveWidget = useCallback(
     (widgetId: WidgetId, targetSide: PanelSide, targetIndex: number) => {
@@ -740,40 +1077,31 @@ export default function App() {
 
       const sparklineWidth = 300;
       const sparklineHeight = 54;
-      const minValue = Math.min(...MOCK_EQUITY_CURVE);
-      const maxValue = Math.max(...MOCK_EQUITY_CURVE);
+      const liveEquityCurve = strategyPerformance.equityCurve.length > 0 ? strategyPerformance.equityCurve : [STARTING_CAPITAL];
+      const minValue = Math.min(...liveEquityCurve);
+      const maxValue = Math.max(...liveEquityCurve);
       const range = Math.max(1, maxValue - minValue);
-      const sparklinePoints = MOCK_EQUITY_CURVE.map((value, index) => {
-        const x = (index / (MOCK_EQUITY_CURVE.length - 1)) * sparklineWidth;
+      const sparklinePoints = liveEquityCurve.map((value, index) => {
+        const x = (index / Math.max(1, liveEquityCurve.length - 1)) * sparklineWidth;
         const y = sparklineHeight - ((value - minValue) / range) * sparklineHeight;
         return `${x},${y}`;
       }).join(" ");
-      const totalPlValue = isStrategyProfitable ? Math.abs(TOTAL_PL_VALUE) : -Math.abs(TOTAL_PL_VALUE);
-      const totalPlDisplay = `${totalPlValue >= 0 ? "+" : "-"}$${Math.abs(totalPlValue).toLocaleString()}`;
-      const tradeManagerMetrics = [
-        { label: "Total P/L", value: totalPlDisplay, tone: totalPlValue >= 0 ? "positive" : "negative" },
-        ...TRADE_MANAGER_METRICS.map((metric) => ({ ...metric, tone: "neutral" })),
-      ];
+      const tradeManagerMetrics = strategyPerformance.metrics;
+      const totalPlValue = liveEquityCurve[liveEquityCurve.length - 1] - STARTING_CAPITAL;
       const isRightTradeManager = widget.id === "tradingBots";
-      const sparkBarWidth = sparklineWidth / MOCK_EQUITY_CURVE.length;
+      const sparkBarWidth = sparklineWidth / Math.max(1, liveEquityCurve.length);
       const sparkColorClass = totalPlValue >= 0 ? "positive" : "negative";
-
-      const profitToggle = (
-        <button
-          type="button"
-          className={`trade-manager-profit-toggle ${isStrategyProfitable ? "on" : "off"}`}
-          onClick={() => setIsStrategyProfitable((current) => !current)}
-          aria-label="Toggle profitable or unprofitable strategy view"
-        >
-          <span>Profitable</span>
-          <span>Unprofitable</span>
-        </button>
-      );
 
       const isLeftTradeManager = widget.id === "tradingBots2";
 
       return (
         <>
+          {isLeftTradeManager && appliedStrategyName && (
+            <div className="widget-active-strategy">
+              <span className="widget-active-strategy-label">Active Strategy</span>
+              <span className="widget-active-strategy-name">{appliedStrategyName}</span>
+            </div>
+          )}
           <div
             className={`trade-manager-sparkline-wrap ${isRightTradeManager ? "trade-manager-sparkline-wrap--compact" : ""}`}
             aria-label="Equity curve mock"
@@ -784,7 +1112,7 @@ export default function App() {
               role="img"
             >
               {isRightTradeManager ? (
-                MOCK_EQUITY_CURVE.map((value, index) => {
+                liveEquityCurve.map((value, index) => {
                   const normalizedHeight = Math.max(2, ((value - minValue) / range) * sparklineHeight);
                   return (
                     <rect
@@ -825,10 +1153,6 @@ export default function App() {
               </div>
             ))}
           </div>
-
-          {(isRightTradeManager || isLeftTradeManager) && (
-            <div className="trade-manager-toggle-bottom">{profitToggle}</div>
-          )}
         </>
       );
     },
@@ -836,12 +1160,13 @@ export default function App() {
       subscriptionsLoading,
       subscriptionsError,
       subscriptions,
+      strategyPerformance,
       selectedAgentId,
       isAgentModalOpen,
       filteredWatchlist,
       selectedSymbol,
       symbolSearch,
-      isStrategyProfitable,
+      appliedStrategyName,
     ]
   );
 
@@ -872,16 +1197,37 @@ export default function App() {
               >
                 <h3>{widgetTitle(widget.id)}</h3>
                 {widget.id === "tradingBots2" && (
-                  <button
-                    type="button"
-                    className="widget-config-button"
-                    onMouseDown={(event) => event.stopPropagation()}
-                    onClick={() => {
-                      setShowTradeManager(true);
-                    }}
-                  >
-                    Configure
-                  </button>
+                  <div className="widget-header-actions">
+                    <button
+                      type="button"
+                      className="widget-config-button"
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={() => setShowTradesModal(true)}
+                      title="Show trade history"
+                    >
+                      Trades
+                    </button>
+                    <button
+                      type="button"
+                      className="widget-debug-button"
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={handleRunTest}
+                      title="Re-run strategy (debug)"
+                      aria-label="Re-run strategy"
+                    >
+                      ↺
+                    </button>
+                    <button
+                      type="button"
+                      className="widget-gear-button"
+                      onMouseDown={(event) => event.stopPropagation()}
+                      onClick={() => setShowTradeManager(true)}
+                      title="Configure strategy"
+                      aria-label="Configure strategy"
+                    >
+                      ⚙
+                    </button>
+                  </div>
                 )}
               </div>
               <div className="widget-body">{renderWidget(widget)}</div>
@@ -908,7 +1254,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.50</h1>
+          <h1 className="app-title">ODIN Market Workspace v0.80</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
@@ -1070,7 +1416,9 @@ export default function App() {
                 onCandleReceived={handleCandleReceived}
                 onSnapshotRequested={handleSnapshotRequested}
                 overlayData={overlayData}
+                overlaySchemas={overlaySchemas}
                 overlayLineColors={overlayLineColors}
+                tradeMarkers={tradeMarkers}
                 selectedSymbol={selectedSymbol}
                 selectedInterval={intervalInput}
                 selectedTimeframe={selectedTimeframe}
@@ -1113,13 +1461,49 @@ export default function App() {
         isOpen={isAgentModalOpen}
         subscription={modalAgent}
         onUpdate={async (id, update) => {
+          // Update the subscription with new config
           await updateSubscription(id, { name: update.name, config: update.config });
+          
+          // If a strategy is currently applied, invalidate trade markers and performance,
+          // then re-apply the strategy to get fresh results based on new indicator values
+          if (appliedStrategyName) {
+            console.log("[Indicator Update] Invalidating trades and re-applying strategy", { appliedStrategyName });
+            setTradeMarkers([]);
+            setTradePerformance(null);
+            
+            try {
+              const sessionId = getSessionId();
+              console.log("[Indicator Update] Re-applying strategy:", appliedStrategyName);
+              const applied = await applyTradeStrategy(sessionId, { strategy_name: appliedStrategyName });
+              setTradeMarkers(applied.markers || []);
+              setTradePerformance(applied.performance || null);
+              console.log("[Indicator Update] Strategy re-applied successfully", {
+                markerCount: applied.marker_count,
+                hasPerformance: Boolean(applied.performance),
+              });
+            } catch (err) {
+              console.error("[Indicator Update] Failed to re-apply strategy:", err);
+            }
+          }
         }}
         onDelete={async (id) => {
           await deleteSubscription(id);
           setOverlayData((current) => {
             const next = new Map(current);
-            next.delete(id);
+            for (const key of Array.from(next.keys())) {
+              if (key.startsWith(`${id}::`)) {
+                next.delete(key);
+              }
+            }
+            return next;
+          });
+          setOverlaySchemas((current) => {
+            const next = new Map(current);
+            for (const key of Array.from(next.keys())) {
+              if (key.startsWith(`${id}::`)) {
+                next.delete(key);
+              }
+            }
             return next;
           });
         }}
@@ -1137,9 +1521,40 @@ export default function App() {
         createSubscription={createSubscription}
       />
 
+      {showTradesModal && (
+        <TradesModal
+          strategyName={appliedStrategyName}
+          markers={tradeMarkers}
+          candles={strategyCandlesById}
+          performance={tradePerformance}
+          onClose={() => setShowTradesModal(false)}
+        />
+      )}
+
       {showTradeManager && (
         <TradeManagerModal
           sessionId={getSessionId()}
+          appliedStrategyName={appliedStrategyName}
+          onApply={(result: ApplyTradeStrategyResponse) => {
+            console.log("[TradeManager] Manual apply result received in App", {
+              strategyName: result.strategy_name,
+              markerCount: result.marker_count,
+              hasPerformance: Boolean(result.performance),
+              performance: result.performance
+                ? {
+                    totalPl: result.performance.total_pl,
+                    totalTrades: result.performance.total_trades,
+                    winRate: result.performance.win_rate,
+                    maxDrawdown: result.performance.max_drawdown,
+                    sharpe: result.performance.sharpe_ratio,
+                    curvePoints: result.performance.equity_curve?.length || 0,
+                  }
+                : null,
+            });
+            setTradeMarkers(result.markers || []);
+            setTradePerformance(result.performance || null);
+            setAppliedStrategyName(result.strategy_name || null);
+          }}
           onClose={() => setShowTradeManager(false)}
         />
       )}

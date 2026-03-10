@@ -1,5 +1,5 @@
 """
-Agent WebSocket Connection Manager (ACP v0.3.0)
+Agent WebSocket Connection Manager (ACP v0.4.1)
 
 Manages WebSocket connections to ACP agents and handles session-based subscriptions.
 Each agent connection can serve multiple sessions (clients).
@@ -24,18 +24,26 @@ from app.models import Agent
 logger = logging.getLogger(__name__)
 
 
+ACP_SPEC_VERSION = "ACP-0.4.1"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1"}
+DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
+DEFAULT_MAX_RECORDS_PER_CHUNK = 5000
+DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES = 10 * 1024 * 1024
+
+
 class AgentConnection:
     """
     Manages WebSocket connection and subscriptions for a single agent.
     
-    ACP v0.3.0: Supports multiple concurrent sessions per agent.
+    ACP v0.4.1: Supports multiple concurrent sessions per agent.
     Each session is isolated (session_id in all messages).
     """
     
     def __init__(
         self,
         agent: Agent,
-        on_message: Callable[[str, str, dict[str, Any]], None] | None = None
+        on_message: Callable[[str, str, dict[str, Any]], None] | None = None,
+        on_rebootstrap: Callable[[str, str], Any] | None = None,
     ):
         """
         Args:
@@ -44,6 +52,7 @@ class AgentConnection:
         """
         self.agent = agent
         self.on_message = on_message
+        self.on_rebootstrap = on_rebootstrap
         self.websocket: WebSocketClientProtocol | None = None
         
         # Subscriptions: session_id -> subscription_info
@@ -91,7 +100,7 @@ class AgentConnection:
     
     async def fetch_metadata(self) -> bool:
         """
-        Fetch and validate agent metadata (ACP v0.3.0).
+        Fetch and validate agent metadata (ACP v0.4.1).
         
         Must be called before first subscribe.
         Returns True if metadata is valid, False otherwise.
@@ -109,7 +118,7 @@ class AgentConnection:
                 
                 metadata = response.json()
                 
-                # Validate required fields per ACP v0.3.0
+                # Validate required fields per ACP v0.4.0
                 required_fields = [
                     "spec_version",
                     "agent_id",
@@ -119,6 +128,7 @@ class AgentConnection:
                     "agent_type",
                     "config_schema",
                     "outputs",
+                    "transport_limits",
                 ]
                 
                 missing_fields = [f for f in required_fields if f not in metadata]
@@ -132,9 +142,9 @@ class AgentConnection:
                 
                 # Validate spec_version compatibility
                 spec_version = metadata.get("spec_version")
-                if spec_version != "ACP-0.3.0":
+                if spec_version not in COMPATIBLE_ACP_SPEC_VERSIONS:
                     logger.error(
-                        f"[{self.agent_id}] Incompatible spec_version: {spec_version} (expected ACP-0.3.0)"
+                        f"[{self.agent_id}] Incompatible spec_version: {spec_version} (expected one of {sorted(COMPATIBLE_ACP_SPEC_VERSIONS)})"
                     )
                     self.metadata_fetched = True
                     self.metadata = None
@@ -159,6 +169,42 @@ class AgentConnection:
                         metadata["agent_type"] = vtype
                         agent_type = vtype
                         break
+
+                transport_limits = metadata.get("transport_limits") or {}
+                max_records_per_chunk = int(
+                    transport_limits.get("max_records_per_chunk")
+                    or DEFAULT_MAX_RECORDS_PER_CHUNK
+                )
+                max_websocket_message_bytes = int(
+                    transport_limits.get("max_websocket_message_bytes")
+                    or DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES
+                )
+                chunk_timeout_seconds = int(
+                    transport_limits.get("chunk_timeout_seconds")
+                    or DEFAULT_CHUNK_TIMEOUT_SECONDS
+                )
+
+                if max_records_per_chunk < 1000 or max_records_per_chunk > 10000:
+                    logger.error(
+                        f"[{self.agent_id}] Invalid transport_limits.max_records_per_chunk={max_records_per_chunk}"
+                    )
+                    self.metadata_fetched = True
+                    self.metadata = None
+                    return False
+
+                if max_websocket_message_bytes < 1048576:
+                    logger.error(
+                        f"[{self.agent_id}] Invalid transport_limits.max_websocket_message_bytes={max_websocket_message_bytes}"
+                    )
+                    self.metadata_fetched = True
+                    self.metadata = None
+                    return False
+
+                metadata["transport_limits"] = {
+                    "max_records_per_chunk": max_records_per_chunk,
+                    "max_websocket_message_bytes": max_websocket_message_bytes,
+                    "chunk_timeout_seconds": chunk_timeout_seconds,
+                }
 
                 if agent_type == "indicator":
                     indicators = metadata.get("indicators")
@@ -203,10 +249,18 @@ class AgentConnection:
         
         try:
             logger.info(f"[{self.agent_id}] Connecting to {self.ws_url}...")
+            ws_limit = DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES
+            if self.metadata and self.metadata.get("transport_limits"):
+                ws_limit = int(
+                    self.metadata["transport_limits"].get("max_websocket_message_bytes")
+                    or DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES
+                )
+            ws_limit = max(ws_limit, DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES)
             self.websocket = await websockets.connect(
                 self.ws_url,
                 ping_interval=20,
-                ping_timeout=10
+                ping_timeout=10,
+                max_size=ws_limit,
             )
             logger.info(f"✅ [{self.agent_id}] Connected to agent WebSocket")
             self.running = True
@@ -319,7 +373,7 @@ class AgentConnection:
             interval: Candle interval (e.g., "1m")
             params: Optional parameters like timeframe_days
         """
-        # ACP v0.3.0: Fetch and validate metadata before first subscribe
+        # ACP v0.4.0: Fetch and validate metadata before first subscribe
         if not self.metadata_fetched:
             logger.info(f"[{self.agent_id}] Fetching metadata before first subscribe...")
             metadata_valid = await self.fetch_metadata()
@@ -345,13 +399,13 @@ class AgentConnection:
                 )
                 return True
         
-        # ACP v0.3.0: Include session_id and per-connection subscription_id.
+        # ACP v0.4.0: Include session_id and per-connection subscription_id.
         # Multiple indicator instances can share a session_id, so subscription_id
         # must be unique per connection to avoid sequence/state collisions.
         subscription_id = self._build_subscription_id(session_id)
         message = {
             "type": "subscribe",
-            "spec_version": "ACP-0.3.0",
+            "spec_version": ACP_SPEC_VERSION,
             "session_id": session_id,
             "subscription_id": subscription_id,
             "agent_id": self.agent_id,
@@ -392,20 +446,56 @@ class AgentConnection:
         subscription = self.subscriptions.get(session_id) or {}
         subscription_id = str(subscription.get("subscription_id") or self._build_subscription_id(session_id))
 
-        message = {
-            "type": "history_push",
-            "spec_version": "ACP-0.3.0",
-            "session_id": session_id,
-            "subscription_id": subscription_id,
-            "agent_id": self.agent_id,
-            "symbol": symbol,
-            "interval": interval,
-            "candles": candles,
-            "count": len(candles)
-        }
-        
-        logger.info(f"📚 [{self.agent_id}] Sending history_push with {len(candles)} candles for session {session_id}")
-        return await self.send_message(message)
+        transport_limits = (self.metadata or {}).get("transport_limits") or {}
+        max_per_chunk = int(
+            transport_limits.get("max_records_per_chunk") or DEFAULT_MAX_RECORDS_PER_CHUNK
+        )
+        max_per_chunk = max(1, max_per_chunk)
+
+        total_candles = len(candles)
+        total_chunks = max(1, (total_candles + max_per_chunk - 1) // max_per_chunk)
+
+        logger.info(
+            "📚 [%s] Sending history_push for session %s: candles=%s chunks=%s chunk_size=%s",
+            self.agent_id,
+            session_id,
+            total_candles,
+            total_chunks,
+            max_per_chunk,
+        )
+
+        for chunk_index in range(total_chunks):
+            start = chunk_index * max_per_chunk
+            end = min(start + max_per_chunk, total_candles)
+            chunk_candles = candles[start:end]
+
+            message = {
+                "type": "history_push",
+                "spec_version": ACP_SPEC_VERSION,
+                "session_id": session_id,
+                "subscription_id": subscription_id,
+                "agent_id": self.agent_id,
+                "symbol": symbol,
+                "interval": interval,
+                "candles": chunk_candles,
+                "count": len(chunk_candles),
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "is_final_chunk": chunk_index == total_chunks - 1,
+            }
+
+            success = await self.send_message(message)
+            if not success:
+                logger.error(
+                    "[%s] Failed sending history_push chunk %s/%s for session %s",
+                    self.agent_id,
+                    chunk_index + 1,
+                    total_chunks,
+                    session_id,
+                )
+                return False
+
+        return True
     
     async def unsubscribe(self, session_id: str) -> bool:
         """
@@ -418,13 +508,13 @@ class AgentConnection:
             logger.warning(f"[{self.agent_id}] Session {session_id} not found")
             return False
         
-        # ACP v0.3.0: Include required envelope fields in unsubscribe message
+        # ACP v0.4.0: Include required envelope fields in unsubscribe message
         subscription = self.subscriptions.get(session_id) or {}
         subscription_id = str(subscription.get("subscription_id") or self._build_subscription_id(session_id))
 
         message = {
             "type": "unsubscribe",
-            "spec_version": "ACP-0.3.0",
+            "spec_version": ACP_SPEC_VERSION,
             "session_id": session_id,
             "subscription_id": subscription_id,
             "agent_id": self.agent_id
@@ -465,7 +555,9 @@ class AgentConnection:
                         message_type = message.get("type")
                         session_id = message.get("session_id", "unknown")
                         
-                        logger.info(f"[{self.agent_id}] ⬇️  Received {message_type} message for session {session_id}")
+                        # Suppress noisy overlay_update and heartbeat logs
+                        if message_type not in ["overlay_update", "heartbeat"]:
+                            logger.info(f"[{self.agent_id}] ⬇️  Received {message_type} message for session {session_id}")
                         
                         # Update agent status based on heartbeat
                         if message_type == "heartbeat":
@@ -535,12 +627,24 @@ class AgentConnection:
             if success:
                 # Re-establish subscriptions
                 for session_id, sub_info in list(self.subscriptions.items()):
-                    await self.subscribe(
+                    subscribe_ok = await self.subscribe(
                         session_id,
                         sub_info["symbol"],
                         sub_info["interval"],
                         sub_info["params"]
                     )
+                    if subscribe_ok and self.on_rebootstrap:
+                        try:
+                            result = self.on_rebootstrap(self.agent_id, session_id)
+                            if inspect.isawaitable(result):
+                                await result
+                        except Exception as exc:
+                            logger.error(
+                                "[%s] Re-bootstrap failed for session %s: %s",
+                                self.agent_id,
+                                session_id,
+                                exc,
+                            )
                 
                 # Restart listening
                 asyncio.create_task(self.listen())

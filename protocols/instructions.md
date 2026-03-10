@@ -33,8 +33,8 @@ Then enforce these rules exactly:
 - OHLC supports lifecycle updates with:
   - bar_state in {partial, provisional_close, session_reconciled, final}
   - monotonic rev per bar id
-- session_id required on ACP-0.3.0 WebSocket protocol messages
-- no auth assumptions for ACP-0.3.0
+- session_id required on ACP-0.4.0 WebSocket protocol messages
+- no auth assumptions for ACP-0.4.0
 - do not introduce protocol fields outside ACP unless proposed as a versioned change
 
 For every protocol-related task response, include:

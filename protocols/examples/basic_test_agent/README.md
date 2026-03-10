@@ -1,9 +1,9 @@
-# Basic ACP 0.2.0 Reference Agents
+# Basic ACP 0.4.0 Reference Agents
 
-This folder includes two runnable ACP-0.2.0 examples:
+This folder includes two runnable ACP-0.4.0 examples:
 
 - `agent.py` — price agent example (`agent_type=price`)
-- `overlay_agent.py` — overlay agent example (`agent_type=overlay`)
+- `overlay_agent.py` — indicator agent example (`agent_type=indicator`)
 
 ## Price Agent Behavior
 
@@ -67,7 +67,7 @@ curl "http://127.0.0.1:8010/history?symbol=SPY&from=2026-03-01T10:00:00Z&to=2026
 ```json
 {
   "type": "subscribe",
-  "spec_version": "ACP-0.2.0",
+  "spec_version": "ACP-0.4.0",
   "session_id": "session-1",
   "subscription_id": "session-1:price",
   "agent_id": "basic_price_agent",
@@ -82,7 +82,7 @@ curl "http://127.0.0.1:8010/history?symbol=SPY&from=2026-03-01T10:00:00Z&to=2026
 ```json
 {
   "type": "unsubscribe",
-  "spec_version": "ACP-0.2.0",
+  "spec_version": "ACP-0.4.0",
   "session_id": "session-1",
   "subscription_id": "session-1:price",
   "agent_id": "basic_price_agent"

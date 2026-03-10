@@ -27,6 +27,7 @@ class AgentConfig(BaseModel):
     config_schema: dict[str, Any] = Field(default_factory=dict, description="Agent-specific configuration")
     outputs: list[dict[str, Any]] = Field(default_factory=list, description="Typed output descriptors")
     indicators: list[dict[str, Any]] = Field(default_factory=list, description="Discoverable indicator catalog")
+    transport_limits: dict[str, Any] = Field(default_factory=dict, description="ACP transport limits")
 
 
 class AgentStatus(BaseModel):
@@ -73,6 +74,7 @@ class Agent(BaseModel):
             "spec_version": self.config.spec_version,
             "agent_version": self.config.agent_version,
             "description": self.config.description,
+            "transport_limits": self.config.transport_limits,
         }
 
 # ============================================================================

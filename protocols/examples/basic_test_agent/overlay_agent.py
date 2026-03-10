@@ -6,10 +6,11 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-app = FastAPI(title="Basic ACP Overlay Agent", version="0.2.0")
+app = FastAPI(title="Basic ACP Overlay Agent", version="0.4.0")
 
-SPEC_VERSION = "ACP-0.2.0"
+SPEC_VERSION = "ACP-0.4.0"
 AGENT_ID = "basic_ema_overlay"
+MAX_RECORDS_PER_CHUNK = 5000
 
 
 @dataclass
@@ -21,6 +22,7 @@ class OverlayState:
 
 session_states: dict[str, OverlayState] = {}
 last_seq_received: dict[str, int] = {}
+history_push_accumulators: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def to_iso(dt: datetime) -> str:
@@ -38,9 +40,9 @@ async def metadata() -> dict[str, Any]:
         "spec_version": SPEC_VERSION,
         "agent_id": AGENT_ID,
         "agent_name": "Basic EMA Overlay",
-        "agent_version": "0.2.0",
-        "description": "Example overlay agent for ACP 0.2.0 history_push/tick_update flow",
-        "agent_type": "overlay",
+        "agent_version": "0.4.0",
+        "description": "Example indicator agent for ACP 0.4.0 history_push/tick_update flow",
+        "agent_type": "indicator",
         "data_dependency": "ohlc",
         "config_schema": {
             "alpha": {
@@ -52,12 +54,43 @@ async def metadata() -> dict[str, Any]:
                 "max": 1.0
             }
         },
-        "output_schema": "line",
-        "overlay": {
-            "kind": "line",
-            "panel": "price",
-            "color": "#f59e0b",
-            "legend": "Basic EMA"
+        "outputs": [
+            {
+                "output_id": "ema.line",
+                "schema": "line",
+                "label": "EMA",
+                "is_primary": True,
+            }
+        ],
+        "indicators": [
+            {
+                "indicator_id": "ema",
+                "name": "Exponential Moving Average",
+                "description": "EMA line over close values",
+                "params_schema": {
+                    "alpha": {
+                        "type": "number",
+                        "description": "EMA smoothing factor",
+                        "required": False,
+                        "default": 0.2,
+                        "min": 0.01,
+                        "max": 1.0
+                    }
+                },
+                "outputs": [
+                    {
+                        "output_id": "ema.line",
+                        "schema": "line",
+                        "label": "EMA",
+                        "is_primary": True,
+                    }
+                ]
+            }
+        ],
+        "transport_limits": {
+            "max_records_per_chunk": MAX_RECORDS_PER_CHUNK,
+            "max_websocket_message_bytes": 10485760,
+            "chunk_timeout_seconds": 30,
         },
     }
 
@@ -85,6 +118,38 @@ def apply_ema(state: OverlayState, close_value: float) -> float:
 
 async def send_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
     await websocket.send_json(payload)
+
+
+async def send_chunked_history_response(
+    websocket: WebSocket,
+    session_id: str,
+    subscription_id: str,
+    overlays: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> None:
+    total_records = len(overlays)
+    total_chunks = max(1, (total_records + MAX_RECORDS_PER_CHUNK - 1) // MAX_RECORDS_PER_CHUNK)
+
+    for chunk_index in range(total_chunks):
+        start = chunk_index * MAX_RECORDS_PER_CHUNK
+        end = min(start + MAX_RECORDS_PER_CHUNK, total_records)
+        chunk_overlays = overlays[start:end]
+        await send_json(
+            websocket,
+            {
+                "type": "history_response",
+                "spec_version": SPEC_VERSION,
+                "session_id": session_id,
+                "subscription_id": subscription_id,
+                "agent_id": AGENT_ID,
+                "schema": "line",
+                "overlays": chunk_overlays,
+                "metadata": metadata,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "is_final_chunk": chunk_index == total_chunks - 1,
+            },
+        )
 
 
 @app.websocket("/ws/live")
@@ -142,15 +207,97 @@ async def ws_live(websocket: WebSocket) -> None:
             if msg_type == "unsubscribe":
                 session_states.pop(session_id, None)
                 last_seq_received.pop(subscription_id, None)
+                history_push_accumulators.pop((session_id, subscription_id), None)
                 continue
 
             if msg_type == "history_push":
                 candles = msg.get("candles", [])
+                if not isinstance(candles, list):
+                    candles = []
+
+                chunk_index = msg.get("chunk_index")
+                total_chunks = msg.get("total_chunks")
+                is_final_chunk = bool(msg.get("is_final_chunk"))
+
+                all_candles = candles
+                if chunk_index is not None:
+                    key = (session_id, subscription_id)
+
+                    try:
+                        chunk_idx = int(chunk_index)
+                        expected_total = int(total_chunks)
+                    except (TypeError, ValueError):
+                        await send_json(
+                            websocket,
+                            {
+                                "type": "error",
+                                "spec_version": SPEC_VERSION,
+                                "session_id": session_id,
+                                "subscription_id": subscription_id,
+                                "agent_id": AGENT_ID,
+                                "code": "CHUNK_SEQUENCE_ERROR",
+                                "message": "Invalid chunk_index/total_chunks",
+                                "retryable": False,
+                            },
+                        )
+                        continue
+
+                    if chunk_idx == 0:
+                        history_push_accumulators[key] = {
+                            "expected": 0,
+                            "total": expected_total,
+                            "candles": [],
+                        }
+
+                    accumulator = history_push_accumulators.get(key)
+                    if not accumulator or int(accumulator["expected"]) != chunk_idx:
+                        history_push_accumulators.pop(key, None)
+                        await send_json(
+                            websocket,
+                            {
+                                "type": "error",
+                                "spec_version": SPEC_VERSION,
+                                "session_id": session_id,
+                                "subscription_id": subscription_id,
+                                "agent_id": AGENT_ID,
+                                "code": "CHUNK_SEQUENCE_ERROR",
+                                "message": f"Expected chunk {accumulator['expected'] if accumulator else 0}, got {chunk_idx}",
+                                "retryable": False,
+                            },
+                        )
+                        continue
+
+                    accumulator["candles"].extend(candles)
+                    accumulator["expected"] = int(accumulator["expected"]) + 1
+
+                    if not is_final_chunk:
+                        continue
+
+                    if int(accumulator["expected"]) != int(accumulator["total"]):
+                        history_push_accumulators.pop(key, None)
+                        await send_json(
+                            websocket,
+                            {
+                                "type": "error",
+                                "spec_version": SPEC_VERSION,
+                                "session_id": session_id,
+                                "subscription_id": subscription_id,
+                                "agent_id": AGENT_ID,
+                                "code": "CHUNK_SEQUENCE_ERROR",
+                                "message": "Final chunk received before all chunks were delivered",
+                                "retryable": False,
+                            },
+                        )
+                        continue
+
+                    all_candles = list(accumulator["candles"])
+                    history_push_accumulators.pop(key, None)
+
                 overlays: list[dict[str, Any]] = []
                 state.last_ema = None
                 state.candles_by_id = {}
 
-                for candle in candles:
+                for candle in all_candles:
                     candle_id = candle.get("id")
                     close_value = candle.get("close")
                     ts = candle.get("ts")
@@ -160,21 +307,15 @@ async def ws_live(websocket: WebSocket) -> None:
                     value = apply_ema(state, float(close_value))
                     overlays.append({"id": f"ema-{candle_id}", "ts": ts, "value": round(value, 6)})
 
-                await send_json(
+                await send_chunked_history_response(
                     websocket,
+                    session_id,
+                    subscription_id,
+                    overlays,
                     {
-                        "type": "history_response",
-                        "spec_version": SPEC_VERSION,
-                        "session_id": session_id,
-                        "subscription_id": subscription_id,
-                        "agent_id": AGENT_ID,
-                        "schema": "line",
-                        "overlays": overlays,
-                        "metadata": {
-                            "alpha": state.alpha,
-                            "computed_at": to_iso(datetime.now(UTC)),
-                            "count": len(overlays),
-                        },
+                        "alpha": state.alpha,
+                        "computed_at": to_iso(datetime.now(UTC)),
+                        "count": len(overlays),
                     },
                 )
                 continue

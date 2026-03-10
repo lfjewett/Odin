@@ -9,6 +9,10 @@
     "id": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
-    "value": { "type": "number" }
+    "value": { "type": "number" },
+    "metadata": {
+      "type": "object",
+      "description": "Agent-specific extension data not rendered on chart"
+    }
   }
 }

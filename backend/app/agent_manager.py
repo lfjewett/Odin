@@ -26,6 +26,7 @@ class AgentManager:
         self.agents: dict[str, Agent] = {}
         self.connections: dict[str, Any] = {}  # agent_id -> AgentConnection
         self.on_agent_message: Callable[[str, dict[str, Any]], Any] | None = None
+        self.on_rebootstrap: Callable[[str, str], Any] | None = None
         self.config_file_path: Path | None = None
     
     def load_from_yaml(self, yaml_path: str | Path) -> None:
@@ -141,7 +142,8 @@ class AgentManager:
             
             connection = AgentConnection(
                 agent=agent,
-                on_message=self.on_agent_message
+                on_message=self.on_agent_message,
+                on_rebootstrap=self.on_rebootstrap,
             )
             
             self.add_connection(agent.agent_id, connection)
@@ -182,6 +184,7 @@ class AgentManager:
                     "agent_type": agent.config.agent_type,
                     "config_schema": agent.config.config_schema,
                     "outputs": agent.config.outputs,
+                    "transport_limits": agent.config.transport_limits,
                 }
                 if agent.config.indicators:
                     agent_dict["indicators"] = agent.config.indicators

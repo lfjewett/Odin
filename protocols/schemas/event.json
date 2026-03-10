@@ -13,6 +13,10 @@
     "title": { "type": "string", "minLength": 1 },
     "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
     "sentiment": { "type": "number", "minimum": -1, "maximum": 1 },
-    "payload": { "type": "object" }
+    "payload": { "type": "object" },
+    "metadata": {
+      "type": "object",
+      "description": "Agent-specific extension data not rendered on chart"
+    }
   }
 }

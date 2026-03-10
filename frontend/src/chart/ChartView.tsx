@@ -1,15 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { createChart, IChartApi, ISeriesApi, Time, ISeriesPrimitive, IPrimitivePaneView, IPrimitivePaneRenderer } from "lightweight-charts";
 import { CanvasRenderingTarget2D } from 'fancy-canvas';
-import { LineRecord, MarketCandle } from "../types/events";
+import { AreaRecord, MarketCandle, OverlayRecord, OverlaySchema } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
 import { formatEasternChartTime, formatEasternDateTime } from "../utils/time";
+import type { TradeMarker } from "../workspace/workspaceApi";
 
 interface ChartViewProps {
   onCandleReceived: (handler: (candle: MarketCandle) => void) => void;
   onSnapshotRequested: (handler: (bars: OHLCBar[]) => void) => void;
-  overlayData: Map<string, LineRecord[]>;
+  overlayData: Map<string, OverlayRecord[]>;
+  overlaySchemas?: Map<string, OverlaySchema>;
   overlayLineColors?: Map<string, string>;
+  tradeMarkers?: TradeMarker[];
   selectedSymbol: string;
   selectedInterval?: string;
   selectedTimeframe?: number;
@@ -33,6 +36,231 @@ function toUnixSeconds(ts: string): number | null {
   }
 
   return Math.floor(millis / 1000);
+}
+
+function overlayAgentId(seriesKey: string): string {
+  const [agentId] = seriesKey.split("::");
+  return agentId || seriesKey;
+}
+
+interface AreaGradientStyle {
+  enabled?: boolean;
+  direction?: "vertical" | "horizontal";
+  start_color?: string;
+  end_color?: string;
+}
+
+interface AreaRenderStyle {
+  primaryColor: string;
+  secondaryColor: string;
+  opacity: number;
+  transparency: number;
+  gradient?: AreaGradientStyle;
+}
+
+interface AreaPoint {
+  time: number;
+  upper: number;
+  lower: number;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function readAreaRenderStyle(record: OverlayRecord | undefined, fallbackColor: string): AreaRenderStyle {
+  const metadata = record?.metadata;
+  const render = (metadata && typeof metadata === "object"
+    ? (metadata as Record<string, unknown>).render
+    : undefined) as Record<string, unknown> | undefined;
+
+  const primaryColor = typeof render?.primary_color === "string" && render.primary_color.trim()
+    ? render.primary_color.trim()
+    : fallbackColor;
+
+  const secondaryColor = typeof render?.secondary_color === "string"
+    ? render.secondary_color.trim()
+    : "";
+
+  const opacity = Number.isFinite(Number(render?.opacity))
+    ? clamp(Number(render?.opacity), 0, 1)
+    : 1;
+
+  const transparency = Number.isFinite(Number(render?.transparency))
+    ? clamp(Number(render?.transparency), 0, 100)
+    : 0;
+
+  const gradientRaw = render?.gradient;
+  const gradient = gradientRaw && typeof gradientRaw === "object"
+    ? {
+        enabled: Boolean((gradientRaw as Record<string, unknown>).enabled),
+        direction: ((gradientRaw as Record<string, unknown>).direction === "horizontal" ? "horizontal" : "vertical") as "vertical" | "horizontal",
+        start_color: typeof (gradientRaw as Record<string, unknown>).start_color === "string"
+          ? String((gradientRaw as Record<string, unknown>).start_color)
+          : undefined,
+        end_color: typeof (gradientRaw as Record<string, unknown>).end_color === "string"
+          ? String((gradientRaw as Record<string, unknown>).end_color)
+          : undefined,
+      }
+    : undefined;
+
+  return {
+    primaryColor,
+    secondaryColor,
+    opacity,
+    transparency,
+    gradient,
+  };
+}
+
+class AreaBetweenRenderer implements IPrimitivePaneRenderer {
+  private chart: IChartApi;
+  private upperSeries: ISeriesApi<any>;
+  private points: AreaPoint[] = [];
+  private style: AreaRenderStyle;
+
+  constructor(chart: IChartApi, upperSeries: ISeriesApi<any>, style: AreaRenderStyle) {
+    this.chart = chart;
+    this.upperSeries = upperSeries;
+    this.style = style;
+  }
+
+  update(points: AreaPoint[], style: AreaRenderStyle) {
+    this.points = points;
+    this.style = style;
+  }
+
+  draw(target: CanvasRenderingTarget2D) {
+    if (this.points.length < 2) {
+      return;
+    }
+
+    const alpha = clamp(this.style.opacity * (1 - this.style.transparency / 100), 0, 1);
+    if (alpha <= 0) {
+      return;
+    }
+
+    const timeScale = this.chart.timeScale();
+
+    target.useBitmapCoordinateSpace((scope) => {
+      const ctx = scope.context;
+
+      for (let index = 1; index < this.points.length; index += 1) {
+        const left = this.points[index - 1];
+        const right = this.points[index];
+
+        const x1 = timeScale.timeToCoordinate(left.time);
+        const x2 = timeScale.timeToCoordinate(right.time);
+
+        if (x1 === null || x2 === null) {
+          continue;
+        }
+
+        const yUpper1 = this.upperSeries.priceToCoordinate(left.upper);
+        const yUpper2 = this.upperSeries.priceToCoordinate(right.upper);
+        const yLower1 = this.upperSeries.priceToCoordinate(left.lower);
+        const yLower2 = this.upperSeries.priceToCoordinate(right.lower);
+
+        if (
+          yUpper1 === null ||
+          yUpper2 === null ||
+          yLower1 === null ||
+          yLower2 === null
+        ) {
+          continue;
+        }
+
+        const segmentMidUpper = (left.upper + right.upper) / 2;
+        const segmentMidLower = (left.lower + right.lower) / 2;
+        const isInverted = segmentMidUpper < segmentMidLower;
+
+        const baseColor = isInverted
+          ? this.style.secondaryColor
+          : this.style.primaryColor;
+
+        if (!baseColor) {
+          continue;
+        }
+
+        const px1 = Math.round(x1 * scope.horizontalPixelRatio);
+        const px2 = Math.round(x2 * scope.horizontalPixelRatio);
+        const pyUpper1 = Math.round(yUpper1 * scope.verticalPixelRatio);
+        const pyUpper2 = Math.round(yUpper2 * scope.verticalPixelRatio);
+        const pyLower1 = Math.round(yLower1 * scope.verticalPixelRatio);
+        const pyLower2 = Math.round(yLower2 * scope.verticalPixelRatio);
+
+        ctx.save();
+        ctx.globalAlpha = alpha;
+
+        if (
+          this.style.gradient?.enabled &&
+          this.style.gradient.start_color &&
+          this.style.gradient.end_color
+        ) {
+          const vertical = this.style.gradient.direction !== "horizontal";
+          const gx1 = vertical ? px1 : px1;
+          const gy1 = vertical ? Math.min(pyUpper1, pyUpper2, pyLower1, pyLower2) : pyUpper1;
+          const gx2 = vertical ? px1 : px2;
+          const gy2 = vertical ? Math.max(pyUpper1, pyUpper2, pyLower1, pyLower2) : pyUpper1;
+          const gradient = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
+          gradient.addColorStop(0, this.style.gradient.start_color);
+          gradient.addColorStop(1, this.style.gradient.end_color);
+          ctx.fillStyle = gradient;
+        } else {
+          ctx.fillStyle = baseColor;
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(px1, pyUpper1);
+        ctx.lineTo(px2, pyUpper2);
+        ctx.lineTo(px2, pyLower2);
+        ctx.lineTo(px1, pyLower1);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    });
+  }
+}
+
+class AreaBetweenPaneView implements IPrimitivePaneView {
+  private rendererInstance: AreaBetweenRenderer;
+
+  constructor(chart: IChartApi, upperSeries: ISeriesApi<any>, style: AreaRenderStyle) {
+    this.rendererInstance = new AreaBetweenRenderer(chart, upperSeries, style);
+  }
+
+  update(points: AreaPoint[], style: AreaRenderStyle) {
+    this.rendererInstance.update(points, style);
+  }
+
+  renderer() {
+    return this.rendererInstance;
+  }
+}
+
+class AreaBetweenPrimitive implements ISeriesPrimitive<Time> {
+  private paneView: AreaBetweenPaneView;
+
+  constructor(chart: IChartApi, upperSeries: ISeriesApi<any>, style: AreaRenderStyle) {
+    this.paneView = new AreaBetweenPaneView(chart, upperSeries, style);
+  }
+
+  update(points: AreaPoint[], style: AreaRenderStyle) {
+    this.paneView.update(points, style);
+  }
+
+  updateAllViews() {
+    // no-op
+  }
+
+  paneViews() {
+    return [this.paneView];
+  }
+
+  timeAxisViews() {
+    return [];
+  }
 }
 
 const EASTERN_TIME_ZONE = "America/New_York";
@@ -262,7 +490,9 @@ export function ChartView({
   onCandleReceived,
   onSnapshotRequested,
   overlayData,
+  overlaySchemas,
   overlayLineColors,
+  tradeMarkers = [],
   selectedSymbol, 
   selectedInterval = "1m",
   selectedTimeframe = 1,
@@ -280,7 +510,17 @@ export function ChartView({
   
   // Store candle data by timestamp for lookup
   const candleDataRef = useRef<Map<number, MarketCandle>>(new Map());
-  const overlaySeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
+  const overlayLineSeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
+  const overlayAreaSeriesRef = useRef<
+    Map<
+      string,
+      {
+        upperSeries: ISeriesApi<any>;
+        lowerSeries: ISeriesApi<any>;
+        primitive: AreaBetweenPrimitive;
+      }
+    >
+  >(new Map());
 
   // Handle snapshot data from backend
   const handleSnapshot = useCallback((bars: OHLCBar[]) => {
@@ -747,40 +987,133 @@ export function ChartView({
 
     try {
       const chart = chartRef.current;
-      const existingSeries = overlaySeriesRef.current;
+      const existingLineSeries = overlayLineSeriesRef.current;
+      const existingAreaSeries = overlayAreaSeriesRef.current;
       const incomingAgentIds = new Set(overlayData.keys());
 
       console.log("[ChartView] Updating overlays:", {
         overlayDataKeys: Array.from(overlayData.keys()),
         overlayColorKeys: overlayLineColors ? Array.from(overlayLineColors.keys()) : [],
-        existingSeriesKeys: Array.from(existingSeries.keys())
+        existingLineSeriesKeys: Array.from(existingLineSeries.keys()),
+        existingAreaSeriesKeys: Array.from(existingAreaSeries.keys())
       });
 
-      for (const [agentId, overlaySeries] of existingSeries.entries()) {
-        if (!incomingAgentIds.has(agentId)) {
-          console.log(`[ChartView] Removing overlay series for ${agentId}`);
+      for (const [seriesKey, overlaySeries] of existingLineSeries.entries()) {
+        if (!incomingAgentIds.has(seriesKey)) {
+          console.log(`[ChartView] Removing line overlay series for ${seriesKey}`);
           chart.removeSeries(overlaySeries);
-          existingSeries.delete(agentId);
+          existingLineSeries.delete(seriesKey);
         }
       }
 
-      for (const [agentId, records] of overlayData.entries()) {
+      for (const [seriesKey, areaSeries] of existingAreaSeries.entries()) {
+        if (!incomingAgentIds.has(seriesKey)) {
+          console.log(`[ChartView] Removing area overlay series for ${seriesKey}`);
+          chart.removeSeries(areaSeries.upperSeries);
+          chart.removeSeries(areaSeries.lowerSeries);
+          existingAreaSeries.delete(seriesKey);
+        }
+      }
+
+      for (const [seriesKey, records] of overlayData.entries()) {
         try {
-          let overlaySeries = existingSeries.get(agentId);
+          const schema = overlaySchemas?.get(seriesKey) || "line";
+          const agentId = overlayAgentId(seriesKey);
           const seriesColor = overlayLineColors?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
-          console.log(`[ChartView] Processing overlay for ${agentId}: color=${seriesColor}, records=${records.length}`);
-          
+
+          console.log(`[ChartView] Processing overlay for ${seriesKey}: schema=${schema}, color=${seriesColor}, records=${records.length}`);
+
+          if (schema === "area") {
+            let areaSeries = existingAreaSeries.get(seriesKey);
+
+            if (!areaSeries) {
+              const upperSeries = chart.addLineSeries({
+                color: seriesColor,
+                lineWidth: 2,
+                priceLineVisible: false,
+                lastValueVisible: false,
+              });
+              const lowerSeries = chart.addLineSeries({
+                color: seriesColor,
+                lineWidth: 2,
+                priceLineVisible: false,
+                lastValueVisible: false,
+              });
+
+              const defaultStyle = readAreaRenderStyle(undefined, seriesColor);
+              const primitive = new AreaBetweenPrimitive(chart, upperSeries, defaultStyle);
+              upperSeries.attachPrimitive(primitive);
+
+              areaSeries = { upperSeries, lowerSeries, primitive };
+              existingAreaSeries.set(seriesKey, areaSeries);
+
+              const possibleLineSeries = existingLineSeries.get(seriesKey);
+              if (possibleLineSeries) {
+                chart.removeSeries(possibleLineSeries);
+                existingLineSeries.delete(seriesKey);
+              }
+            }
+
+            const areaPoints = records
+              .map((record) => {
+                const time = toUnixSeconds(record.ts);
+                const upper = Number((record as AreaRecord).upper);
+                const lower = Number((record as AreaRecord).lower);
+
+                if (time === null || !Number.isFinite(upper) || !Number.isFinite(lower)) {
+                  return null;
+                }
+
+                return { time, upper, lower };
+              })
+              .filter((point): point is AreaPoint => point !== null)
+              .sort((a, b) => a.time - b.time);
+
+            const uniqueAreaDataByTime = new Map<number, AreaPoint>();
+            for (const point of areaPoints) {
+              uniqueAreaDataByTime.set(point.time, point);
+            }
+
+            const deduplicatedAreaData = Array.from(uniqueAreaDataByTime.values()).sort(
+              (a, b) => a.time - b.time
+            );
+
+            if (deduplicatedAreaData.length > 0) {
+              const latestRecord = records[records.length - 1];
+              const style = readAreaRenderStyle(latestRecord, seriesColor);
+
+              areaSeries.upperSeries.applyOptions({ color: style.primaryColor || seriesColor });
+              areaSeries.lowerSeries.applyOptions({ color: style.secondaryColor || style.primaryColor || seriesColor });
+
+              areaSeries.upperSeries.setData(
+                deduplicatedAreaData.map((point) => ({ time: point.time, value: point.upper }))
+              );
+              areaSeries.lowerSeries.setData(
+                deduplicatedAreaData.map((point) => ({ time: point.time, value: point.lower }))
+              );
+              areaSeries.primitive.update(deduplicatedAreaData, style);
+            }
+
+            continue;
+          }
+
+          let overlaySeries = existingLineSeries.get(seriesKey);
           if (!overlaySeries) {
-            console.log(`[ChartView] Creating new line series for ${agentId} with color ${seriesColor}`);
             overlaySeries = chart.addLineSeries({
               color: seriesColor,
               lineWidth: 2,
               priceLineVisible: false,
               lastValueVisible: false,
             });
-            existingSeries.set(agentId, overlaySeries);
+            existingLineSeries.set(seriesKey, overlaySeries);
+
+            const possibleAreaSeries = existingAreaSeries.get(seriesKey);
+            if (possibleAreaSeries) {
+              chart.removeSeries(possibleAreaSeries.upperSeries);
+              chart.removeSeries(possibleAreaSeries.lowerSeries);
+              existingAreaSeries.delete(seriesKey);
+            }
           } else {
-            console.log(`[ChartView] Updating existing series for ${agentId} with color ${seriesColor}`);
             overlaySeries.applyOptions({ color: seriesColor });
           }
 
@@ -811,16 +1144,69 @@ export function ChartView({
 
           if (deduplicatedLineData.length > 0) {
             overlaySeries.setData(deduplicatedLineData);
-            console.log(`[ChartView] Set ${deduplicatedLineData.length} data points for ${agentId}`);
           }
         } catch (error) {
-          console.error(`[ChartView] Failed to render overlay for agent ${agentId}:`, error);
+          console.error(`[ChartView] Failed to render overlay for series ${seriesKey}:`, error);
         }
       }
     } catch (error) {
       console.error("[ChartView] Failed to update overlay series:", error);
     }
-  }, [overlayData, overlayLineColors]);
+  }, [overlayData, overlaySchemas, overlayLineColors]);
+
+  useEffect(() => {
+    if (!seriesRef.current) {
+      return;
+    }
+
+    const markerByTime = new Map<number, {
+      time: number;
+      position: "aboveBar" | "belowBar";
+      color: string;
+      shape: "arrowUp" | "arrowDown";
+      text: string;
+    }>();
+    const markerUpColor = cssVar("--chart-up", "#22c55e");
+    const markerDownColor = cssVar("--chart-down", "#ef4444");
+
+    for (const marker of tradeMarkers) {
+      const time = toUnixSeconds(marker.ts);
+      if (time === null) {
+        continue;
+      }
+
+      const action = (marker.action || "").toUpperCase();
+      const title = (marker.title || "").toUpperCase();
+      const isEntry = action.endsWith("ENTRY") || title.includes("ENTRY");
+      const isExit = action.endsWith("EXIT") || title.includes("EXIT");
+      const isLong = action.includes("LONG") || title.includes("LONG");
+      const isShort = action.includes("SHORT") || title.includes("SHORT");
+
+      if (!isEntry && !isExit) {
+        continue;
+      }
+
+      // Build label: LE=LONG ENTRY, LX=LONG EXIT, SE=SHORT ENTRY, SX=SHORT EXIT
+      let markerLabel = "?";
+      if (isLong && isEntry) markerLabel = "LE";
+      else if (isLong && isExit) markerLabel = "LX";
+      else if (isShort && isEntry) markerLabel = "SE";
+      else if (isShort && isExit) markerLabel = "SX";
+      else if (isEntry) markerLabel = "E"; // Fallback
+      else if (isExit) markerLabel = "X"; // Fallback
+
+      markerByTime.set(time, {
+        time,
+        position: isEntry ? "belowBar" : "aboveBar",
+        color: isEntry ? markerUpColor : markerDownColor,
+        shape: isEntry ? "arrowUp" : "arrowDown",
+        text: markerLabel,
+      });
+    }
+
+    const markerData = Array.from(markerByTime.values()).sort((a, b) => a.time - b.time);
+    seriesRef.current.setMarkers(markerData);
+  }, [tradeMarkers]);
 
   const timeframeOptions = [
     { label: "1D", days: 1 },

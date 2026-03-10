@@ -19,7 +19,7 @@
       "required": ["type", "spec_version", "symbol", "interval", "agent_ids"],
       "properties": {
         "type": { "const": "create_session" },
-        "spec_version": { "type": "string", "const": "ACP-0.2.0" },
+        "spec_version": { "type": "string", "const": "ACP-0.4.0" },
         "symbol": { "type": "string", "minLength": 1 },
         "interval": { "$ref": "#/$defs/interval" },
         "timeframe_days": { "type": "integer", "minimum": 1 },
@@ -36,7 +36,7 @@
       "required": ["type", "spec_version", "session_id", "timestamp"],
       "properties": {
         "type": { "const": "session_created" },
-        "spec_version": { "type": "string", "const": "ACP-0.2.0" },
+        "spec_version": { "type": "string", "const": "ACP-0.4.0" },
         "session_id": { "type": "string", "minLength": 1 },
         "timestamp": { "type": "string", "format": "date-time" }
       }
@@ -47,7 +47,7 @@
       "required": ["type", "spec_version", "session_id", "timestamp"],
       "properties": {
         "type": { "const": "session_ready" },
-        "spec_version": { "type": "string", "const": "ACP-0.2.0" },
+        "spec_version": { "type": "string", "const": "ACP-0.4.0" },
         "session_id": { "type": "string", "minLength": 1 },
         "timestamp": { "type": "string", "format": "date-time" }
       }
@@ -58,7 +58,7 @@
       "required": ["type", "spec_version", "session_id"],
       "properties": {
         "type": { "const": "close_session" },
-        "spec_version": { "type": "string", "const": "ACP-0.2.0" },
+        "spec_version": { "type": "string", "const": "ACP-0.4.0" },
         "session_id": { "type": "string", "minLength": 1 }
       }
     }

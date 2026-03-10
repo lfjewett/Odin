@@ -9,14 +9,14 @@ This repository is the authoritative source of truth for:
 
 ## Current Version
 
-- Protocol: `ACP-0.3.0`
+- Protocol: `ACP-0.4.0`
 - Version file: `version/current.txt`
 
 ## Why ACP Exists
 
 Odin owns canonical candles per chart session and coordinates specialized agents (price, overlays, events). ACP provides a strict interface so independently built agents interoperate without ambiguity.
 
-## Key Protocol Decisions (ACP-0.3.0)
+## Key Protocol Decisions (ACP-0.4.0)
 
 - Transport model:
   - Backend calls price agent REST `/history` for snapshot backfill

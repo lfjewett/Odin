@@ -10,6 +10,10 @@
     "seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
     "value": { "type": "number" },
-    "baseline": { "type": "number" }
+    "baseline": { "type": "number" },
+    "metadata": {
+      "type": "object",
+      "description": "Agent-specific extension data not rendered on chart"
+    }
   }
 }

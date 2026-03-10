@@ -4,7 +4,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 
-const BACKEND_URL = "http://localhost:8001";
+const BACKEND_URL = "";
 
 export interface AgentSubscription {
   id: string;

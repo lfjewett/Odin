@@ -508,6 +508,107 @@ body {
   outline-offset: 2px;
 }
 
+/* Gear icon button for Trade Manager */
+.widget-gear-button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s, background 0.15s;
+}
+
+.widget-gear-button:hover {
+  color: var(--text-primary);
+  background: var(--surface-3);
+}
+
+/* Compact debug re-run button */
+.widget-debug-button {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s, background 0.15s;
+  opacity: 0.5;
+}
+
+.widget-debug-button:hover {
+  opacity: 1;
+  color: var(--text-primary);
+  background: var(--surface-3);
+}
+
+/* Strategy name label in widget header */
+.widget-strategy-name {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+/* Right-side actions group in widget header */
+.widget-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Active strategy banner inside the widget body */
+.widget-active-strategy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  margin: -10px -10px 0 -10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-3) 50%, transparent);
+  min-width: 0;
+}
+
+.widget-active-strategy-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.widget-active-strategy-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 .drag-hint {
   color: var(--text-muted);
   font-size: 10px;

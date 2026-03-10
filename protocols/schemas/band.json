@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "acp/schemas/band.json",
-  "title": "ACP Band Record",
+  "title": "ACP Band Record (Bollinger Bands, Keltner Channels, etc.)",
   "type": "object",
   "additionalProperties": false,
   "required": ["id", "ts", "upper", "lower"],
@@ -9,8 +9,12 @@
     "id": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
-    "upper": { "type": "number" },
-    "lower": { "type": "number" },
-    "center": { "type": "number" }
+    "upper": { "type": "number", "description": "Upper band value" },
+    "lower": { "type": "number", "description": "Lower band value" },
+    "center": { "type": "number", "description": "Optional center/basis line" },
+    "metadata": {
+      "type": "object",
+      "description": "Agent-specific extension data not rendered on chart"
+    }
   }
 }

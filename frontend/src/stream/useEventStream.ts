@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { MarketCandle, OverlayRecord } from "../types/events";
+import { MarketCandle, OverlayRecord, OverlaySchema } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
 
 interface UseEventStreamOptions {
@@ -16,14 +16,14 @@ export interface CandleEvent {
 export interface OverlayEvent {
   sessionId: string;
   agentId: string;
-  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  schema: OverlaySchema;
   record: OverlayRecord;
 }
 
 export interface OverlayHistoryEvent {
   sessionId: string;
   agentId: string;
-  schema: "line" | "event" | "band" | "histogram" | "forecast";
+  schema: OverlaySchema;
   overlays: OverlayRecord[];
 }
 
@@ -51,7 +51,7 @@ export interface SubscribeRequest {
 }
 
 /**
- * ACP v0.3.0 WebSocket hook for frontend market data streaming
+ * ACP v0.4.1 WebSocket hook for frontend market data streaming
  * 
  * Manages:
  * - Session-aware subscriptions (session_id per chart/view)
@@ -170,7 +170,7 @@ export function useEventStream(
           const message = JSON.parse(event.data);
           console.log("[WebSocket] Received message:", message.type);
           
-          // Handle different message types from backend (ACP v0.3.0)
+          // Handle different message types from backend (ACP v0.4.0)
           switch (message.type) {
             case "connection_ready":
               // Store client_id from backend for future use
@@ -313,7 +313,7 @@ export function useEventStream(
                 onOverlayHistoryRef.current({
                   sessionId: message.session_id,
                   agentId: message.agent_id,
-                  schema: message.schema as "line" | "event" | "band" | "histogram" | "forecast",
+                  schema: message.schema as OverlaySchema,
                   overlays: message.overlays,
                 });
               }
@@ -326,7 +326,7 @@ export function useEventStream(
                 onOverlayRef.current({
                   sessionId: message.session_id,
                   agentId: message.agent_id,
-                  schema: message.schema as "line" | "event" | "band" | "histogram" | "forecast",
+                  schema: message.schema as OverlaySchema,
                   record: message.record,
                 });
               }
