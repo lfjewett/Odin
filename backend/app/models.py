@@ -25,6 +25,8 @@ UI_MANAGED_INDICATOR_CONFIG_KEYS = {
     "visible",
     "aggregation_interval",
     "force_subgraph",
+    "area_use_source_style",
+    "area_show_labels",
     "area_fill_mode",
     "area_fill_opacity",
     "area_conditional_up_color",

@@ -1,8 +1,18 @@
 # Agent Chart Protocol (ACP)
 
-- Spec ID: `ACP-0.4.2`
+- Spec ID: `ACP-0.4.3`
 - Status: Draft (Authoritative in this repository)
 - Last updated: 2026-03-12
+
+## Changes from ACP-0.4.2 to ACP-0.4.3
+
+**ACP-0.4.3 tightens overlay output identity requirements for deterministic multi-output behavior.**
+
+- Non-OHLC overlay records (`line`, `band`, `area`, `histogram`, `forecast`, `event`) now require `output_id` on each emitted record.
+- For indicators that emit multiple outputs/zones, each record's `output_id` MUST match one descriptor in metadata `outputs[]` / indicator catalog `indicators[].outputs[]`.
+- Backend implementations SHOULD reject malformed overlay messages that omit required `output_id` when `spec_version` is `ACP-0.4.3`.
+
+This release closes an ambiguity where multiple overlays at the same timestamp could collapse into a single rendered/exported series when records lacked explicit output identity.
 
 ## Changes from ACP-0.4.1 to ACP-0.4.2
 
@@ -383,6 +393,8 @@ Each output descriptor MUST include:
 - `is_primary`
 
 Indicator agents MAY emit multiple outputs from a single subscription (e.g., MACD line, signal line, crossover events).
+
+For all non-OHLC emitted records, agents MUST include `output_id` and it MUST map to the corresponding output descriptor.
 
 ### 14.3 Indicator Catalog
 `indicators[]` entries define selectable indicators exposed by a single agent base URL.

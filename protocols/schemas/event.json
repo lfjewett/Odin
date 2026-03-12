@@ -4,11 +4,12 @@
   "title": "ACP Event Record",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "ts", "event_type", "title"],
+  "required": ["id", "ts", "output_id", "event_type", "title"],
   "properties": {
     "id": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
+    "output_id": { "type": "string", "minLength": 1 },
     "event_type": { "type": "string", "minLength": 1 },
     "title": { "type": "string", "minLength": 1 },
     "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },

@@ -4,11 +4,12 @@
   "title": "ACP Band Record (Bollinger Bands, Keltner Channels, etc.)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "ts", "upper", "lower"],
+  "required": ["id", "ts", "output_id", "upper", "lower"],
   "properties": {
     "id": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
+    "output_id": { "type": "string", "minLength": 1 },
     "upper": { "type": "number", "description": "Upper band value" },
     "lower": { "type": "number", "description": "Lower band value" },
     "center": { "type": "number", "description": "Optional center/basis line" },

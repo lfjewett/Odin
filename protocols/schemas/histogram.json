@@ -4,11 +4,12 @@
   "title": "ACP Histogram Record",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "ts", "value"],
+  "required": ["id", "ts", "output_id", "value"],
   "properties": {
     "id": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
+    "output_id": { "type": "string", "minLength": 1 },
     "value": { "type": "number" },
     "baseline": { "type": "number" },
     "metadata": {

@@ -1,9 +1,9 @@
 """
-Odin Backend - FastAPI WebSocket Server (ACP v0.4.2)
+Odin Backend - FastAPI WebSocket Server (ACP v0.4.3)
 
 Manages WebSocket connections from the frontend and routes them to ACP agents:
 - Accepts WebSocket connections from the frontend (each is a client_id)
-- Loads agent configurations from overlay_agents.yaml (ACP v0.4.2)
+- Loads agent configurations from overlay_agents.yaml (ACP v0.4.3)
 - Connects to ACP agents via WebSocket
 - Routes ACP messages to specific sessions (not broadcast-all)
 - Maintains canonical candle store per session with deduplication
@@ -51,9 +51,9 @@ from app.trade_engine import evaluate_research_expression, evaluate_strategy, va
 from app.trade_strategy_store import TradeStrategyStore
 from app.workspace_store import WorkspaceStore
 
-ACP_SPEC_VERSION = "ACP-0.4.2"
-ACP_API_VERSION = "0.4.2"
-COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2"}
+ACP_SPEC_VERSION = "ACP-0.4.3"
+ACP_API_VERSION = "0.4.3"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
 SUBSCRIBE_PROPAGATION_DELAY_SECONDS = 0.2
 EXPORT_CHUNK_MONTHS = 6
@@ -79,6 +79,32 @@ INDICATOR_OHLC_FIELDS = {
 def to_indicator_ohlc(candle: dict) -> dict:
     """Normalize candles to strict ACP OHLC fields expected by indicator agents."""
     return {key: candle[key] for key in INDICATOR_OHLC_FIELDS if key in candle}
+
+
+def requires_overlay_output_id(spec_version: Any) -> bool:
+    return str(spec_version or "").strip() == "ACP-0.4.3"
+
+
+def missing_overlay_output_id(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return True
+    output_id = record.get("output_id")
+    return not isinstance(output_id, str) or not output_id.strip()
+
+
+def validate_overlay_records_output_ids(
+    records: list[Any],
+    *,
+    schema: str,
+    message_type: str,
+) -> str | None:
+    for index, record in enumerate(records):
+        if missing_overlay_output_id(record):
+            return (
+                f"{message_type} requires non-empty overlay.output_id for schema '{schema}' "
+                f"(invalid record index {index}) in ACP-0.4.3"
+            )
+    return None
 
 
 def next_available_indicator_instance(base_agent_id: str) -> tuple[str, int]:
@@ -1753,7 +1779,7 @@ async def get_session_variables(session_id: str):
         ))
     
     # Get all indicator agents that have data in this session
-    # The data_store.latest_non_ohlc_by_key is keyed by (agent_id, record_id)
+    # The data_store.latest_non_ohlc_by_key is keyed by (agent_id, canonical_overlay_key)
     indicator_agent_ids = set()
     for (agent_id, _) in data_store.latest_non_ohlc_by_key.keys():
         indicator_agent_ids.add(agent_id)
@@ -1811,7 +1837,7 @@ async def get_session_variables(session_id: str):
                 # Useful for rich area indicators that emit additional context
                 # (e.g. directional state, phase, confidence) in record.metadata.
                 metadata_numeric_keys: set[str] = set()
-                for (record_agent_id, _record_id), record in data_store.latest_non_ohlc_by_key.items():
+                for (record_agent_id, _storage_key), record in data_store.latest_non_ohlc_by_key.items():
                     if record_agent_id != agent_id:
                         continue
 
@@ -2881,6 +2907,23 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         overlays = message.get("overlays", [])
         if not isinstance(overlays, list):
             overlays = []
+        schema = str(message.get("schema") or "")
+
+        if requires_overlay_output_id(message.get("spec_version")):
+            validation_error = validate_overlay_records_output_ids(
+                overlays,
+                schema=schema,
+                message_type="history_response",
+            )
+            if validation_error:
+                await send_protocol_error_to_agent(
+                    agent_id,
+                    session_id,
+                    subscription_id,
+                    "INVALID_MESSAGE",
+                    validation_error,
+                )
+                return
 
         chunk_index_raw = message.get("chunk_index")
         total_chunks_raw = message.get("total_chunks")
@@ -3052,6 +3095,17 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         original_agent_id = message.get("agent_id", "not_set")
         record = message.get("record")
         schema = message.get("schema")
+
+        if requires_overlay_output_id(message.get("spec_version")) and missing_overlay_output_id(record):
+            subscription_id = str(message.get("subscription_id") or f"{session_id}::{agent_id}")
+            await send_protocol_error_to_agent(
+                agent_id,
+                session_id,
+                subscription_id,
+                "INVALID_MESSAGE",
+                f"overlay_update requires non-empty record.output_id for schema '{schema}' in ACP-0.4.3",
+            )
+            return
         
         if isinstance(record, dict) and session_id in session_data_stores:
             data_store = session_data_stores[session_id]
@@ -3083,6 +3137,17 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
     elif message_type == "overlay_marker":
         # Event marker from overlay agent
         record = message.get("record")
+
+        if requires_overlay_output_id(message.get("spec_version")) and missing_overlay_output_id(record):
+            subscription_id = str(message.get("subscription_id") or f"{session_id}::{agent_id}")
+            await send_protocol_error_to_agent(
+                agent_id,
+                session_id,
+                subscription_id,
+                "INVALID_MESSAGE",
+                "overlay_marker requires non-empty record.output_id in ACP-0.4.3",
+            )
+            return
         
         if isinstance(record, dict) and session_id in session_data_stores:
             data_store = session_data_stores[session_id]

@@ -31,6 +31,8 @@ interface ChartViewProps {
   overlayAreaStyles?: Map<
     string,
     {
+      useSourceStyle: boolean;
+      showLabels: boolean;
       fillMode: "solid" | "conditional";
       opacityPercent: number;
       conditionalUpColor?: string;
@@ -155,10 +157,58 @@ interface AreaPoint {
   time: number;
   upper: number;
   lower: number;
+  style?: AreaRenderStyle;
+}
+
+function intervalToSeconds(interval?: string): number | null {
+  if (!interval) {
+    return null;
+  }
+
+  const match = /^(\d+)(m|h|d|w|M)$/i.exec(interval.trim());
+  if (!match) {
+    return null;
+  }
+
+  const value = Number.parseInt(match[1], 10);
+  const unit = match[2];
+  if (!Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+
+  switch (unit) {
+    case "m":
+      return value * 60;
+    case "h":
+      return value * 3600;
+    case "d":
+      return value * 86400;
+    case "w":
+      return value * 604800;
+    case "M":
+      return value * 2592000;
+    default:
+      return null;
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function readAreaLabel(record: OverlayRecord | undefined): string | null {
+  const metadata = record?.metadata;
+  if (!metadata || typeof metadata !== "object") {
+    return null;
+  }
+
+  const value = (metadata as Record<string, unknown>).label;
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 /**
@@ -202,6 +252,8 @@ function readAreaRenderStyle(
   record: OverlayRecord | undefined,
   fallbackColor: string,
   uiStyle?: {
+    useSourceStyle: boolean;
+    showLabels: boolean;
     fillMode: "solid" | "conditional";
     opacityPercent: number;
     conditionalUpColor?: string;
@@ -215,9 +267,14 @@ function readAreaRenderStyle(
     ? (metadata as Record<string, unknown>).render
     : undefined) as Record<string, unknown> | undefined;
 
-  const fillMode = uiStyle?.fillMode === "solid"
+  const useSourceStyle = uiStyle?.useSourceStyle === true;
+  const overrideStyle = useSourceStyle ? undefined : uiStyle;
+
+  const fillMode = overrideStyle?.fillMode === "solid"
     ? "solid"
-    : (render?.fill_mode === "solid" ? "solid" : "conditional");
+    : useSourceStyle
+      ? (render?.fill_mode === "conditional" ? "conditional" : "solid")
+      : (render?.fill_mode === "solid" ? "solid" : "conditional");
 
   const hasPrimaryColor = typeof render?.primary_color === "string" && render.primary_color.trim().length > 0;
   const hasSecondaryColor = typeof render?.secondary_color === "string" && render.secondary_color.trim().length > 0;
@@ -230,19 +287,19 @@ function readAreaRenderStyle(
   const transparency = hasTransparency ? clamp(Number(render?.transparency), 0, 100) : 0;
 
   const metadataAlpha = clamp(opacity * (1 - transparency / 100), 0, 1);
-  const fillAlpha = uiStyle
-    ? clamp(uiStyle.opacityPercent / 100, 0, 1)
+  const fillAlpha = overrideStyle
+    ? clamp(overrideStyle.opacityPercent / 100, 0, 1)
     : (hasOpacity || hasTransparency ? metadataAlpha : 0.5);
 
-  const resolvedUpColor = uiStyle?.conditionalUpColor || conditionalUpColor;
-  const resolvedDownColor = uiStyle?.conditionalDownColor || conditionalDownColor;
+  const resolvedUpColor = overrideStyle?.conditionalUpColor || conditionalUpColor;
+  const resolvedDownColor = overrideStyle?.conditionalDownColor || conditionalDownColor;
 
-  const primaryColor = fillMode === "conditional"
-    ? resolvedUpColor
-    : (primaryColorRaw || fallbackColor);
-  const secondaryColor = fillMode === "conditional"
-    ? resolvedDownColor
-    : (secondaryColorRaw || primaryColor);
+  const primaryColor = useSourceStyle
+    ? (primaryColorRaw || fallbackColor)
+    : (fillMode === "conditional" ? resolvedUpColor : (primaryColorRaw || fallbackColor));
+  const secondaryColor = useSourceStyle
+    ? (secondaryColorRaw || primaryColor)
+    : (fillMode === "conditional" ? resolvedDownColor : (secondaryColorRaw || primaryColor));
 
   const gradientRaw = render?.gradient;
   const gradient = gradientRaw && typeof gradientRaw === "object"
@@ -272,6 +329,7 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
   private upperSeries: ISeriesApi<any>;
   private points: AreaPoint[] = [];
   private style: AreaRenderStyle;
+  private maxGapSeconds: number | null = null;
 
   constructor(chart: IChartApi, upperSeries: ISeriesApi<any>, style: AreaRenderStyle) {
     this.chart = chart;
@@ -279,18 +337,16 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
     this.style = style;
   }
 
-  update(points: AreaPoint[], style: AreaRenderStyle) {
+  update(points: AreaPoint[], style: AreaRenderStyle, maxGapSeconds?: number | null) {
     this.points = points;
     this.style = style;
+    this.maxGapSeconds = typeof maxGapSeconds === "number" && Number.isFinite(maxGapSeconds)
+      ? maxGapSeconds
+      : null;
   }
 
   draw(target: CanvasRenderingTarget2D) {
     if (this.points.length < 2) {
-      return;
-    }
-
-    const alpha = clamp(this.style.fillAlpha, 0, 1);
-    if (alpha <= 0) {
       return;
     }
 
@@ -302,6 +358,16 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
       for (let index = 1; index < this.points.length; index += 1) {
         const left = this.points[index - 1];
         const right = this.points[index];
+
+        if (this.maxGapSeconds !== null && right.time - left.time > this.maxGapSeconds) {
+          continue;
+        }
+
+        const segmentStyle = right.style || left.style || this.style;
+        const alpha = clamp(segmentStyle.fillAlpha, 0, 1);
+        if (alpha <= 0) {
+          continue;
+        }
 
         const x1 = timeScale.timeToCoordinate(left.time);
         const x2 = timeScale.timeToCoordinate(right.time);
@@ -328,9 +394,9 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
         const segmentMidLower = (left.lower + right.lower) / 2;
         const isInverted = segmentMidUpper < segmentMidLower;
 
-        const baseColor = this.style.fillMode === "solid"
-          ? this.style.primaryColor
-          : (isInverted ? this.style.secondaryColor : this.style.primaryColor);
+        const baseColor = segmentStyle.fillMode === "solid"
+          ? segmentStyle.primaryColor
+          : (isInverted ? segmentStyle.secondaryColor : segmentStyle.primaryColor);
 
         if (!baseColor) {
           continue;
@@ -347,18 +413,18 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
         ctx.globalAlpha = alpha;
 
         if (
-          this.style.gradient?.enabled &&
-          this.style.gradient.start_color &&
-          this.style.gradient.end_color
+          segmentStyle.gradient?.enabled &&
+          segmentStyle.gradient.start_color &&
+          segmentStyle.gradient.end_color
         ) {
-          const vertical = this.style.gradient.direction !== "horizontal";
+          const vertical = segmentStyle.gradient.direction !== "horizontal";
           const gx1 = vertical ? px1 : px1;
           const gy1 = vertical ? Math.min(pyUpper1, pyUpper2, pyLower1, pyLower2) : pyUpper1;
           const gx2 = vertical ? px1 : px2;
           const gy2 = vertical ? Math.max(pyUpper1, pyUpper2, pyLower1, pyLower2) : pyUpper1;
           const gradient = ctx.createLinearGradient(gx1, gy1, gx2, gy2);
-          gradient.addColorStop(0, this.style.gradient.start_color);
-          gradient.addColorStop(1, this.style.gradient.end_color);
+          gradient.addColorStop(0, segmentStyle.gradient.start_color);
+          gradient.addColorStop(1, segmentStyle.gradient.end_color);
           ctx.fillStyle = gradient;
         } else {
           ctx.fillStyle = baseColor;
@@ -384,8 +450,8 @@ class AreaBetweenPaneView implements IPrimitivePaneView {
     this.rendererInstance = new AreaBetweenRenderer(chart, upperSeries, style);
   }
 
-  update(points: AreaPoint[], style: AreaRenderStyle) {
-    this.rendererInstance.update(points, style);
+  update(points: AreaPoint[], style: AreaRenderStyle, maxGapSeconds?: number | null) {
+    this.rendererInstance.update(points, style, maxGapSeconds);
   }
 
   renderer() {
@@ -400,8 +466,8 @@ class AreaBetweenPrimitive implements ISeriesPrimitive<Time> {
     this.paneView = new AreaBetweenPaneView(chart, upperSeries, style);
   }
 
-  update(points: AreaPoint[], style: AreaRenderStyle) {
-    this.paneView.update(points, style);
+  update(points: AreaPoint[], style: AreaRenderStyle, maxGapSeconds?: number | null) {
+    this.paneView.update(points, style, maxGapSeconds);
   }
 
   updateAllViews() {
@@ -803,6 +869,7 @@ export function ChartView({
       }
     >
   >(new Map());
+  const areaSeriesMarkersRef = useRef<Map<string, ISeriesMarkersPluginApi<Time>>>(new Map());
   const seriesMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const seriesMarkersSeriesRef = useRef<ISeriesApi<any> | null>(null);
 
@@ -1333,6 +1400,7 @@ export function ChartView({
       initializedSubgraphPanesRef.current.clear();
       lineSeriesActualPaneRef.current.clear();
       areaSeriesActualPaneRef.current.clear();
+      areaSeriesMarkersRef.current.clear();
       seriesMarkersRef.current = null;
       seriesMarkersSeriesRef.current = null;
     };
@@ -1405,6 +1473,11 @@ export function ChartView({
 
       for (const [seriesKey, areaSeries] of existingAreaSeries.entries()) {
         if (!incomingAgentIds.has(seriesKey)) {
+          const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
+          if (areaMarkersApi) {
+            areaMarkersApi.setMarkers([] as SeriesMarker<Time>[]);
+            areaSeriesMarkersRef.current.delete(seriesKey);
+          }
           chart.removeSeries(areaSeries.upperSeries);
           chart.removeSeries(areaSeries.lowerSeries);
           existingAreaSeries.delete(seriesKey);
@@ -1444,6 +1517,10 @@ export function ChartView({
           const areaStyleOverride = overlayAreaStyles?.get(agentId);
           const upColor = cssVar("--chart-up", "#22c55e");
           const downColor = cssVar("--chart-down", "#ef4444");
+          const expectedIntervalSeconds = intervalToSeconds(selectedInterval) || intervalToSeconds(records[0]?.metadata && typeof records[0].metadata === "object"
+            ? String((records[0].metadata as Record<string, unknown>).aggregation_interval || "")
+            : "") || null;
+          const maxAreaGapSeconds = expectedIntervalSeconds ? expectedIntervalSeconds * 1.5 : null;
 
           // --- Histogram schema: always render in a dedicated sub-graph pane ---
           if (schema === "histogram") {
@@ -1462,6 +1539,11 @@ export function ChartView({
 
               const possibleAreaSeries = existingAreaSeries.get(seriesKey);
               if (possibleAreaSeries) {
+                const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
+                if (areaMarkersApi) {
+                  areaMarkersApi.setMarkers([] as SeriesMarker<Time>[]);
+                  areaSeriesMarkersRef.current.delete(seriesKey);
+                }
                 chart.removeSeries(possibleAreaSeries.upperSeries);
                 chart.removeSeries(possibleAreaSeries.lowerSeries);
                 existingAreaSeries.delete(seriesKey);
@@ -1495,6 +1577,7 @@ export function ChartView({
             const wantsSubgraph = isSubgraphOverlay(schema, records, agentId, overlaySubgraphForced);
             const paneKey = resolveSubgraphPaneKey(schema, records, agentId, seriesKey);
             const areaPane = wantsSubgraph ? getSubgraphPane(paneKey) : 0;
+            const shouldShowAreaLabels = areaStyleOverride?.showLabels !== false;
             if (wantsSubgraph) {
               ensureSubgraphPaneStretch(areaPane);
             }
@@ -1502,6 +1585,11 @@ export function ChartView({
 
             const actualPane = areaSeriesActualPaneRef.current.get(seriesKey) ?? 0;
             if (areaSeries && actualPane !== areaPane) {
+              const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
+              if (areaMarkersApi) {
+                areaMarkersApi.setMarkers([] as SeriesMarker<Time>[]);
+                areaSeriesMarkersRef.current.delete(seriesKey);
+              }
               chart.removeSeries(areaSeries.upperSeries);
               chart.removeSeries(areaSeries.lowerSeries);
               existingAreaSeries.delete(seriesKey);
@@ -1567,7 +1655,15 @@ export function ChartView({
                   return null;
                 }
 
-                return { time, upper, lower };
+                const style = readAreaRenderStyle(
+                  record,
+                  seriesColor,
+                  areaStyleOverride,
+                  upColor,
+                  downColor,
+                );
+
+                return { time, upper, lower, style };
               })
               .filter((point): point is AreaPoint => point !== null)
               .sort((a, b) => a.time - b.time);
@@ -1582,9 +1678,8 @@ export function ChartView({
             );
 
             if (deduplicatedAreaData.length > 0) {
-              const latestRecord = records[records.length - 1];
-              const style = readAreaRenderStyle(
-                latestRecord,
+              const fallbackStyle = readAreaRenderStyle(
+                records[records.length - 1],
                 seriesColor,
                 areaStyleOverride,
                 upColor,
@@ -1610,7 +1705,54 @@ export function ChartView({
               areaSeries.lowerSeries.setData(
                 deduplicatedAreaData.map((point) => ({ time: point.time, value: point.lower }))
               );
-              areaSeries.primitive.update(deduplicatedAreaData, style);
+              areaSeries.primitive.update(deduplicatedAreaData, fallbackStyle, maxAreaGapSeconds);
+
+              const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
+              const setAreaMarkers = (markers: SeriesMarker<Time>[]) => {
+                if (!areaMarkersApi) {
+                  const nextApi = createSeriesMarkers(areaSeries.upperSeries as any, markers);
+                  areaSeriesMarkersRef.current.set(seriesKey, nextApi);
+                } else {
+                  areaMarkersApi.setMarkers(markers);
+                }
+              };
+
+              if (!shouldShowAreaLabels) {
+                setAreaMarkers([] as SeriesMarker<Time>[]);
+              } else {
+                let latestLabeledRecord: OverlayRecord | null = null;
+                for (let index = records.length - 1; index >= 0; index -= 1) {
+                  const candidate = records[index];
+                  const candidateLabel = readAreaLabel(candidate);
+                  const candidateTime = toUnixSeconds(candidate.ts);
+                  if (!candidateLabel || candidateTime === null || !isInCandleWindow(candidateTime)) {
+                    continue;
+                  }
+                  latestLabeledRecord = candidate;
+                  break;
+                }
+
+                if (!latestLabeledRecord) {
+                  setAreaMarkers([] as SeriesMarker<Time>[]);
+                } else {
+                  const labelText = readAreaLabel(latestLabeledRecord);
+                  const labelTime = toUnixSeconds(latestLabeledRecord.ts);
+                  if (!labelText || labelTime === null) {
+                    setAreaMarkers([] as SeriesMarker<Time>[]);
+                  } else {
+                    const markerText = labelText.length > 32 ? `${labelText.slice(0, 29)}...` : labelText;
+                    setAreaMarkers([
+                      {
+                        time: labelTime,
+                        position: "aboveBar",
+                        shape: "square",
+                        color: fallbackStyle.primaryColor || seriesColor,
+                        text: markerText,
+                      } as SeriesMarker<Time>,
+                    ]);
+                  }
+                }
+              }
             } else {
               areaSeries.upperSeries.setData([]);
               areaSeries.lowerSeries.setData([]);
@@ -1622,8 +1764,13 @@ export function ChartView({
                   areaStyleOverride,
                   upColor,
                   downColor,
-                )
+                ),
+                maxAreaGapSeconds,
               );
+              const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
+              if (areaMarkersApi) {
+                areaMarkersApi.setMarkers([] as SeriesMarker<Time>[]);
+              }
             }
 
             continue;
@@ -1674,6 +1821,11 @@ export function ChartView({
 
             const possibleAreaSeries = existingAreaSeries.get(seriesKey);
             if (possibleAreaSeries) {
+              const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
+              if (areaMarkersApi) {
+                areaMarkersApi.setMarkers([] as SeriesMarker<Time>[]);
+                areaSeriesMarkersRef.current.delete(seriesKey);
+              }
               chart.removeSeries(possibleAreaSeries.upperSeries);
               chart.removeSeries(possibleAreaSeries.lowerSeries);
               existingAreaSeries.delete(seriesKey);

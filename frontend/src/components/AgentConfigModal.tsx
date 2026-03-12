@@ -243,6 +243,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   const [areaFillOpacityInput, setAreaFillOpacityInput] = useState<number>(50);
   const [areaConditionalUpColorInput, setAreaConditionalUpColorInput] = useState<string>("#22c55e");
   const [areaConditionalDownColorInput, setAreaConditionalDownColorInput] = useState<string>("#ef4444");
+  const [areaUseSourceStyleInput, setAreaUseSourceStyleInput] = useState<boolean>(true);
+  const [areaShowLabelsInput, setAreaShowLabelsInput] = useState<boolean>(true);
   const [visibleInput, setVisibleInput] = useState<boolean>(true);
   const [savedVisibleInput, setSavedVisibleInput] = useState<boolean>(true);
   const [forceSubgraphInput, setForceSubgraphInput] = useState<boolean>(false);
@@ -271,7 +273,9 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
             key !== "area_fill_mode" &&
             key !== "area_fill_opacity" &&
             key !== "area_conditional_up_color" &&
-            key !== "area_conditional_down_color"
+            key !== "area_conditional_down_color" &&
+            key !== "area_use_source_style" &&
+            key !== "area_show_labels"
         );
 
     return orderedKeys.map((key) => {
@@ -337,6 +341,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     const nextFillOpacity = Number(subscription.config?.area_fill_opacity);
     const nextConditionalUpColor = subscription.config?.area_conditional_up_color;
     const nextConditionalDownColor = subscription.config?.area_conditional_down_color;
+    const nextUseSourceStyle = subscription.config?.area_use_source_style;
+    const nextShowLabels = subscription.config?.area_show_labels;
     const nextAggregationInterval = subscription.config?.aggregation_interval;
     const nextParamInputs: Record<string, string> = {};
 
@@ -375,6 +381,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
         ? nextConditionalDownColor
         : "#ef4444"
     );
+    setAreaUseSourceStyleInput(nextUseSourceStyle !== false);
+    setAreaShowLabelsInput(nextShowLabels !== false);
     setForceSubgraphInput(subscription.config?.force_subgraph === true);
     setActionError(null);
     setSaving(false);
@@ -497,6 +505,8 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
         nextConfig.area_fill_opacity = Math.max(0, Math.min(100, areaFillOpacityInput));
         nextConfig.area_conditional_up_color = areaConditionalUpColorInput;
         nextConfig.area_conditional_down_color = areaConditionalDownColorInput;
+        nextConfig.area_use_source_style = areaUseSourceStyleInput;
+        nextConfig.area_show_labels = areaShowLabelsInput;
       }
 
       await onUpdate(subscription.id, {
@@ -771,6 +781,46 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                 {hasAreaOutput && (
                   <>
                     <div className="config-item">
+                      <span className="config-label">Area Source Style</span>
+                      <label
+                        className="agent-subgraph-toggle"
+                        style={{ display: "flex", alignItems: "center", gap: "8px", cursor: saving || deleting ? "not-allowed" : "pointer" }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={areaUseSourceStyleInput}
+                          onChange={(event) => setAreaUseSourceStyleInput(event.target.checked)}
+                          disabled={saving || deleting}
+                          style={{ width: "16px", height: "16px", accentColor: "#22c55e", cursor: "inherit" }}
+                        />
+                        <span style={{ fontSize: "12px", color: areaUseSourceStyleInput ? "#22c55e" : "#94a3b8" }}>
+                          {areaUseSourceStyleInput
+                            ? "Enabled — use indicator-sent color/opacity metadata"
+                            : "Disabled — use UI area colors and opacity overrides"}
+                        </span>
+                      </label>
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">Area Labels</span>
+                      <label
+                        className="agent-subgraph-toggle"
+                        style={{ display: "flex", alignItems: "center", gap: "8px", cursor: saving || deleting ? "not-allowed" : "pointer" }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={areaShowLabelsInput}
+                          onChange={(event) => setAreaShowLabelsInput(event.target.checked)}
+                          disabled={saving || deleting}
+                          style={{ width: "16px", height: "16px", accentColor: "#22c55e", cursor: "inherit" }}
+                        />
+                        <span style={{ fontSize: "12px", color: areaShowLabelsInput ? "#22c55e" : "#94a3b8" }}>
+                          {areaShowLabelsInput
+                            ? "Enabled — show metadata.label on active zone"
+                            : "Disabled — hide zone labels"}
+                        </span>
+                      </label>
+                    </div>
+                    <div className="config-item">
                       <span className="config-label">Area Fill Mode</span>
                       <select
                         className="agent-input"
@@ -778,7 +828,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                         onChange={(event) =>
                           setAreaFillModeInput(event.target.value === "solid" ? "solid" : "conditional")
                         }
-                        disabled={saving || deleting}
+                        disabled={saving || deleting || areaUseSourceStyleInput}
                       >
                         <option value="conditional">Conditional (green/red cloud)</option>
                         <option value="solid">Solid (single fill color)</option>
@@ -801,7 +851,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                           }
                           setAreaFillOpacityInput(Math.max(0, Math.min(100, nextValue)));
                         }}
-                        disabled={saving || deleting}
+                        disabled={saving || deleting || areaUseSourceStyleInput}
                       />
                     </div>
                     <div className="config-item">
@@ -811,7 +861,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                         type="color"
                         value={areaConditionalUpColorInput}
                         onChange={(event) => setAreaConditionalUpColorInput(event.target.value)}
-                        disabled={saving || deleting}
+                        disabled={saving || deleting || areaUseSourceStyleInput}
                       />
                     </div>
                     <div className="config-item">
@@ -821,7 +871,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                         type="color"
                         value={areaConditionalDownColorInput}
                         onChange={(event) => setAreaConditionalDownColorInput(event.target.value)}
-                        disabled={saving || deleting}
+                        disabled={saving || deleting || areaUseSourceStyleInput}
                       />
                     </div>
                   </>

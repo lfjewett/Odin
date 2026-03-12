@@ -4,7 +4,7 @@
   "title": "ACP Area Record (Shaded Region)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "ts", "upper", "lower"],
+  "required": ["id", "ts", "output_id", "upper", "lower"],
   "properties": {
     "id": { 
       "type": "string", 
@@ -20,6 +20,11 @@
       "type": "string", 
       "format": "date-time",
       "description": "ISO-8601 timestamp"
+    },
+    "output_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable output identifier matching indicator metadata outputs[].output_id"
     },
     "upper": { 
       "type": "number",

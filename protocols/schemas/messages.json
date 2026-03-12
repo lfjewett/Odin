@@ -29,7 +29,7 @@
       "required": ["type", "spec_version", "session_id", "subscription_id", "agent_id"],
       "properties": {
         "type": { "type": "string" },
-        "spec_version": { "type": "string", "enum": ["ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2"] },
+        "spec_version": { "type": "string", "enum": ["ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3"] },
         "session_id": { "type": "string", "minLength": 1 },
         "subscription_id": { "type": "string", "minLength": 1 },
         "agent_id": { "type": "string", "minLength": 1 }

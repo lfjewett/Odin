@@ -712,7 +712,7 @@ def _build_indicator_variable_maps(data_store: SessionDataStore) -> dict[str, di
 
         records_for_agent = [
             record
-            for (source_agent_id, _record_id), record in data_store.latest_non_ohlc_by_key.items()
+            for (source_agent_id, _storage_key), record in data_store.latest_non_ohlc_by_key.items()
             if source_agent_id == agent_id
         ]
 

@@ -616,6 +616,8 @@ export default function App() {
     const styles = new Map<
       string,
       {
+        useSourceStyle: boolean;
+        showLabels: boolean;
         fillMode: "solid" | "conditional";
         opacityPercent: number;
         conditionalUpColor?: string;
@@ -633,6 +635,15 @@ export default function App() {
         return;
       }
 
+      const hasExplicitUiAreaStyle =
+        agent.config?.area_fill_mode !== undefined
+        || agent.config?.area_fill_opacity !== undefined
+        || agent.config?.area_conditional_up_color !== undefined
+        || agent.config?.area_conditional_down_color !== undefined;
+
+      const useSourceStyle = agent.config?.area_use_source_style === true
+        || (agent.config?.area_use_source_style !== false && !hasExplicitUiAreaStyle);
+
       const fillMode = agent.config?.area_fill_mode === "solid" ? "solid" : "conditional";
       const rawOpacity = Number(agent.config?.area_fill_opacity);
       const opacityPercent = Number.isFinite(rawOpacity)
@@ -646,6 +657,8 @@ export default function App() {
         : "";
 
       styles.set(agent.id, {
+        useSourceStyle,
+        showLabels: agent.config?.area_show_labels !== false,
         fillMode,
         opacityPercent,
         conditionalUpColor: conditionalUpColor || undefined,
@@ -1684,7 +1697,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v1.32</h1>
+          <h1 className="app-title">ODIN Market Workspace v1.35</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">

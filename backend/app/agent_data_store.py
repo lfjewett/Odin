@@ -1,9 +1,9 @@
 """
-Per-session canonical data container for ACP v0.2.0.
+Per-session canonical data container for ACP v0.4.x.
 
 Stores canonical OHLC records with proper deduplication (by agent_id, id, rev
-for OHLC; by agent_id, id for non-OHLC). Maintains rolling window of finalized
-candles for historical queries.
+for OHLC; by agent_id plus canonical overlay identity for non-OHLC). Maintains
+rolling window of finalized candles for historical queries.
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ class SessionDataStore:
     """
     Holds canonical market data for a single session.
     
-    Per ACP v0.2.0:
+    Per ACP v0.4.x:
     - OHLC deduplication: (agent_id, id, rev) — upsert on higher rev
-    - Non-OHLC deduplication: (agent_id, id)
+    - Non-OHLC canonical identity: (agent_id, output_id, ts|id) with upsert semantics
     """
 
     session_id: str
@@ -39,7 +39,7 @@ class SessionDataStore:
     finalized_bars: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
 
     # Non-OHLC storage and dedup tracking:
-    # key: (source_agent_id, record_id) -> latest record
+    # key: (source_agent_id, canonical_overlay_key) -> latest record
     latest_non_ohlc_by_key: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     
     # Activity timestamps
@@ -138,32 +138,32 @@ class SessionDataStore:
         output_id: str | None = None,
     ) -> dict[str, Any] | None:
         """
-        Ingest a non-OHLC record (e.g., event, line) with deduplication.
-        
-        ACP v0.2.0 deduplication: (agent_id, id)
-        - Rejects if we've already seen this (agent_id, id)
+        Ingest a non-OHLC record (e.g., area, event, line) with canonical upsert semantics.
+
+        Canonical identity prefers `(output_id, ts)` so multi-output indicators can
+        emit records with the same `id` without collapsing distinct outputs.
         """
-        record_id = str(record.get("id", ""))
-        if not record_id:
+        raw_record_id = str(record.get("id", "")).strip()
+        record_ts = str(record.get("ts", "")).strip()
+        normalized_output_id = str(output_id or record.get("output_id") or "default").strip() or "default"
+
+        if not raw_record_id and not record_ts:
             return None
 
         dedup_agent_id = source_agent_id or self.agent_id
-        dedup_key = (dedup_agent_id, record_id)
-        
-        # Simple dedup: if we've seen this id before, skip
-        if dedup_key in self.latest_non_ohlc_by_key:
-            return None  # Already ingested
+        canonical_record_key = f"{normalized_output_id}::{record_ts or raw_record_id}"
+        dedup_key = (dedup_agent_id, canonical_record_key)
 
-        # Ingest
         normalized = dict(record)
+        if raw_record_id:
+            normalized["id"] = raw_record_id
         if source_agent_id and not normalized.get("agent_id"):
             normalized["agent_id"] = source_agent_id
         if schema and not normalized.get("schema"):
             normalized["schema"] = schema
         if subscription_id and not normalized.get("subscription_id"):
             normalized["subscription_id"] = subscription_id
-        if output_id and not normalized.get("output_id"):
-            normalized["output_id"] = output_id
+        normalized["output_id"] = normalized_output_id
         self.latest_non_ohlc_by_key[dedup_key] = normalized
         self.last_event_ts = str(normalized.get("ts") or self.last_event_ts)
 

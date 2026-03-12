@@ -102,7 +102,7 @@ Semantics:
 - Backend indicator subscribe/reconcile flows must send the selected `indicator_id` to remote agents; matching by URL or agent path is not sufficient.
 - `line_color` remains a UI-managed config field and should be editable even when it is not declared in `params_schema`.
 - `visible` remains a UI-managed config field and must persist in backend agent `config` round-trips while being excluded from indicator runtime subscribe params.
-- `area_fill_mode` (`conditional|solid`), `area_fill_opacity` (`0..100`, default `50`), `area_conditional_up_color`, and `area_conditional_down_color` are UI-managed config fields for area overlays and must persist in backend agent `config` round-trips while being excluded from indicator runtime subscribe params.
+- `area_fill_mode` (`conditional|solid`), `area_fill_opacity` (`0..100`, default `50`), `area_conditional_up_color`, `area_conditional_down_color`, `area_use_source_style` (`boolean`), and `area_show_labels` (`boolean`) are UI-managed config fields for area overlays and must persist in backend agent `config` round-trips while being excluded from indicator runtime subscribe params.
 - If schema matching is unavailable, frontend may fall back to rendering existing persisted config keys except `line_color`.
 - Session variable discovery for area outputs must expose both `upper/lower` and any numeric `record.metadata` fields using stable DSL-safe canonical names. For duplicate label cases like `Gungnir:Gungnir`, canonical names collapse to `Gungnir:upper`, `Gungnir:lower`, and `Gungnir:dist`. Strategy evaluation must resolve metadata-backed variables from each record's `metadata` payload and keep legacy alias compatibility for previously saved rules that still reference `Gungnir:Gungnir:upper|lower` or `...:meta_<field>`.
 
@@ -113,6 +113,14 @@ Semantics:
 - Numeric confidence intended for trade logic must be emitted in record metadata (recommended key: `metadata.confidence`) by backend/agent and consumed by backend trade evaluation/export; UI may only display it.
 - Optional text labels (recommended key: `metadata.label`) and optional render hints (`metadata.render.*`) are display metadata and must not be required for backend trade correctness.
 - Backend canonical storage must treat overlay updates as authoritative for matching candle/output identity; UI replay/state should follow backend snapshots/events rather than local heuristics.
+- When `config.area_use_source_style === true`, frontend must prefer per-record `metadata.render` colors/opacities for area overlays; when false, frontend may apply UI-managed area fill overrides instead.
+- When `config.area_show_labels !== false`, frontend may render `metadata.label` for active area zones; when false, label rendering must be suppressed without affecting backend-canonical records.
+
+## Overlay Output Identity Rules (ACP-0.4.3)
+
+- For `ACP-0.4.3`, all non-OHLC overlay records MUST include non-empty `output_id` on every emitted record (`history_response.overlays[]`, `overlay_update.record`, `overlay_marker.record`).
+- For multi-output indicators, record `output_id` MUST map to stable metadata output descriptors and remain deterministic through the subscription lifecycle.
+- Backend enforces this for incoming `ACP-0.4.3` payloads and returns protocol error `INVALID_MESSAGE` when `output_id` is missing/empty.
 
 ## Recovery Rules
 

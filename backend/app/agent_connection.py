@@ -1,5 +1,5 @@
 """
-Agent WebSocket Connection Manager (ACP v0.4.2)
+Agent WebSocket Connection Manager (ACP v0.4.3)
 
 Manages WebSocket connections to ACP agents and handles session-based subscriptions.
 Each agent connection can serve multiple sessions (clients).
@@ -24,8 +24,8 @@ from app.models import Agent
 logger = logging.getLogger(__name__)
 
 
-ACP_SPEC_VERSION = "ACP-0.4.2"
-COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2"}
+ACP_SPEC_VERSION = "ACP-0.4.3"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RECORDS_PER_CHUNK = 5000
 DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES = 10 * 1024 * 1024
@@ -35,7 +35,7 @@ class AgentConnection:
     """
     Manages WebSocket connection and subscriptions for a single agent.
     
-    ACP v0.4.2: Supports multiple concurrent sessions per agent.
+    ACP v0.4.3: Supports multiple concurrent sessions per agent.
     Each session is isolated (session_id in all messages).
     """
     
