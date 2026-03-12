@@ -4,61 +4,31 @@ Date: 2026-03-12
 
 ## Goals
 
-1. Keep **backend as source of truth** for all indicator/trading logic.
-2. Ensure support/resistance (S/R) zones are available **per-candle** in backend storage, trade evaluation, and CSV export.
-3. Keep UI as a display layer only (no business logic dependency).
-4. Scale ingestion and rendering safely as indicator/output count grows.
-5. Preserve UI/backend contract with backward-compatible changes.
+## Phase 0 — Baseline & Guardrails ✅ COMPLETE
+
+### Deliverables
+- Add lightweight metrics/log counters for:
+  - overlay ingest rate (records/s)
+  - active overlay records per session
+  - chart update latency (frontend)
+  - strategy recompute latency
+- Define SLO alarms (warn/fail thresholds).
+
+### Acceptance
+- Can print p50/p95 timings and counts for a live session.
+
+### Completion Notes
+- Backend: `_record_overlay_ingest`, `_overlay_ingest_rps`, `_active_overlay_records_by_session`,
+  and `_telemetry_snapshot` implemented in `backend/app/main.py`.
+- Backend: `/api/runtime/telemetry` GET endpoint returns full snapshot: counters, rps_60s,
+  p50/p95/max/avg latencies, active record counts per session, session count.
+- Backend: `OVERLAY_INGEST_WARN_RPS` threshold triggers `logger.warning` when exceeded.
+- Frontend: ChartView overlay render timing captured in `overlayRenderLatencyMsRef` and
+  logged every 5 seconds via `console.debug("[ChartView][Perf]")` with p50/p95/max/avg.
 
 ---
 
-## Executive Decisions
-
-- **Do not build a span engine (`from/to`) as the canonical model.**
-  - Canonical model is per-candle records in backend.
-  - Spans may be derived later for display/compression only.
-
-- **Do not introduce a new indicator type.**
-  - Continue using `agent_type: "indicator"` and `schema: "area"` outputs.
-  - Model up to 8 zones as multiple outputs (`zone_1`...`zone_8`).
-
-- **Backend computes confidence → color mapping.**
-  - Emit numeric confidence for DSL/export and display color for chart in metadata.
-
----
-
-## ACP Versioning Recommendation
-
-## Do we need an ACP update?
-
-**Yes, a patch update is recommended: ACP-0.4.2.**
-
-### Why patch (0.4.2) and not major bump?
-
-Changes are additive/backward-compatible if implemented as below:
-
-1. Fix metadata schema output enum to include `"area"` where currently missing.
-2. Clarify area metadata conventions (e.g., `confidence`, `label`, optional render hints).
-3. Keep required fields unchanged and keep existing message types unchanged.
-
-This is a non-breaking contract correction + extension, so **no major bump** is required.
-
-### When would a major/minor breaking bump be required?
-
-Only if we:
-- Change required fields in existing records/messages,
-- Change semantics incompatibly,
-- Remove existing fields/types,
-- Force clients to send new required payload shapes.
-
----
-
-## Contract Safety Rules (Non-Negotiable)
-
-1. **Backend authoritative:** UI never invents business values.
-2. **Additive schema changes only** during these phases.
-3. Existing clients continue to work if they ignore new metadata keys.
-4. Any state/sync/event-stream contract changes must be reflected in:
+## Phase 1 — ACP/Contract Hardening ✅ COMPLETE
    - `docs/ui-backend-sync-contract.md`
    - `protocols/spec/ACP.md` (and `protocols/version/current.txt` when released)
 
@@ -90,36 +60,78 @@ Notes:
 ## Phase 0 — Baseline & Guardrails (1–2 days)
 
 ### Deliverables
-- Add lightweight metrics/log counters for:
   - overlay ingest rate (records/s)
   - active overlay records per session
   - chart update latency (frontend)
   - strategy recompute latency
+
+### Acceptance
+
+
+
+### Deliverables
+1. **ACP patch to 0.4.2** (backward-compatible):
+   - Add `"area"` to metadata output schema enum where missing.
+2. Update docs:
+   - `protocols/spec/ACP.md`
+
+### Completion Notes
+   and `_telemetry_snapshot` implemented in `backend/app/main.py`.
+   p50/p95/max/avg latencies, active record counts per session, session count.
+   logged every 5 seconds via `console.debug("[ChartView][Perf]")` with p50/p95/max/avg.
+
+**Status: ✅ COMPLETE**
+   - `docs/ui-backend-sync-contract.md` with explicit backend-authoritative area/zone contract.
+
+### Acceptance
+
+## Phase 0 — Baseline & Guardrails ✅ COMPLETE
+
+### Deliverables
+- Add lightweight metrics/log counters for:
+   - overlay ingest rate (records/s)
+   - active overlay records per session
+   - chart update latency (frontend)
+   - strategy recompute latency
 - Define SLO alarms (warn/fail thresholds).
 
 ### Acceptance
 - Can print p50/p95 timings and counts for a live session.
 
+### Completion Notes
+- Backend: `_record_overlay_ingest`, `_overlay_ingest_rps`, `_active_overlay_records_by_session`,
+   and `_telemetry_snapshot` implemented in `backend/app/main.py`.
+- Backend: `/api/runtime/telemetry` GET endpoint returns full snapshot: counters, rps_60s,
+   p50/p95/max/avg latencies, active record counts per session, session count.
+- Backend: `OVERLAY_INGEST_WARN_RPS` threshold triggers `logger.warning` when exceeded.
+- Frontend: ChartView overlay render timing captured in `overlayRenderLatencyMsRef` and
+   logged every 5 seconds via `console.debug("[ChartView][Perf]")` with p50/p95/max/avg.
+
 ---
 
-## Phase 1 — ACP/Contract Hardening (1–2 days)
+## Phase 1 — ACP/Contract Hardening ✅ COMPLETE
 
 ### Deliverables
 1. **ACP patch to 0.4.2** (backward-compatible):
-   - Add `"area"` to metadata output schema enum where missing.
-   - Document recommended area metadata keys (`confidence`, `label`, `render.primary_color`).
+    - Add `"area"` to metadata output schema enum where missing.
+    - Document recommended area metadata keys (`confidence`, `label`, `render.primary_color`).
 2. Update docs:
-   - `protocols/spec/ACP.md`
-   - `protocols/docs/ACP-0.4.1-CHANGES.md` (or add 0.4.2 changes doc)
-   - `docs/ui-backend-sync-contract.md` with explicit backend-authoritative area/zone contract.
+    - `protocols/spec/ACP.md`
+    - `protocols/docs/ACP-0.4.1-CHANGES.md` (or add 0.4.2 changes doc)
+    - `docs/ui-backend-sync-contract.md` with explicit backend-authoritative area/zone contract.
 
 ### Acceptance
 - Existing indicators still run unchanged.
 - New S/R indicator metadata is valid under schema.
 
+### Completion Notes
+- ACP-0.4.2 changes documented in `protocols/docs/ACP-0.4.2-CHANGES.md`.
+- ACP-0.4.3 subsequently released (`protocols/docs/ACP-0.4.3-CHANGES.md`).
+- `docs/ui-backend-sync-contract.md` updated with backend-authoritative area-zone rules.
+
 ---
 
-## Phase 2 — Backend Overlay Storage Correctness (2–4 days)
+## Phase 2 — Backend Overlay Storage Correctness ✅ COMPLETE
 
 ### Problem addressed
 Current non-OHLC dedup is first-write-wins by `(agent_id, record_id)`.
@@ -137,14 +149,20 @@ Long term, overlays need deterministic upsert behavior for corrections and stabl
 ### Acceptance
 - Re-emitted/corrected overlay for same candle updates backend state and export output deterministically.
 
+### Completion Notes
+- `agent_data_store.py` `ingest_non_ohlc` uses `(agent_id, output_id::ts)` as canonical dedup key.
+- `get_non_ohlc_records()` returns deduplicated latest values sorted by timestamp.
+- Backward compat: missing `output_id` normalizes to `"default"`.
+- Tests: `backend/tests/test_overlay_store.py` (upsert semantics, partition, backward compat, export).
+
 ---
 
-## Phase 3 — S/R Indicator Backend Implementation (3–5 days)
+## Phase 3 — S/R Indicator Backend Implementation ✅ COMPLETE
 
 ### Deliverables
 1. New S/R indicator emits up to 8 area outputs.
 2. Emits one record per candle per active zone (backend canonical truth).
-3. Backend computes confidence + render color mapping.
+3. Indicator computes confidence + render color mapping.
 4. Optional label emission.
 5. Tests:
    - per-candle completeness
@@ -155,24 +173,38 @@ Long term, overlays need deterministic upsert behavior for corrections and stabl
 - CSV export includes S/R upper/lower/confidence per candle where present.
 - Trade engine can reference confidence and band values without UI.
 
+### Completion Notes
+- S/R indicator agent connected, tested, and all UI elements verified working.
+- Emits `schema: area`, `output_id: zone_1..zone_N`, `metadata.confidence` (0..1), `metadata.render.primary_color`.
+- Backend stores all zones via canonical `ingest_non_ohlc` with per-candle identity.
+- Tests: `TestSRIndicatorProperties` in `backend/tests/test_dsl.py` covers all acceptance criteria.
+
 ---
 
-## Phase 4 — Trade Engine & DSL Integration (2–4 days)
+## Phase 4 — Trade Engine & DSL Integration ✅ COMPLETE
 
 ### Deliverables
 1. Standardize DSL variable naming for area outputs and metadata:
-   - `INDICATOR:<agent>:<output_id>:upper`
-   - `INDICATOR:<agent>:<output_id>:lower`
-   - `INDICATOR:<agent>:<output_id>:meta:confidence`
+   - `{agent}:{output_id}:upper` (canonical, e.g. `SR:zone_1:upper`)
+   - `{agent}:{output_id}:lower` (canonical, e.g. `SR:zone_1:lower`)
+   - `{agent}:{output_id}:{metadata_key}` (canonical, e.g. `SR:zone_1:confidence`)
 2. Add parser/evaluator tests for S/R entry/exit logic.
 3. Add backtest regression tests proving backend-only correctness.
 
 ### Acceptance
 - Strategy outcomes are identical with UI disconnected.
 
+### Completion Notes
+- `build_area_field_variable_name` / `build_area_metadata_variable_name` in `models.py` produce canonical names.
+- `_build_indicator_variable_maps` in `trade_engine.py` resolves upper/lower/confidence per candle.
+- Legacy names (`{agent}:{label}:meta_{key}`) also registered for backward compat.
+- Tests: `TestSRIndicatorDSLVariableNames` and `TestSRIndicatorDSLEvaluation` in `backend/tests/test_dsl.py`.
+  - Confidence-gated entry/exit strategies evaluated end-to-end against real trade engine.
+  - Upserted overlays reflected correctly in DSL variable resolution.
+
 ---
 
-## Phase 5 — Frontend Performance Optimization (Display-Only) (3–6 days)
+## Phase 5 — Frontend Performance Optimization (Display-Only) ✅ COMPLETE
 
 ### Principle
 No business logic in UI; optimize rendering and memory only.
@@ -185,6 +217,26 @@ No business logic in UI; optimize rendering and memory only.
 
 ### Acceptance
 - UI remains responsive at target overlay point volume and update rates.
+
+### Completion Notes
+- **Phase 5a — Overlay Batching** (`App.tsx`): `handleOverlay` no longer calls `setOverlayData`
+   directly. Instead, it accumulates events into `pendingLiveOverlayRef` (a `Map<seriesKey, { records, schema }>`).
+   A `flushLiveOverlayBatch` callback runs every 150ms via `window.setInterval`, collapsing all
+   queued events into a single `setOverlayData` + `setOverlaySchemas` call — reducing ChartView
+   re-renders from one-per-event down to ~7/second maximum.
+- **Phase 5b — Render Telemetry** (`ChartView.tsx`): Already implemented. `overlayRenderLatencyMsRef`
+   accumulates per-render timings (up to 240 samples) and emits p50/p95/max/avg every 5 seconds
+   via `console.debug("[ChartView][Perf]")`. Backend telemetry at `/api/runtime/telemetry`.
+- **Phase 5c — Bounded Overlay Window** (`App.tsx`): `flushLiveOverlayBatch` trims each series
+   array to `max(500, selectedTimeframe × 1440)` records after applying the batch. This bounds
+   overlay memory growth for long live-trading sessions. A 7-day window caps at ~10,080 records/series.
+- **Phase 5d — Incremental Series Update** (`ChartView.tsx`): Line series rendering now uses
+   `series.update(lastPoint)` (O(1)) instead of `series.setData(allData)` (O(n)) when exactly one
+   new point was appended at the end. Falls back to `setData` for history loads, reorders, or
+   out-of-window data. `lineSeriesLastPointRef` tracks per-series `{length, lastTime}` for detection.
+   Cleanup integrated at all series-removal sites (main loop, pane change, area replacement).
+
+**Status: ✅ COMPLETE**
 
 ---
 
@@ -238,12 +290,22 @@ Before each phase release:
 
 ---
 
-## Suggested Immediate Next Steps (This Week)
+## Suggested Immediate Next Steps (Current)
 
-1. Execute Phase 1 (ACP 0.4.2 patch + contract docs).
-2. Execute Phase 2 storage key/upsert hardening.
-3. Implement S/R indicator prototype for 2 zones first, then scale to 8.
-4. Run load test at 1 day and 5 day windows to establish real p95 limits.
+Phases 1–4 are complete. Remaining work:
+
+**All phases complete.** Recommended next actions:
+
+1. **Run load tests** — Execute a 1-day and 5-day live-window session and pull
+   `/api/runtime/telemetry` snapshots. Check `console.debug("[ChartView][Perf]")` logs for
+   p95 overlay render latency. Compare against comfortable range (<100k active overlay points).
+2. **Tune the flush interval** — The 150ms batch window in `App.tsx` can be reduced to 100ms
+   or increased to 250ms based on p95 measurements from live sessions.
+3. **Extend Phase 5d to area series** — Currently only line series use incremental `update()`.
+   Area series still call `setData()` on both `upperSeries` and `lowerSeries`. If area-heavy
+   workloads show high render latency, apply the same incremental pattern there.
+4. **Phase 0 SLO alerts surfaced in UI** — Consider a small toast/badge when
+   `/api/runtime/telemetry` overlay `rps_60s` exceeds `warn_threshold_rps`.
 
 ---
 

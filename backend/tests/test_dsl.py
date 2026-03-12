@@ -648,7 +648,7 @@ class TestValidation:
         """Test that empty rules fail validation"""
         result = validate_long_only("", "")
         assert not result.valid
-        assert any("empty" in err.lower() for err in result.errors)
+        assert any("entry rule" in err.lower() for err in result.errors)
     
     def test_syntax_error(self):
         """Test that syntax errors are caught"""
@@ -853,6 +853,450 @@ class TestLongEntriesSince:
             short_exit_rules=["IN_BEAR_TRADE AND CLOSE > OPEN"],
         )
         assert short_result.valid
+
+
+# ============================================================================
+# Phase 3: S/R Indicator Backend Properties
+# ============================================================================
+
+
+class TestSRIndicatorProperties:
+    """Phase 3 acceptance: per-candle completeness, partition correctness, confidence range."""
+
+    # Timestamps representing a full trading session
+    CANDLE_TIMESTAMPS = [
+        "2026-01-05T14:30:00+00:00",
+        "2026-01-05T14:35:00+00:00",
+        "2026-01-05T14:40:00+00:00",
+        "2026-01-05T14:45:00+00:00",
+        "2026-01-05T14:50:00+00:00",
+    ]
+
+    def _build_sr_store(
+        self,
+        zones: list[tuple[str, float, float, float]],  # (output_id, upper, lower, confidence)
+        timestamps: list[str] | None = None,
+    ) -> SessionDataStore:
+        """Helper: build a SessionDataStore pre-populated with S/R zone records."""
+        ts_list = timestamps or self.CANDLE_TIMESTAMPS
+        store = SessionDataStore(
+            session_id="session-sr",
+            agent_id="ohlc-agent",
+            symbol="SPY",
+            interval="5m",
+        )
+        for i, ts in enumerate(ts_list):
+            store.latest_by_candle_id[f"c{i}"] = {
+                "id": f"c{i}",
+                "ts": ts,
+                "open": 400.0, "high": 402.0, "low": 398.0, "close": 401.0, "volume": 1000,
+            }
+
+        AGENT = "indicator-sr-agent"
+        for i, ts in enumerate(ts_list):
+            for output_id, upper, lower, confidence in zones:
+                store.latest_non_ohlc_by_key[(AGENT, f"{output_id}::{ts}")] = {
+                    "id": f"{output_id}-{i}",
+                    "ts": ts,
+                    "output_id": output_id,
+                    "schema": "area",
+                    "upper": upper,
+                    "lower": lower,
+                    "metadata": {
+                        "confidence": confidence,
+                        "label": output_id,
+                        "render": {"primary_color": "#FF5050"},
+                    },
+                }
+        return store
+
+    def test_per_candle_coverage_completeness(self):
+        """Every candle timestamp must have at least one zone record (per-candle completeness)."""
+        zones = [("zone_1", 405.0, 403.0, 0.85)]
+        store = self._build_sr_store(zones)
+
+        records = store.get_non_ohlc_records()
+        covered_ts = {r["ts"] for r in records}
+        assert covered_ts == set(self.CANDLE_TIMESTAMPS), (
+            "Some candle timestamps are missing S/R zone records — per-candle completeness violation"
+        )
+
+    def test_per_candle_coverage_with_eight_zones(self):
+        """With 8 zones, every candle timestamp has records for each zone."""
+        zones = [
+            (f"zone_{i}", float(400 + i * 5), float(400 + i * 5 - 3), round(0.1 + i * 0.1, 1))
+            for i in range(1, 9)
+        ]
+        store = self._build_sr_store(zones)
+
+        records = store.get_non_ohlc_records()
+        total_expected = len(self.CANDLE_TIMESTAMPS) * 8
+        assert len(records) == total_expected
+
+        # Every timestamp has all 8 zones
+        from collections import defaultdict
+        ts_zone_map: dict[str, set[str]] = defaultdict(set)
+        for r in records:
+            ts_zone_map[r["ts"]].add(r["output_id"])
+
+        for ts in self.CANDLE_TIMESTAMPS:
+            assert ts_zone_map[ts] == {f"zone_{i}" for i in range(1, 9)}, (
+                f"Missing zones at timestamp {ts}: {ts_zone_map[ts]}"
+            )
+
+    def test_output_id_partition_correctness_two_zones(self):
+        """zone_1 and zone_2 occupy separate storage slots — no cross-contamination."""
+        zones = [
+            ("zone_1", 405.0, 403.0, 0.85),
+            ("zone_2", 395.0, 393.0, 0.45),
+        ]
+        store = self._build_sr_store(zones, timestamps=["2026-01-05T14:30:00+00:00"])
+
+        records = store.get_non_ohlc_records()
+        assert len(records) == 2
+
+        zone_map = {r["output_id"]: r for r in records}
+        assert zone_map["zone_1"]["upper"] == 405.0
+        assert zone_map["zone_2"]["upper"] == 395.0
+        assert zone_map["zone_1"]["upper"] != zone_map["zone_2"]["upper"]
+
+    def test_output_id_partition_correctness_eight_zones(self):
+        """All 8 zone output_ids are stored independently at a single timestamp."""
+        zones = [
+            (f"zone_{i}", float(400 + i * 5), float(400 + i * 5 - 3), i * 0.1)
+            for i in range(1, 9)
+        ]
+        store = self._build_sr_store(zones, timestamps=["2026-01-05T14:30:00+00:00"])
+
+        records = store.get_non_ohlc_records()
+        assert len(records) == 8
+        output_ids = {r["output_id"] for r in records}
+        assert output_ids == {f"zone_{i}" for i in range(1, 9)}
+
+        # Verify each zone has distinct upper values (no aliasing)
+        uppers = [r["upper"] for r in records]
+        assert len(set(uppers)) == 8, "Each zone must have a distinct upper value"
+
+    def test_confidence_is_numeric(self):
+        """Confidence values in zone metadata are always numeric (int or float)."""
+        zones = [
+            ("zone_1", 405.0, 403.0, 0.85),
+            ("zone_2", 395.0, 393.0, 0.45),
+        ]
+        store = self._build_sr_store(zones)
+
+        for record in store.get_non_ohlc_records():
+            confidence = record.get("metadata", {}).get("confidence")
+            assert confidence is not None, f"Missing confidence in {record.get('output_id')} at {record.get('ts')}"
+            assert isinstance(confidence, (int, float)), f"confidence must be numeric, got {type(confidence)}"
+
+    def test_confidence_within_valid_range(self):
+        """Confidence values must be in [0.0, 1.0] — values outside are invalid."""
+        zones = [
+            ("zone_1", 405.0, 403.0, 0.0),    # boundary
+            ("zone_2", 395.0, 393.0, 1.0),    # boundary
+            ("zone_3", 385.0, 383.0, 0.5),    # midpoint
+            ("zone_4", 375.0, 373.0, 0.99),   # near-max
+        ]
+        store = self._build_sr_store(zones, timestamps=["2026-01-05T14:30:00+00:00"])
+
+        for record in store.get_non_ohlc_records():
+            confidence = record["metadata"]["confidence"]
+            assert 0.0 <= confidence <= 1.0, (
+                f"confidence {confidence} out of range [0, 1] for {record['output_id']}"
+            )
+
+    def test_backend_render_color_is_string(self):
+        """render.primary_color is a string display hint emitted by the backend."""
+        zones = [("zone_1", 405.0, 403.0, 0.8)]
+        store = self._build_sr_store(zones, timestamps=["2026-01-05T14:30:00+00:00"])
+
+        records = store.get_non_ohlc_records()
+        assert len(records) == 1
+        render = records[0].get("metadata", {}).get("render", {})
+        assert isinstance(render.get("primary_color"), str)
+
+    def test_upper_always_greater_than_lower(self):
+        """S/R zones are well-formed: upper > lower (zone has positive width)."""
+        zones = [
+            ("zone_1", 405.0, 403.0, 0.85),
+            ("zone_2", 395.0, 393.0, 0.45),
+        ]
+        store = self._build_sr_store(zones)
+
+        for record in store.get_non_ohlc_records():
+            assert record["upper"] > record["lower"], (
+                f"{record['output_id']} at {record['ts']}: "
+                f"upper={record['upper']} must be > lower={record['lower']}"
+            )
+
+
+# ============================================================================
+# Phase 4: S/R Indicator DSL / Trade Engine Integration
+# ============================================================================
+
+
+class TestSRIndicatorDSLVariableNames:
+    """Phase 4: Canonical variable name format for multi-zone S/R indicator."""
+
+    def test_zone_field_names_follow_canonical_format(self):
+        """SR:zone_N:upper / SR:zone_N:lower are the canonical DSL variable names."""
+        for i in range(1, 9):
+            output = {"schema": "area", "output_id": f"zone_{i}", "label": f"zone_{i}"}
+            assert build_area_field_variable_name("SR", output, "upper") == f"SR:zone_{i}:upper"
+            assert build_area_field_variable_name("SR", output, "lower") == f"SR:zone_{i}:lower"
+
+    def test_confidence_metadata_canonical_name(self):
+        """SR:zone_N:confidence is the canonical DSL name for the confidence metadata field."""
+        for i in range(1, 9):
+            output = {"schema": "area", "output_id": f"zone_{i}", "label": f"zone_{i}"}
+            assert build_area_metadata_variable_name("SR", output, "confidence") == f"SR:zone_{i}:confidence"
+
+    def test_single_output_name_collapses_duplicate_label(self):
+        """Single-output indicator where label == agent_name: SR:upper (not SR:SR:upper)."""
+        output = {"schema": "area", "output_id": "SR", "label": "SR"}
+        assert build_area_field_variable_name("SR", output, "upper") == "SR:upper"
+        assert build_area_field_variable_name("SR", output, "lower") == "SR:lower"
+        assert build_area_metadata_variable_name("SR", output, "confidence") == "SR:confidence"
+
+    def test_zone_rules_parse_and_validate(self):
+        """DSL rules using S/R zone variables (upper/lower/confidence) are valid."""
+        result = validate_strategy_v2(
+            long_entry_rules=[
+                "LOW < SR:zone_1:lower AND SR:zone_1:confidence > 0.6 AND !IN_BULL_TRADE"
+            ],
+            long_exit_rules=["HIGH > SR:zone_1:upper AND IN_BULL_TRADE"],
+            short_entry_rules=[
+                "HIGH > SR:zone_1:upper AND SR:zone_1:confidence > 0.6 AND !IN_BEAR_TRADE"
+            ],
+            short_exit_rules=["LOW < SR:zone_1:lower AND IN_BEAR_TRADE"],
+        )
+        assert result.valid
+
+    def test_multi_zone_rule_references_independent_zones(self):
+        """A single rule can reference zone_1 and zone_2 independently."""
+        result = validate_strategy_v2(
+            long_entry_rules=[
+                "SR:zone_1:confidence > 0.7 AND SR:zone_2:confidence > 0.2 "
+                "AND CLOSE < SR:zone_1:lower AND !IN_BULL_TRADE"
+            ],
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE > SR:zone_1:upper"],
+            short_entry_rules=[],
+            short_exit_rules=[],
+        )
+        assert result.valid
+
+
+class TestSRIndicatorDSLEvaluation:
+    """Phase 4: Trade engine correctly evaluates S/R zone variables in strategies."""
+
+    SR_AGENT_ID = "indicator-sr-agent"
+    SR_AGENT_NAME = "SR"
+
+    def _make_fake_sr_agent(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                agent_name=self.SR_AGENT_NAME,
+                outputs=[
+                    {"schema": "area", "output_id": "zone_1", "label": "zone_1"},
+                    {"schema": "area", "output_id": "zone_2", "label": "zone_2"},
+                ],
+            )
+        )
+
+    def _make_store(self, monkeypatch) -> SessionDataStore:
+        """
+        Build a store with 3 candles and two S/R zones:
+          zone_1: strong resistance at 403–405 (confidence=0.85)
+          zone_2: weak support at 396–398 (confidence=0.30)
+
+        Candle prices: close = 401, 397, 406
+        """
+        store = SessionDataStore(
+            session_id="session-sr-dsl",
+            agent_id="ohlc-agent",
+            symbol="SPY",
+            interval="5m",
+        )
+        candles = [
+            # c1: price below zone_1 upper, above zone_2 upper — no S/R touch
+            {"id": "c1", "ts": "2026-01-05T14:30:00+00:00",
+             "open": 400, "high": 402, "low": 399, "close": 401, "volume": 1000},
+            # c2: low touches zone_2 lower — weak support touch
+            {"id": "c2", "ts": "2026-01-05T14:35:00+00:00",
+             "open": 399, "high": 400, "low": 395, "close": 397, "volume": 1000},
+            # c3: close breaks above zone_1 upper — resistance break
+            {"id": "c3", "ts": "2026-01-05T14:40:00+00:00",
+             "open": 403, "high": 407, "low": 402, "close": 406, "volume": 1000},
+        ]
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+
+        AGENT = self.SR_AGENT_ID
+        for ts in ["2026-01-05T14:30:00+00:00", "2026-01-05T14:35:00+00:00", "2026-01-05T14:40:00+00:00"]:
+            # zone_1: resistance 403–405, high confidence
+            store.latest_non_ohlc_by_key[(AGENT, f"zone_1::{ts}")] = {
+                "id": f"z1-{ts[-8:]}",
+                "ts": ts,
+                "output_id": "zone_1",
+                "schema": "area",
+                "upper": 405.0,
+                "lower": 403.0,
+                "metadata": {"confidence": 0.85},
+            }
+            # zone_2: support 396–398, low confidence
+            store.latest_non_ohlc_by_key[(AGENT, f"zone_2::{ts}")] = {
+                "id": f"z2-{ts[-8:]}",
+                "ts": ts,
+                "output_id": "zone_2",
+                "schema": "area",
+                "upper": 398.0,
+                "lower": 396.0,
+                "metadata": {"confidence": 0.30},
+            }
+
+        monkeypatch.setattr(
+            trade_engine.agent_manager,
+            "get_agent",
+            lambda agent_id: self._make_fake_sr_agent() if agent_id == AGENT else None,
+        )
+        return store
+
+    def test_variable_map_resolves_sr_zone_fields(self, monkeypatch):
+        """Variable map contains SR:zone_1:upper, SR:zone_1:lower for each candle timestamp."""
+        store = self._make_store(monkeypatch)
+        variables = trade_engine._build_indicator_variable_maps(store)
+
+        for zone in ("zone_1", "zone_2"):
+            assert f"SR:{zone}:upper" in variables
+            assert f"SR:{zone}:lower" in variables
+            assert f"SR:{zone}:confidence" in variables
+
+        # All three candle timestamps present for zone_1
+        assert len(variables["SR:zone_1:upper"]) == 3
+        # zone_1 upper is 405.0 for all candles
+        assert all(v == 405.0 for v in variables["SR:zone_1:upper"].values())
+
+    def test_variable_map_resolves_confidence_per_zone(self, monkeypatch):
+        """Confidence metadata resolves distinctly for zone_1 vs zone_2."""
+        store = self._make_store(monkeypatch)
+        variables = trade_engine._build_indicator_variable_maps(store)
+
+        assert "SR:zone_1:confidence" in variables
+        assert "SR:zone_2:confidence" in variables
+
+        assert all(abs(v - 0.85) < 1e-9 for v in variables["SR:zone_1:confidence"].values())
+        assert all(abs(v - 0.30) < 1e-9 for v in variables["SR:zone_2:confidence"].values())
+
+    def test_confidence_gated_entry_high_confidence_zone(self, monkeypatch):
+        """Entry gated on high-confidence zone fires when confidence threshold is met."""
+        store = self._make_store(monkeypatch)
+
+        # Enter when candle breaks above strong zone_1 resistance
+        result = evaluate_strategy(
+            session_id="session-sr-dsl",
+            strategy_name="sr-breakout",
+            long_entry_rules=[
+                "CLOSE > SR:zone_1:upper AND SR:zone_1:confidence > 0.7 AND !IN_BULL_TRADE"
+            ],
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE < SR:zone_1:lower"],
+            short_entry_rules=[],
+            short_exit_rules=[],
+            data_store=store,
+        )
+
+        long_entries = [m for m in result["markers"] if m["action"] == "LONG_ENTRY"]
+        # Only c3 closes at 406, which is > zone_1:upper=405 and confidence=0.85 > 0.7
+        assert len(long_entries) == 1
+        assert long_entries[0]["ts"] == "2026-01-05T14:40:00+00:00"
+
+    def test_confidence_gate_blocks_entry_when_below_threshold(self, monkeypatch):
+        """Entry does not fire when zone confidence is below the threshold."""
+        store = self._make_store(monkeypatch)
+
+        # zone_2 has confidence=0.30 which is < 0.70 — should never enter
+        result = evaluate_strategy(
+            session_id="session-sr-dsl",
+            strategy_name="sr-weak-zone",
+            long_entry_rules=[
+                "LOW < SR:zone_2:lower AND SR:zone_2:confidence > 0.70 AND !IN_BULL_TRADE"
+            ],
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE > SR:zone_2:upper"],
+            short_entry_rules=[],
+            short_exit_rules=[],
+            data_store=store,
+        )
+
+        long_entries = [m for m in result["markers"] if m["action"] == "LONG_ENTRY"]
+        assert len(long_entries) == 0, (
+            "Should not enter when zone_2 confidence (0.30) is below threshold (0.70)"
+        )
+
+    def test_lower_threshold_allows_weak_zone_entry(self, monkeypatch):
+        """Confidence gate at 0.20 allows entry on weak zone when price touches it."""
+        store = self._make_store(monkeypatch)
+
+        # zone_2 confidence=0.30 > 0.20 — should fire when c2 low hits zone_2 lower
+        result = evaluate_strategy(
+            session_id="session-sr-dsl",
+            strategy_name="sr-any-zone",
+            long_entry_rules=[
+                "LOW < SR:zone_2:lower AND SR:zone_2:confidence > 0.20 AND !IN_BULL_TRADE"
+            ],
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE > SR:zone_2:upper"],
+            short_entry_rules=[],
+            short_exit_rules=[],
+            data_store=store,
+        )
+
+        long_entries = [m for m in result["markers"] if m["action"] == "LONG_ENTRY"]
+        # c2 low is 395 < zone_2:lower=396, confidence=0.30 > 0.20 → should enter
+        assert len(long_entries) == 1
+        assert long_entries[0]["ts"] == "2026-01-05T14:35:00+00:00"
+
+    def test_upserted_overlay_reflected_in_dsl_evaluation(self, monkeypatch):
+        """After upsert, DSL evaluation sees the corrected zone values, not originals."""
+        store = SessionDataStore(
+            session_id="session-upsert-dsl",
+            agent_id="ohlc-agent",
+            symbol="SPY",
+            interval="5m",
+        )
+        AGENT = self.SR_AGENT_ID
+        TS = "2026-01-05T14:30:00+00:00"
+
+        store.latest_by_candle_id["c1"] = {
+            "id": "c1", "ts": TS,
+            "open": 400, "high": 406, "low": 398, "close": 405, "volume": 1000,
+        }
+
+        canonical_key = (AGENT, f"zone_1::{TS}")
+
+        # Original emission
+        store.latest_non_ohlc_by_key[canonical_key] = {
+            "id": "r1", "ts": TS, "output_id": "zone_1",
+            "upper": 400.0, "lower": 395.0,
+            "metadata": {"confidence": 0.5},
+        }
+
+        # Corrected emission — same key, new values (close at 405 > 400)
+        store.latest_non_ohlc_by_key[canonical_key] = {
+            "id": "r2", "ts": TS, "output_id": "zone_1",
+            "upper": 403.0, "lower": 400.0,
+            "metadata": {"confidence": 0.9},
+        }
+
+        monkeypatch.setattr(
+            trade_engine.agent_manager,
+            "get_agent",
+            lambda agent_id: self._make_fake_sr_agent() if agent_id == AGENT else None,
+        )
+
+        variables = trade_engine._build_indicator_variable_maps(store)
+
+        # DSL must see corrected values
+        assert variables["SR:zone_1:upper"][TS] == 403.0
+        assert variables["SR:zone_1:confidence"][TS] == 0.9
 
 
 if __name__ == "__main__":

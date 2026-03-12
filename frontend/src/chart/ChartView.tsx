@@ -789,6 +789,9 @@ export function ChartView({
   candleType = "candlestick"
 }: ChartViewProps) {
   const SUBGRAPH_PANE_STRETCH_FACTOR = 0.5;
+  // Rollback note: set either flag to false to disable the new area performance paths.
+  const ENABLE_AREA_INCREMENTAL_POINTS = true;
+  const ENABLE_AREA_APPEND_UPDATE = true;
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<any> | null>(null);
@@ -811,6 +814,7 @@ export function ChartView({
     }
 
     const excludedKeys = new Set(["id", "ts", "seq", "rev", "output_id", "metadata"]);
+    const tsFastPrefix = selectedCandleDetails.ts.slice(0, 16);
     const rows: Array<{ seriesName: string; field: string; value: number }> = [];
 
     for (const [seriesKey, records] of overlayData.entries()) {
@@ -822,7 +826,12 @@ export function ChartView({
         : seriesKey;
 
       const matchingRecord = records.find((record) => {
-        const recordUnix = toUnixSeconds(String(record.ts || ""));
+        // Fast-path: compare ISO prefix ("YYYY-MM-DDTHH:MM", 16 chars) before calling
+        // Date.parse on each record. At 1m granularity this uniquely identifies a candle,
+        // eliminating ~99.9% of Date.parse calls per series on candle-click interactions.
+        const rts = String(record.ts || "");
+        if (tsFastPrefix && !rts.startsWith(tsFastPrefix)) return false;
+        const recordUnix = toUnixSeconds(rts);
         return recordUnix !== null && recordUnix === selectedUnix;
       });
 
@@ -880,8 +889,36 @@ export function ChartView({
   // Tracks the pane each line series was actually created on so we can detect changes
   const lineSeriesActualPaneRef = useRef<Map<string, number>>(new Map());
   const areaSeriesActualPaneRef = useRef<Map<string, number>>(new Map());
+    // Phase 5d: Tracks the last-rendered snapshot per line series to enable incremental update()
+    // calls instead of full setData() when a new candle is simply appended to the end.
+    const lineSeriesLastPointRef = useRef<Map<string, { length: number; lastTime: number }>>(new Map());
+  const areaSeriesLastPointRef = useRef<Map<string, { length: number; lastTime: number }>>(new Map());
   const overlayRenderLatencyMsRef = useRef<number[]>([]);
   const overlayRenderLastLogAtRef = useRef<number>(0);
+
+  // Per-series render cache: skips the expensive setData/sort/map pipeline for series
+  // whose records reference and candle window bounds haven't changed since last render.
+  // This is the primary defence against the 5s subscription poll triggering full redraws.
+  const overlayDataRenderCacheRef = useRef<Map<string, {
+    records: OverlayRecord[];
+    minCandle: number | null;
+    maxCandle: number | null;
+  }>>(new Map());
+  const areaPointsCacheRef = useRef<Map<string, {
+    points: AreaPoint[];
+    sourceLength: number;
+    lastRecordId: string;
+    minCandle: number | null;
+    maxCandle: number | null;
+  }>>(new Map());
+
+  // Stable refs so the heavy overlay useEffect can read colors/styles without listing
+  // them as deps. Updated on every render (always current). Avoids costly re-runs on
+  // every 5s subscription poll when only Map references change but content is the same.
+  const overlayLineColorsRef = useRef(overlayLineColors);
+  overlayLineColorsRef.current = overlayLineColors;
+  const overlayAreaStylesRef = useRef(overlayAreaStyles);
+  overlayAreaStylesRef.current = overlayAreaStyles;
 
   const updateVisibleLogicalRange = useCallback((range: { from: number; to: number } | null) => {
     setVisibleLogicalRange(normalizeLogicalRange(range));
@@ -1401,6 +1438,10 @@ export function ChartView({
       lineSeriesActualPaneRef.current.clear();
       areaSeriesActualPaneRef.current.clear();
       areaSeriesMarkersRef.current.clear();
+      areaSeriesLastPointRef.current.clear();
+      areaPointsCacheRef.current.clear();
+        lineSeriesLastPointRef.current.clear();
+      overlayDataRenderCacheRef.current.clear();
       seriesMarkersRef.current = null;
       seriesMarkersSeriesRef.current = null;
     };
@@ -1468,6 +1509,7 @@ export function ChartView({
           existingLineSeries.delete(seriesKey);
           subgraphPaneAssignmentsRef.current.delete(seriesKey);
           lineSeriesActualPaneRef.current.delete(seriesKey);
+            lineSeriesLastPointRef.current.delete(seriesKey);
         }
       }
 
@@ -1483,6 +1525,8 @@ export function ChartView({
           existingAreaSeries.delete(seriesKey);
           subgraphPaneAssignmentsRef.current.delete(seriesKey);
           areaSeriesActualPaneRef.current.delete(seriesKey);
+          areaSeriesLastPointRef.current.delete(seriesKey);
+          areaPointsCacheRef.current.delete(seriesKey);
         }
       }
 
@@ -1510,11 +1554,27 @@ export function ChartView({
       };
 
       for (const [seriesKey, records] of overlayData.entries()) {
+        // Per-series render skip: if the records array reference and candle window bounds
+        // are identical to the last render, no data has changed — skip all expensive
+        // processing (map/filter/sort/setData). This is the primary fix for the 5s
+        // subscription-poll-driven INP spikes with large SR zone datasets.
+        const _cachedRender = overlayDataRenderCacheRef.current.get(seriesKey);
+        if (
+          _cachedRender &&
+          _cachedRender.records === records &&
+          _cachedRender.minCandle === minCandleTime &&
+          _cachedRender.maxCandle === maxCandleTime
+        ) {
+          continue;
+        }
         try {
           const schema = overlaySchemas?.get(seriesKey) || "line";
           const agentId = overlayAgentId(seriesKey);
-          const seriesColor = overlayLineColors?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
-          const areaStyleOverride = overlayAreaStyles?.get(agentId);
+          // Read colors/styles via stable refs (not direct props) so this effect is not
+          // listed as a dep on overlayLineColors/overlayAreaStyles. A separate lightweight
+          // effect below handles color-only applyOptions without triggering setData.
+          const seriesColor = overlayLineColorsRef.current?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
+          const areaStyleOverride = overlayAreaStylesRef.current?.get(agentId);
           const upColor = cssVar("--chart-up", "#22c55e");
           const downColor = cssVar("--chart-down", "#ef4444");
           const expectedIntervalSeconds = intervalToSeconds(selectedInterval) || intervalToSeconds(records[0]?.metadata && typeof records[0].metadata === "object"
@@ -1547,6 +1607,8 @@ export function ChartView({
                 chart.removeSeries(possibleAreaSeries.upperSeries);
                 chart.removeSeries(possibleAreaSeries.lowerSeries);
                 existingAreaSeries.delete(seriesKey);
+                areaSeriesLastPointRef.current.delete(seriesKey);
+                areaPointsCacheRef.current.delete(seriesKey);
               }
             } else {
               histSeries.applyOptions({ color: seriesColor });
@@ -1569,6 +1631,7 @@ export function ChartView({
             const dedupHistData = Array.from(uniqueHistData.values()).sort((a, b) => a.time - b.time);
 
             histSeries.setData(dedupHistData.length > 0 ? dedupHistData : []);
+            overlayDataRenderCacheRef.current.set(seriesKey, { records, minCandle: minCandleTime, maxCandle: maxCandleTime });
             continue;
           }
 
@@ -1594,6 +1657,8 @@ export function ChartView({
               chart.removeSeries(areaSeries.lowerSeries);
               existingAreaSeries.delete(seriesKey);
               areaSeriesActualPaneRef.current.delete(seriesKey);
+              areaSeriesLastPointRef.current.delete(seriesKey);
+              areaPointsCacheRef.current.delete(seriesKey);
               if (!wantsSubgraph) subgraphPaneAssignmentsRef.current.delete(seriesKey);
               areaSeries = undefined;
             }
@@ -1637,45 +1702,109 @@ export function ChartView({
                 chart.removeSeries(possibleLineSeries);
                 existingLineSeries.delete(seriesKey);
                 lineSeriesActualPaneRef.current.delete(seriesKey);
+                  lineSeriesLastPointRef.current.delete(seriesKey);
               }
             }
 
-            const areaPoints = records
-              .map((record) => {
-                const time = toUnixSeconds(record.ts);
-                const upper = Number((record as AreaRecord).upper);
-                const lower = Number((record as AreaRecord).lower);
+            let deduplicatedAreaData: AreaPoint[] = [];
+            const cachedArea = areaPointsCacheRef.current.get(seriesKey);
+            const canAppendFromCache =
+              ENABLE_AREA_INCREMENTAL_POINTS &&
+              !!cachedArea &&
+              cachedArea.sourceLength + 1 === records.length &&
+              cachedArea.minCandle === minCandleTime &&
+              cachedArea.maxCandle === maxCandleTime;
 
+            if (canAppendFromCache && cachedArea) {
+              const newest = records[records.length - 1];
+              const newestId = String(newest?.id || "");
+              if (newestId && newestId !== cachedArea.lastRecordId) {
+                const newestTime = toUnixSeconds(String(newest.ts || ""));
+                const newestUpper = Number((newest as AreaRecord).upper);
+                const newestLower = Number((newest as AreaRecord).lower);
+
+                deduplicatedAreaData = [...cachedArea.points];
                 if (
-                  time === null ||
-                  !Number.isFinite(upper) ||
-                  !Number.isFinite(lower) ||
-                  !isInCandleWindow(time)
+                  newestTime !== null &&
+                  Number.isFinite(newestUpper) &&
+                  Number.isFinite(newestLower) &&
+                  isInCandleWindow(newestTime)
                 ) {
-                  return null;
+                  const newestStyle = readAreaRenderStyle(
+                    newest,
+                    seriesColor,
+                    areaStyleOverride,
+                    upColor,
+                    downColor,
+                  );
+                  const lastPoint = deduplicatedAreaData[deduplicatedAreaData.length - 1];
+                  if (lastPoint && lastPoint.time === newestTime) {
+                    deduplicatedAreaData[deduplicatedAreaData.length - 1] = {
+                      time: newestTime,
+                      upper: newestUpper,
+                      lower: newestLower,
+                      style: newestStyle,
+                    };
+                  } else if (!lastPoint || newestTime > lastPoint.time) {
+                    deduplicatedAreaData.push({
+                      time: newestTime,
+                      upper: newestUpper,
+                      lower: newestLower,
+                      style: newestStyle,
+                    });
+                  } else {
+                    deduplicatedAreaData = [];
+                  }
                 }
-
-                const style = readAreaRenderStyle(
-                  record,
-                  seriesColor,
-                  areaStyleOverride,
-                  upColor,
-                  downColor,
-                );
-
-                return { time, upper, lower, style };
-              })
-              .filter((point): point is AreaPoint => point !== null)
-              .sort((a, b) => a.time - b.time);
-
-            const uniqueAreaDataByTime = new Map<number, AreaPoint>();
-            for (const point of areaPoints) {
-              uniqueAreaDataByTime.set(point.time, point);
+              }
             }
 
-            const deduplicatedAreaData = Array.from(uniqueAreaDataByTime.values()).sort(
-              (a, b) => a.time - b.time
-            );
+            if (deduplicatedAreaData.length === 0) {
+              const areaPoints = records
+                .map((record) => {
+                  const time = toUnixSeconds(record.ts);
+                  const upper = Number((record as AreaRecord).upper);
+                  const lower = Number((record as AreaRecord).lower);
+
+                  if (
+                    time === null ||
+                    !Number.isFinite(upper) ||
+                    !Number.isFinite(lower) ||
+                    !isInCandleWindow(time)
+                  ) {
+                    return null;
+                  }
+
+                  const style = readAreaRenderStyle(
+                    record,
+                    seriesColor,
+                    areaStyleOverride,
+                    upColor,
+                    downColor,
+                  );
+
+                  return { time, upper, lower, style };
+                })
+                .filter((point): point is AreaPoint => point !== null)
+                .sort((a, b) => a.time - b.time);
+
+              const uniqueAreaDataByTime = new Map<number, AreaPoint>();
+              for (const point of areaPoints) {
+                uniqueAreaDataByTime.set(point.time, point);
+              }
+
+              deduplicatedAreaData = Array.from(uniqueAreaDataByTime.values()).sort(
+                (a, b) => a.time - b.time
+              );
+            }
+
+            areaPointsCacheRef.current.set(seriesKey, {
+              points: deduplicatedAreaData,
+              sourceLength: records.length,
+              lastRecordId: String(records[records.length - 1]?.id || ""),
+              minCandle: minCandleTime,
+              maxCandle: maxCandleTime,
+            });
 
             if (deduplicatedAreaData.length > 0) {
               const fallbackStyle = readAreaRenderStyle(
@@ -1699,13 +1828,30 @@ export function ChartView({
                 crosshairMarkerVisible: false,
               });
 
-              areaSeries.upperSeries.setData(
-                deduplicatedAreaData.map((point) => ({ time: point.time, value: point.upper }))
-              );
-              areaSeries.lowerSeries.setData(
-                deduplicatedAreaData.map((point) => ({ time: point.time, value: point.lower }))
-              );
+              const latestAreaPoint = deduplicatedAreaData[deduplicatedAreaData.length - 1];
+              const prevAreaSeen = areaSeriesLastPointRef.current.get(seriesKey);
+              const canAreaIncrement =
+                ENABLE_AREA_APPEND_UPDATE &&
+                prevAreaSeen !== undefined &&
+                deduplicatedAreaData.length === prevAreaSeen.length + 1 &&
+                latestAreaPoint.time > prevAreaSeen.lastTime;
+
+              if (canAreaIncrement) {
+                areaSeries.upperSeries.update({ time: latestAreaPoint.time, value: latestAreaPoint.upper });
+                areaSeries.lowerSeries.update({ time: latestAreaPoint.time, value: latestAreaPoint.lower });
+              } else {
+                areaSeries.upperSeries.setData(
+                  deduplicatedAreaData.map((point) => ({ time: point.time, value: point.upper }))
+                );
+                areaSeries.lowerSeries.setData(
+                  deduplicatedAreaData.map((point) => ({ time: point.time, value: point.lower }))
+                );
+              }
               areaSeries.primitive.update(deduplicatedAreaData, fallbackStyle, maxAreaGapSeconds);
+              areaSeriesLastPointRef.current.set(seriesKey, {
+                length: deduplicatedAreaData.length,
+                lastTime: latestAreaPoint.time,
+              });
 
               const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
               const setAreaMarkers = (markers: SeriesMarker<Time>[]) => {
@@ -1767,12 +1913,14 @@ export function ChartView({
                 ),
                 maxAreaGapSeconds,
               );
+              areaSeriesLastPointRef.current.delete(seriesKey);
               const areaMarkersApi = areaSeriesMarkersRef.current.get(seriesKey);
               if (areaMarkersApi) {
                 areaMarkersApi.setMarkers([] as SeriesMarker<Time>[]);
               }
             }
 
+            overlayDataRenderCacheRef.current.set(seriesKey, { records, minCandle: minCandleTime, maxCandle: maxCandleTime });
             continue;
           }
 
@@ -1797,6 +1945,7 @@ export function ChartView({
             existingLineSeries.delete(seriesKey);
             lineSeriesActualPaneRef.current.delete(seriesKey);
             if (!wantsSubgraph) subgraphPaneAssignmentsRef.current.delete(seriesKey);
+              lineSeriesLastPointRef.current.delete(seriesKey);
             overlaySeries = undefined;
           }
 
@@ -1830,6 +1979,8 @@ export function ChartView({
               chart.removeSeries(possibleAreaSeries.lowerSeries);
               existingAreaSeries.delete(seriesKey);
               areaSeriesActualPaneRef.current.delete(seriesKey);
+              areaSeriesLastPointRef.current.delete(seriesKey);
+              areaPointsCacheRef.current.delete(seriesKey);
             }
           } else {
             let resolvedLineColor = explicitLineColor || seriesColor;
@@ -1869,10 +2020,28 @@ export function ChartView({
           );
 
           if (deduplicatedLineData.length > 0) {
-            overlaySeries.setData(deduplicatedLineData);
+            const lastPoint = deduplicatedLineData[deduplicatedLineData.length - 1];
+            const prevSeen = lineSeriesLastPointRef.current.get(seriesKey);
+            // Incremental update: if we have exactly one new point appended at the end,
+            // use series.update() which is O(1) instead of series.setData() which is O(n).
+            const canIncrement =
+              prevSeen !== undefined &&
+              deduplicatedLineData.length === prevSeen.length + 1 &&
+              lastPoint.time > prevSeen.lastTime;
+            if (canIncrement) {
+              overlaySeries.update(lastPoint);
+            } else {
+              overlaySeries.setData(deduplicatedLineData);
+            }
+            lineSeriesLastPointRef.current.set(seriesKey, {
+              length: deduplicatedLineData.length,
+              lastTime: lastPoint.time,
+            });
           } else {
             overlaySeries.setData([]);
+            lineSeriesLastPointRef.current.delete(seriesKey);
           }
+          overlayDataRenderCacheRef.current.set(seriesKey, { records, minCandle: minCandleTime, maxCandle: maxCandleTime });
         } catch (error) {
           console.error(`[ChartView] Failed to render overlay for series ${seriesKey}:`, error);
         }
@@ -1907,7 +2076,34 @@ export function ChartView({
         overlayRenderLastLogAtRef.current = now;
       }
     }
-  }, [overlayData, overlaySchemas, overlayLineColors, overlayAreaStyles, overlaySubgraphForced, candleWindowRevision, SUBGRAPH_PANE_STRETCH_FACTOR]);
+  // overlayLineColors and overlayAreaStyles intentionally omitted from deps: they are accessed
+  // via overlayLineColorsRef / overlayAreaStylesRef to avoid re-running the costly setData
+  // pipeline on every 5s subscription poll. The lightweight effect below handles color-only
+  // updates on existing series without touching data.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overlayData, overlaySchemas, overlaySubgraphForced, candleWindowRevision, SUBGRAPH_PANE_STRETCH_FACTOR]);
+
+  // Lightweight color/style sync: fires when subscription settings change (e.g. line_color
+  // edit or the 5s background poll). Calls only applyOptions (O(1) per series) — never setData.
+  // For area series, also clears the render cache so the next real data change re-processes
+  // with the updated colors (area colors are baked into primitive points).
+  useEffect(() => {
+    if (!chartRef.current) return;
+    for (const [seriesKey] of overlayData.entries()) {
+      const agentId = overlayAgentId(seriesKey);
+      const seriesColor = overlayLineColors?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
+      const existingLine = overlayLineSeriesRef.current.get(seriesKey);
+      if (existingLine) {
+        existingLine.applyOptions({ color: seriesColor });
+      }
+      // Area colors are embedded in point-level style data — invalidate cache so that the
+      // next data arrival (overlay_update / timeframe change) triggers a proper re-render.
+      if (overlayAreaSeriesRef.current.has(seriesKey)) {
+        overlayDataRenderCacheRef.current.delete(seriesKey);
+        areaPointsCacheRef.current.delete(seriesKey);
+      }
+    }
+  }, [overlayLineColors, overlayAreaStyles, overlayData]);
 
   useEffect(() => {
     if (!seriesRef.current) {

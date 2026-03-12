@@ -126,6 +126,14 @@ export default function App() {
   const [overlaySchemas, setOverlaySchemas] = useState<Map<string, OverlaySchema>>(new Map());
   const [tradeMarkers, setTradeMarkers] = useState<TradeMarker[]>([]);
   const [tradePerformance, setTradePerformance] = useState<TradePerformance | null>(null);
+
+  // Phase 5a/5c: Batch live overlay events and flush at 150ms intervals instead of per-event setState.
+  // This prevents ChartView from re-rendering + calling setData() on every incoming candle.
+  const pendingLiveOverlayRef = useRef<
+    Map<string, { records: Map<string, OverlayRecord>; schema: OverlaySchema }>
+  >(new Map());
+  // Stable ref mirror of selectedTimeframe for use inside flush callback (avoids dep churn)
+  const selectedTimeframeForFlushRef = useRef<number>(7);
   const [appliedStrategyName, setAppliedStrategyName] = useState<string | null>(null);
   const [strategyCandlesById, setStrategyCandlesById] = useState<Map<string, OHLCBar>>(new Map());
   const markersHydratedKeyRef = useRef<string | null>(null);
@@ -580,6 +588,10 @@ export default function App() {
     return agent?.config?.visible !== false;
   }, [subscriptions]);
 
+  // Return the same Map reference when line-color settings are unchanged (common during the
+  // 5s subscription background poll). This prevents ChartView's heavy overlay useEffect from
+  // re-running setData on all series when nothing visually changed.
+  const stableOverlayLineColorsRef = useRef<Map<string, string>>(new Map());
   const overlayLineColors = useMemo(() => {
     const colors = new Map<string, string>();
     (subscriptions || []).forEach((agent) => {
@@ -596,10 +608,16 @@ export default function App() {
         colors.set(agent.id, configuredColor);
       }
     });
+    const prev = stableOverlayLineColorsRef.current;
+    if (prev.size === colors.size && [...colors.entries()].every(([k, v]) => prev.get(k) === v)) {
+      return prev; // stable reference → no dep change in consumers
+    }
+    stableOverlayLineColorsRef.current = colors;
     return colors;
   }, [subscriptions]);
 
   /** agentId → true for any indicator that has force_subgraph saved in config */
+  const stableOverlaySubgraphForcedRef = useRef<Map<string, boolean>>(new Map());
   const overlaySubgraphForced = useMemo(() => {
     const forced = new Map<string, boolean>();
     forced.set(RESEARCH_AGENT_ID, true);
@@ -609,9 +627,22 @@ export default function App() {
         forced.set(agent.id, true);
       }
     });
+    const prev = stableOverlaySubgraphForcedRef.current;
+    if (prev.size === forced.size && [...forced.entries()].every(([k, v]) => prev.get(k) === v)) {
+      return prev;
+    }
+    stableOverlaySubgraphForcedRef.current = forced;
     return forced;
   }, [subscriptions]);
 
+  const stableOverlayAreaStylesRef = useRef<Map<string, {
+    useSourceStyle: boolean;
+    showLabels: boolean;
+    fillMode: "solid" | "conditional";
+    opacityPercent: number;
+    conditionalUpColor?: string;
+    conditionalDownColor?: string;
+  }>>(new Map());
   const overlayAreaStyles = useMemo(() => {
     const styles = new Map<
       string,
@@ -665,6 +696,29 @@ export default function App() {
         conditionalDownColor: conditionalDownColor || undefined,
       });
     });
+    // Return same reference when area style settings are unchanged — prevents ChartView's
+    // heavy overlay useEffect from re-running on every 5s subscription poll.
+    const prev = stableOverlayAreaStylesRef.current;
+    if (prev.size === styles.size) {
+      let same = true;
+      for (const [k, v] of styles.entries()) {
+        const p = prev.get(k);
+        if (
+          !p ||
+          p.useSourceStyle !== v.useSourceStyle ||
+          p.showLabels !== v.showLabels ||
+          p.fillMode !== v.fillMode ||
+          p.opacityPercent !== v.opacityPercent ||
+          p.conditionalUpColor !== v.conditionalUpColor ||
+          p.conditionalDownColor !== v.conditionalDownColor
+        ) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return prev;
+    }
+    stableOverlayAreaStylesRef.current = styles;
     return styles;
   }, [subscriptions]);
 
@@ -709,6 +763,64 @@ export default function App() {
       }
     }
   }, [selectedAgent, selectedAgentId, selectedSymbol, intervalInput, snapshotHandler]);
+
+  // Keep the timeframe ref current on every render pass so the flush callback reads
+  // the latest value without needing it in its dependency array.
+  selectedTimeframeForFlushRef.current = selectedTimeframe;
+
+  // Phase 5a+5c: Flush accumulated live overlay events into React state at 150ms intervals.
+  // Groups all events that arrived within the window into one setOverlayData call, collapsing
+  // many per-candle events into a single chart render cycle (Phase 5a). Also trims overlay
+  // arrays that exceed the current timeframe window to bound memory growth (Phase 5c).
+  const flushLiveOverlayBatch = useCallback(() => {
+    const pending = pendingLiveOverlayRef.current;
+    if (pending.size === 0) {
+      return;
+    }
+
+    // Snapshot so we don't mutate the map while iterating
+    const snapshot = new Map(pending);
+    pending.clear();
+
+    // Phase 5c: Bound overlay arrays to (timeframeDays × 1440 minutes) records maximum.
+    // At 1m interval, 1 day ≈ 390 RTH bars. 1440 gives comfortable headroom for 24h data.
+    const maxRecordsPerSeries = Math.max(500, selectedTimeframeForFlushRef.current * 1440);
+
+    setOverlayData((prev) => {
+      const updated = new Map(prev);
+      for (const [seriesKey, { records: newRecords }] of snapshot.entries()) {
+        const existing = [...(updated.get(seriesKey) || [])];
+        for (const [recordId, record] of newRecords.entries()) {
+          const idx = existing.findIndex((r) => r.id === recordId);
+          if (idx >= 0) {
+            existing[idx] = record;
+          } else {
+            existing.push(record);
+          }
+        }
+        // Trim oldest records when the series exceeds the bounded window
+        if (existing.length > maxRecordsPerSeries) {
+          existing.splice(0, existing.length - maxRecordsPerSeries);
+        }
+        updated.set(seriesKey, existing);
+      }
+      return updated;
+    });
+
+    setOverlaySchemas((prev) => {
+      const updated = new Map(prev);
+      for (const [seriesKey, { schema }] of snapshot.entries()) {
+        updated.set(seriesKey, schema);
+      }
+      return updated;
+    });
+  }, []);
+
+  // Run the flush every 150ms (Phase 5a)
+  useEffect(() => {
+    const interval = window.setInterval(flushLiveOverlayBatch, 150);
+    return () => window.clearInterval(interval);
+  }, [flushLiveOverlayBatch]);
 
   const handleOverlayHistory = useCallback((event: OverlayHistoryEvent) => {
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
@@ -760,27 +872,15 @@ export default function App() {
     const outputId = String((event.record as Record<string, unknown>).output_id ?? "default");
     const seriesKey = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
 
-    setOverlayData((prev) => {
-      const updated = new Map(prev);
-      const existing = [...(updated.get(seriesKey) || [])];
+      // Accumulate into the live-overlay batch; the 150ms flush interval applies state updates.
       const record = event.record as OverlayRecord;
-
-      const index = existing.findIndex((r) => r.id === record.id);
-      if (index >= 0) {
-        existing[index] = record;
-      } else {
-        existing.push(record);
+      let bucket = pendingLiveOverlayRef.current.get(seriesKey);
+      if (!bucket) {
+        bucket = { records: new Map<string, OverlayRecord>(), schema: event.schema };
+        pendingLiveOverlayRef.current.set(seriesKey, bucket);
       }
-
-      updated.set(seriesKey, existing);
-      return updated;
-    });
-
-    setOverlaySchemas((prev) => {
-      const updated = new Map(prev);
-      updated.set(seriesKey, event.schema);
-      return updated;
-    });
+      bucket.records.set(record.id, record);
+      bucket.schema = event.schema;
   }, [resolveOverlayAgentId, buildOverlaySeriesKey, isAgentVisible]);
 
   const handleStateEvent = useCallback(
@@ -985,6 +1085,8 @@ export default function App() {
     setOverlayData(new Map());
     setOverlaySchemas(new Map());
     setStrategyCandlesById(new Map());
+      // Clear any pending live-overlay events that belong to the previous subscription
+      pendingLiveOverlayRef.current.clear();
     setTradeMarkers([]);
     setTradePerformance(null);
     markTradeSyncing();
@@ -1697,7 +1799,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v1.35</h1>
+          <h1 className="app-title">ODIN Market Workspace v1.38</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
