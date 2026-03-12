@@ -83,7 +83,7 @@ export interface SyncSnapshot {
 }
 
 /**
- * ACP v0.4.1 WebSocket hook for frontend market data streaming
+ * ACP v0.4.2 WebSocket hook for frontend market data streaming
  * 
  * Manages:
  * - Session-aware subscriptions (session_id per chart/view)
@@ -150,7 +150,6 @@ export function useEventStream(
     };
 
     ws.send(JSON.stringify(payload));
-    console.log("[WebSocket] Sent subscribe_request:", payload);
     return true;
   }, []);
 
@@ -168,7 +167,6 @@ export function useEventStream(
     };
 
     ws.send(JSON.stringify(payload));
-    console.log("[WebSocket] Sent resync_request for session", sessionId, "since seq", lastSeq);
   }, []);
 
   useEffect(() => {
@@ -237,20 +235,17 @@ export function useEventStream(
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
-          console.log("[WebSocket] Received message:", message.type);
           
-          // Handle different message types from backend (ACP v0.4.0)
+          // Handle different message types from backend (ACP v0.4.x)
           switch (message.type) {
             case "connection_ready":
               // Store client_id from backend for future use
-              console.log("[WebSocket] Connection ready, client_id:", message.client_id);
               setClientId(message.client_id);
               
               // Flush pending subscribe if waiting
               if (pendingSubscribeRef.current) {
                 const flushed = sendSubscribePayload(pendingSubscribeRef.current);
                 if (flushed) {
-                  console.log("[WebSocket] Flushed pending subscribe_request on connect");
                   pendingSubscribeRef.current = null;
                 }
               }
@@ -266,7 +261,6 @@ export function useEventStream(
               break;
             
             case "heartbeat":
-              console.log("[WebSocket] Heartbeat received");
               if (onStatusUpdateRef.current && message.agent_id && message.status) {
                 onStatusUpdateRef.current({
                   agent_id: message.agent_id,
@@ -277,7 +271,6 @@ export function useEventStream(
               break;
             
             case "agent_status_update":
-              console.log("[WebSocket] Agent status update:", message.agent_id, message.status);
               if (onStatusUpdateRef.current) {
                 onStatusUpdateRef.current({
                   agent_id: message.agent_id,
@@ -290,7 +283,6 @@ export function useEventStream(
             
             case "snapshot":
               // Historical data snapshot (all canonical bars including in-flight states)
-              console.log("[WebSocket] Snapshot received:", message.session_id, message.count || 0, "bars");
               if (onSnapshotRef.current && message.bars) {
                 onSnapshotRef.current({
                   sessionId: message.session_id,
@@ -307,8 +299,6 @@ export function useEventStream(
             
             case "data":
               // ACP data message (live updates)
-              console.log("[WebSocket] Data message:", message.session_id, message.schema);
-              
               // Track sequence for gap detection
               const sessionId = message.session_id;
               if (message.seq !== undefined) {
@@ -334,7 +324,6 @@ export function useEventStream(
             
             case "candle_correction":
               // Candle update with higher revision (upsert)
-              console.log("[WebSocket] Candle correction:", message.session_id, message.record?.id);
               if (message.record) {
                 onEventRef.current({
                   sessionId: message.session_id,
@@ -346,7 +335,6 @@ export function useEventStream(
             
             case "resync_response":
               // Replay buffer from backend after gap
-              console.log("[WebSocket] Resync response with", message.count, "messages");
               if (message.messages && Array.isArray(message.messages)) {
                 for (const msg of message.messages) {
                   // Re-process each message as if fresh
@@ -386,7 +374,6 @@ export function useEventStream(
             
             case "history_response":
               // Overlay agent's response with computed overlay values
-              console.log("[WebSocket] History response:", message.session_id, message.overlays?.length || 0, "overlays");
               if (onOverlayHistoryRef.current && message.overlays) {
                 onOverlayHistoryRef.current({
                   sessionId: message.session_id,
@@ -399,7 +386,6 @@ export function useEventStream(
             
             case "overlay_update":
               // Live overlay value update
-              console.log("[WebSocket] Overlay update:", message.session_id, message.schema);
               if (onOverlayRef.current && message.record) {
                 onOverlayRef.current({
                   sessionId: message.session_id,
@@ -412,7 +398,6 @@ export function useEventStream(
             
             case "overlay_marker":
               // Event marker from overlay agent
-              console.log("[WebSocket] Overlay marker:", message.session_id);
               if (onOverlayRef.current && message.record) {
                 onOverlayRef.current({
                   sessionId: message.session_id,
@@ -436,7 +421,7 @@ export function useEventStream(
               break;
             
             default:
-              console.log("[WebSocket] Received message type:", message.type);
+              break;
           }
         } catch (err) {
           console.error("[WebSocket] Failed to parse message:", err);

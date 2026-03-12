@@ -29,6 +29,7 @@ export default function AddIndicatorAgentModal({
   const [selectedIndicatorId, setSelectedIndicatorId] = useState("");
   const [paramValues, setParamValues] = useState<Record<string, string>>({});
   const [lineColor, setLineColor] = useState<string>("#22c55e");
+  const [forceSubgraph, setForceSubgraph] = useState<boolean>(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -41,6 +42,7 @@ export default function AddIndicatorAgentModal({
       setSelectedIndicatorId("");
       setParamValues({});
       setLineColor("#22c55e");
+      setForceSubgraph(false);
       setSubmitError(null);
       setSubmitting(false);
     }
@@ -167,6 +169,10 @@ export default function AddIndicatorAgentModal({
 
     // Always include line_color in config
     params.line_color = lineColor;
+    // Only persist force_subgraph when the user explicitly enabled it
+    if (forceSubgraph) {
+      params.force_subgraph = true;
+    }
 
     setSubmitting(true);
     setSubmitError(null);
@@ -311,6 +317,24 @@ export default function AddIndicatorAgentModal({
                 />
                 <span className="add-indicator-color-value">{lineColor}</span>
               </div>
+
+              <label className="add-indicator-label">
+                Sub-graph Pane
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: submitting ? "not-allowed" : "pointer", marginBottom: "4px" }}>
+                <input
+                  type="checkbox"
+                  checked={forceSubgraph}
+                  onChange={(event) => setForceSubgraph(event.target.checked)}
+                  disabled={submitting}
+                  style={{ width: "16px", height: "16px", accentColor: "#22c55e", cursor: "inherit" }}
+                />
+                <span style={{ fontSize: "12px", color: forceSubgraph ? "#22c55e" : "#94a3b8" }}>
+                  {forceSubgraph
+                    ? "Enabled — render in a separate pane below the chart"
+                    : "Disabled — overlay on the main price chart"}
+                </span>
+              </label>
             </>
           )}
 

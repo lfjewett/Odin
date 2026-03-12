@@ -5,6 +5,7 @@ Data models for Odin backend
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -13,6 +14,165 @@ import uuid
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# Keys that are managed purely by the UI and must survive the sanitize/normalize
+# pipeline without being declared in the agent's params_schema.
+# IMPORTANT: If you add a new UI-only config key here you must ALSO update the
+# POST /api/agents and PATCH /api/agents/{id} handlers in main.py so the key
+# is forwarded into the stored config (search for "_ui_keys" in main.py).
+UI_MANAGED_INDICATOR_CONFIG_KEYS = {
+    "line_color",
+    "visible",
+    "aggregation_interval",
+    "force_subgraph",
+    "area_fill_mode",
+    "area_fill_opacity",
+    "area_conditional_up_color",
+    "area_conditional_down_color",
+}
+
+
+def _normalize_indicator_instance_agent_id(agent_id: str) -> str:
+    return re.sub(r"__\d+$", "", agent_id or "")
+
+
+def get_selected_indicator_definition(
+    agent_id: str,
+    indicators: list[dict[str, Any]] | None,
+    outputs: list[dict[str, Any]] | None = None,
+    config_schema: dict[str, Any] | None = None,
+    selected_indicator_id: str | None = None,
+) -> dict[str, Any] | None:
+    catalog = indicators or []
+    if not catalog:
+        return None
+
+    if selected_indicator_id:
+        matched = next(
+            (item for item in catalog if item.get("indicator_id") == selected_indicator_id),
+            None,
+        )
+        if matched:
+            return matched
+
+    normalized_agent_id = _normalize_indicator_instance_agent_id(agent_id)
+    matched_by_agent_id = next(
+        (
+            item
+            for item in catalog
+            if normalized_agent_id.endswith(f"__{item.get('indicator_id', '')}")
+        ),
+        None,
+    )
+    if matched_by_agent_id:
+        return matched_by_agent_id
+
+    if outputs:
+        matched_by_outputs = next(
+            (item for item in catalog if (item.get("outputs") or []) == outputs),
+            None,
+        )
+        if matched_by_outputs:
+            return matched_by_outputs
+
+    configured_keys = {
+        key for key in (config_schema or {}).keys() if key not in UI_MANAGED_INDICATOR_CONFIG_KEYS
+    }
+    if configured_keys:
+        best_match: tuple[int, dict[str, Any]] | None = None
+        for item in catalog:
+            params_schema = item.get("params_schema") or {}
+            if not isinstance(params_schema, dict):
+                continue
+
+            schema_keys = {key for key in params_schema.keys() if key not in UI_MANAGED_INDICATOR_CONFIG_KEYS}
+            if not schema_keys:
+                continue
+
+            overlap = len(schema_keys & configured_keys)
+            if overlap == 0:
+                continue
+
+            exact_match = schema_keys == configured_keys
+            score = overlap * 10 + (100 if exact_match else 0) - abs(len(schema_keys) - len(configured_keys))
+            if best_match is None or score > best_match[0]:
+                best_match = (score, item)
+
+        if best_match:
+            return best_match[1]
+
+    if len(catalog) == 1:
+        return catalog[0]
+
+    return None
+
+
+def infer_selected_indicator_id(
+    agent_id: str,
+    indicators: list[dict[str, Any]] | None,
+    outputs: list[dict[str, Any]] | None = None,
+    config_schema: dict[str, Any] | None = None,
+    selected_indicator_id: str | None = None,
+) -> str | None:
+    selected = get_selected_indicator_definition(
+        agent_id=agent_id,
+        indicators=indicators,
+        outputs=outputs,
+        config_schema=config_schema,
+        selected_indicator_id=selected_indicator_id,
+    )
+    indicator_id = selected.get("indicator_id") if selected else None
+    return str(indicator_id) if indicator_id else None
+
+
+def normalize_indicator_config(
+    agent_id: str,
+    config_schema: dict[str, Any] | None,
+    indicators: list[dict[str, Any]] | None,
+    outputs: list[dict[str, Any]] | None = None,
+    selected_indicator_id: str | None = None,
+) -> dict[str, Any]:
+    config = dict(config_schema or {})
+    selected = get_selected_indicator_definition(
+        agent_id=agent_id,
+        indicators=indicators,
+        outputs=outputs,
+        config_schema=config,
+        selected_indicator_id=selected_indicator_id,
+    )
+    if not selected:
+        return config
+
+    params_schema = selected.get("params_schema") or {}
+    if not isinstance(params_schema, dict):
+        return config
+
+    allowed_keys = set(params_schema.keys()) | UI_MANAGED_INDICATOR_CONFIG_KEYS
+    return {key: value for key, value in config.items() if key in allowed_keys}
+
+
+def normalize_indicator_outputs_and_description(
+    outputs: list[dict[str, Any]] | None,
+    description: str,
+    indicators: list[dict[str, Any]] | None,
+    agent_id: str,
+    config_schema: dict[str, Any] | None,
+    selected_indicator_id: str | None = None,
+) -> tuple[list[dict[str, Any]], str, str | None]:
+    selected = get_selected_indicator_definition(
+        agent_id=agent_id,
+        indicators=indicators,
+        outputs=outputs,
+        config_schema=config_schema,
+        selected_indicator_id=selected_indicator_id,
+    )
+    if not selected:
+        return list(outputs or []), description, None
+
+    normalized_outputs = list(selected.get("outputs") or outputs or [])
+    normalized_description = str(selected.get("description") or description or "")
+    indicator_id = selected.get("indicator_id")
+    return normalized_outputs, normalized_description, str(indicator_id) if indicator_id else None
 
 
 class AgentConfig(BaseModel):
@@ -27,6 +187,7 @@ class AgentConfig(BaseModel):
     config_schema: dict[str, Any] = Field(default_factory=dict, description="Agent-specific configuration")
     outputs: list[dict[str, Any]] = Field(default_factory=list, description="Typed output descriptors")
     indicators: list[dict[str, Any]] = Field(default_factory=list, description="Discoverable indicator catalog")
+    selected_indicator_id: str | None = Field(default=None, description="Selected indicator from indicators catalog")
     transport_limits: dict[str, Any] = Field(default_factory=dict, description="ACP transport limits")
 
 
@@ -56,6 +217,24 @@ class Agent(BaseModel):
     
     def to_frontend_format(self) -> dict[str, Any]:
         """Convert to format expected by frontend"""
+        normalized_config = self.config.config_schema
+        selected_indicator_id = self.config.selected_indicator_id
+        if self.config.agent_type == "indicator":
+            normalized_config = normalize_indicator_config(
+                agent_id=self.config.agent_id,
+                config_schema=self.config.config_schema,
+                indicators=self.config.indicators,
+                outputs=self.config.outputs,
+                selected_indicator_id=self.config.selected_indicator_id,
+            )
+            selected_indicator_id = infer_selected_indicator_id(
+                agent_id=self.config.agent_id,
+                indicators=self.config.indicators,
+                outputs=self.config.outputs,
+                config_schema=normalized_config,
+                selected_indicator_id=self.config.selected_indicator_id,
+            )
+
         return {
             "id": self.config.agent_id,
             "name": self.config.agent_name,
@@ -70,10 +249,11 @@ class Agent(BaseModel):
             "error_message": self.status.error_message,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "config": self.config.config_schema,
+            "config": normalized_config,
             "spec_version": self.config.spec_version,
             "agent_version": self.config.agent_version,
             "description": self.config.description,
+            "selected_indicator_id": selected_indicator_id,
             "transport_limits": self.config.transport_limits,
         }
 
@@ -190,6 +370,59 @@ def build_variable_name(agent_name: str, output: dict[str, Any]) -> str:
     """
     label = output.get("label", output.get("output_id", "value"))
     return f"{agent_name}:{label}"
+
+
+def _build_area_canonical_base_name(agent_name: str, output: dict[str, Any]) -> str:
+    """Build canonical base name for area-derived variables, collapsing duplicate label prefixes."""
+    base_name = build_variable_name(agent_name, output)
+    output_label = str(output.get("label", output.get("output_id", "value"))).strip()
+    normalized_agent_name = str(agent_name).strip()
+    if normalized_agent_name and output_label == normalized_agent_name:
+        return normalized_agent_name
+    return base_name
+
+
+def build_area_field_variable_name(agent_name: str, output: dict[str, Any], field: str) -> str:
+    """Construct the canonical variable name for an area numeric field (upper/lower)."""
+    base_name = _build_area_canonical_base_name(agent_name, output)
+    normalized_field = str(field).strip().lower()
+    return f"{base_name}:{normalized_field}"
+
+
+def build_area_field_legacy_variable_name(agent_name: str, output: dict[str, Any], field: str) -> str:
+    """Construct the legacy variable name for an area numeric field (upper/lower)."""
+    base_name = build_variable_name(agent_name, output)
+    normalized_field = str(field).strip().lower()
+    return f"{base_name}:{normalized_field}"
+
+
+def build_area_metadata_variable_name(agent_name: str, output: dict[str, Any], metadata_key: str) -> str:
+    """Construct the canonical DSL-safe variable name for an area metadata numeric field."""
+    base_name = build_variable_name(agent_name, output)
+    normalized_key = re.sub(r"[^A-Za-z0-9_:\-]", "_", str(metadata_key).strip())
+    normalized_key = re.sub(r"_+", "_", normalized_key).strip("_:")
+    if not normalized_key:
+        normalized_key = "field"
+    if normalized_key[0].isdigit():
+        normalized_key = f"f_{normalized_key}"
+
+    # For metadata fields, avoid duplicate prefixes when output label == agent name.
+    # Example: Gungnir:Gungnir:meta_dist -> canonical Gungnir:dist
+    base_name = _build_area_canonical_base_name(agent_name, output)
+
+    return f"{base_name}:{normalized_key}"
+
+
+def build_area_metadata_legacy_variable_name(agent_name: str, output: dict[str, Any], metadata_key: str) -> str:
+    """Construct the legacy DSL-safe variable name for an area metadata numeric field."""
+    base_name = build_variable_name(agent_name, output)
+    normalized_key = re.sub(r"[^A-Za-z0-9_:\-]", "_", str(metadata_key).strip())
+    normalized_key = re.sub(r"_+", "_", normalized_key).strip("_:")
+    if not normalized_key:
+        normalized_key = "field"
+    if normalized_key[0].isdigit():
+        normalized_key = f"f_{normalized_key}"
+    return f"{base_name}:meta_{normalized_key}"
 
 
 class SessionManager:

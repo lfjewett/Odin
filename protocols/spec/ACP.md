@@ -1,8 +1,21 @@
 # Agent Chart Protocol (ACP)
 
-- Spec ID: `ACP-0.4.1`
+- Spec ID: `ACP-0.4.2`
 - Status: Draft (Authoritative in this repository)
-- Last updated: 2026-03-10
+- Last updated: 2026-03-12
+
+## Changes from ACP-0.4.1 to ACP-0.4.2
+
+**ACP-0.4.2 is a backward-compatible patch release.**
+
+- Fixes metadata output schema enums to include `area` in both top-level `outputs[]` and indicator catalog `indicators[].outputs[]`
+- Clarifies backend-authoritative conventions for area-zone overlays:
+  - zone records SHOULD be emitted per candle timestamp for canonical backend/export/trade usage
+  - numeric confidence SHOULD be emitted as `metadata.confidence`
+  - optional display labels MAY be emitted as `metadata.label`
+  - optional chart hints MAY be emitted under `metadata.render.*`
+
+No required message fields were removed or changed.
 
 ## Changes from ACP-0.4.0 to ACP-0.4.1
 

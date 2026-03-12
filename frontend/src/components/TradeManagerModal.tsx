@@ -23,18 +23,21 @@ const DEFAULT_ENTRY_RULE = 'CLOSE < OPEN AND !IN_BULL_TRADE';
 const DEFAULT_EXIT_RULE = 'CLOSE > OPEN AND IN_BULL_TRADE';
 
 type ParsedStrategyRules = {
-  long_entry_rule: string;
+  long_entry_rules: string[];
   long_exit_rules: string[];
-  short_entry_rule: string;
+  short_entry_rules: string[];
   short_exit_rules: string[];
 };
 
 const buildRulesText = (rules: ParsedStrategyRules): string => {
   const lines: string[] = [];
 
-  if (rules.long_entry_rule.trim()) {
-    lines.push(`long_entry: ${rules.long_entry_rule.trim()}`);
-  }
+  rules.long_entry_rules.forEach((rule, idx) => {
+    const clean = rule.trim();
+    if (clean) {
+      lines.push(`long_entry_${idx + 1}: ${clean}`);
+    }
+  });
 
   rules.long_exit_rules.forEach((rule, idx) => {
     const clean = rule.trim();
@@ -43,12 +46,15 @@ const buildRulesText = (rules: ParsedStrategyRules): string => {
     }
   });
 
-  const hasShortSide = rules.short_entry_rule.trim() || rules.short_exit_rules.some((rule) => rule.trim());
+  const hasShortSide = rules.short_entry_rules.some((rule) => rule.trim()) || rules.short_exit_rules.some((rule) => rule.trim());
   if (hasShortSide) {
     lines.push('');
-    if (rules.short_entry_rule.trim()) {
-      lines.push(`short_entry: ${rules.short_entry_rule.trim()}`);
-    }
+    rules.short_entry_rules.forEach((rule, idx) => {
+      const clean = rule.trim();
+      if (clean) {
+        lines.push(`short_entry_${idx + 1}: ${clean}`);
+      }
+    });
     rules.short_exit_rules.forEach((rule, idx) => {
       const clean = rule.trim();
       if (clean) {
@@ -62,10 +68,12 @@ const buildRulesText = (rules: ParsedStrategyRules): string => {
 
 const parseRulesText = (rulesText: string): { rules: ParsedStrategyRules; errors: string[] } => {
   const errors: string[] = [];
+  const longEntries: Array<{ index: number; rule: string }> = [];
   const longExits: Array<{ index: number; rule: string }> = [];
+  const shortEntries: Array<{ index: number; rule: string }> = [];
   const shortExits: Array<{ index: number; rule: string }> = [];
-  let longEntry = '';
-  let shortEntry = '';
+  let legacyLongEntry = ''; // Support old unnumbered format
+  let legacyShortEntry = '';
 
   const lines = rulesText.split(/\r?\n/);
   lines.forEach((rawLine, lineIdx) => {
@@ -87,25 +95,38 @@ const parseRulesText = (rulesText: string): { rules: ParsedStrategyRules; errors
       return;
     }
 
+    // Support both old unnumbered format (long_entry) and new numbered format (long_entry_1)
     if (key === 'long_entry') {
-      if (longEntry) {
+      if (legacyLongEntry) {
         errors.push(`Line ${lineIdx + 1}: duplicate long_entry`);
       }
-      longEntry = value;
+      legacyLongEntry = value;
       return;
     }
 
     if (key === 'short_entry') {
-      if (shortEntry) {
+      if (legacyShortEntry) {
         errors.push(`Line ${lineIdx + 1}: duplicate short_entry`);
       }
-      shortEntry = value;
+      legacyShortEntry = value;
+      return;
+    }
+
+    const longEntryMatch = key.match(/^long_entry_(\d+)$/);
+    if (longEntryMatch) {
+      longEntries.push({ index: Number(longEntryMatch[1]), rule: value });
       return;
     }
 
     const longExitMatch = key.match(/^long_exit_(\d+)$/);
     if (longExitMatch) {
       longExits.push({ index: Number(longExitMatch[1]), rule: value });
+      return;
+    }
+
+    const shortEntryMatch = key.match(/^short_entry_(\d+)$/);
+    if (shortEntryMatch) {
+      shortEntries.push({ index: Number(shortEntryMatch[1]), rule: value });
       return;
     }
 
@@ -118,6 +139,14 @@ const parseRulesText = (rulesText: string): { rules: ParsedStrategyRules; errors
     errors.push(`Line ${lineIdx + 1}: unsupported key '${key}'`);
   });
 
+  // Legacy support: if old unnumbered format was used, convert to numbered
+  if (legacyLongEntry && longEntries.length === 0) {
+    longEntries.push({ index: 1, rule: legacyLongEntry });
+  }
+  if (legacyShortEntry && shortEntries.length === 0) {
+    shortEntries.push({ index: 1, rule: legacyShortEntry });
+  }
+
   const dedupeCheck = (entries: Array<{ index: number; rule: string }>, prefix: string) => {
     const seen = new Set<number>();
     entries.forEach(({ index }) => {
@@ -128,16 +157,18 @@ const parseRulesText = (rulesText: string): { rules: ParsedStrategyRules; errors
     });
   };
 
+  dedupeCheck(longEntries, 'long_entry');
   dedupeCheck(longExits, 'long_exit');
+  dedupeCheck(shortEntries, 'short_entry');
   dedupeCheck(shortExits, 'short_exit');
 
   const sortByIndex = (a: { index: number }, b: { index: number }) => a.index - b.index;
 
   return {
     rules: {
-      long_entry_rule: longEntry,
+      long_entry_rules: longEntries.sort(sortByIndex).map((entry) => entry.rule),
       long_exit_rules: longExits.sort(sortByIndex).map((entry) => entry.rule),
-      short_entry_rule: shortEntry,
+      short_entry_rules: shortEntries.sort(sortByIndex).map((entry) => entry.rule),
       short_exit_rules: shortExits.sort(sortByIndex).map((entry) => entry.rule),
     },
     errors,
@@ -151,9 +182,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
   const [strategyNameInput, setStrategyNameInput] = useState('MVP Strategy');
   const [strategyRulesText, setStrategyRulesText] = useState(() =>
     buildRulesText({
-      long_entry_rule: DEFAULT_ENTRY_RULE,
+      long_entry_rules: [DEFAULT_ENTRY_RULE],
       long_exit_rules: [DEFAULT_EXIT_RULE],
-      short_entry_rule: '',
+      short_entry_rules: [],
       short_exit_rules: [],
     })
   );
@@ -205,9 +236,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
             setDescription(strategy.description || '');
             setStrategyRulesText(
               buildRulesText({
-                long_entry_rule: strategy.long_entry_rule || '',
+                long_entry_rules: Array.isArray(strategy.long_entry_rules) ? strategy.long_entry_rules : [],
                 long_exit_rules: Array.isArray(strategy.long_exit_rules) ? strategy.long_exit_rules : [],
-                short_entry_rule: strategy.short_entry_rule || '',
+                short_entry_rules: Array.isArray(strategy.short_entry_rules) ? strategy.short_entry_rules : [],
                 short_exit_rules: Array.isArray(strategy.short_exit_rules) ? strategy.short_exit_rules : [],
               }),
             );
@@ -269,9 +300,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
     setDescription('');
     setStrategyRulesText(
       buildRulesText({
-        long_entry_rule: DEFAULT_ENTRY_RULE,
+        long_entry_rules: [DEFAULT_ENTRY_RULE],
         long_exit_rules: [DEFAULT_EXIT_RULE],
-        short_entry_rule: '',
+        short_entry_rules: [],
         short_exit_rules: [],
       })
     );
@@ -289,9 +320,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
       setDescription(strategy.description || '');
       setStrategyRulesText(
         buildRulesText({
-          long_entry_rule: strategy.long_entry_rule || '',
+          long_entry_rules: Array.isArray(strategy.long_entry_rules) ? strategy.long_entry_rules : [],
           long_exit_rules: Array.isArray(strategy.long_exit_rules) ? strategy.long_exit_rules : [],
-          short_entry_rule: strategy.short_entry_rule || '',
+          short_entry_rules: Array.isArray(strategy.short_entry_rules) ? strategy.short_entry_rules : [],
           short_exit_rules: Array.isArray(strategy.short_exit_rules) ? strategy.short_exit_rules : [],
         })
       );
@@ -315,9 +346,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
         return;
       }
       const result = await validateTradeStrategy(sessionId, {
-        long_entry_rule: parsed.rules.long_entry_rule,
+        long_entry_rules: parsed.rules.long_entry_rules,
         long_exit_rules: parsed.rules.long_exit_rules,
-        short_entry_rule: parsed.rules.short_entry_rule,
+        short_entry_rules: parsed.rules.short_entry_rules,
         short_exit_rules: parsed.rules.short_exit_rules,
       });
       if (result.valid) {
@@ -350,9 +381,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
       }
       const saved = await saveTradeStrategy(sessionId, name, {
         description,
-        long_entry_rule: parsed.rules.long_entry_rule,
+        long_entry_rules: parsed.rules.long_entry_rules,
         long_exit_rules: parsed.rules.long_exit_rules,
-        short_entry_rule: parsed.rules.short_entry_rule,
+        short_entry_rules: parsed.rules.short_entry_rules,
         short_exit_rules: parsed.rules.short_exit_rules,
       });
       setSelectedStrategyName(saved.name);
@@ -404,9 +435,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
       console.log('[TradeManagerModal] Apply requested', {
         sessionId,
         strategyName: name,
-        hasLongEntryRule: Boolean(parsed.rules.long_entry_rule.trim()),
+        hasLongEntryRule: Boolean(parsed.rules.long_entry_rules.some((rule) => rule.trim())),
         longExitRuleCount: parsed.rules.long_exit_rules.length,
-        hasShortEntryRule: Boolean(parsed.rules.short_entry_rule.trim()),
+        hasShortEntryRule: Boolean(parsed.rules.short_entry_rules.some((rule) => rule.trim())),
         shortExitRuleCount: parsed.rules.short_exit_rules.length,
       });
 
@@ -414,9 +445,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
         try {
           const saved = await saveTradeStrategy(sessionId, name, {
             description,
-            long_entry_rule: parsed.rules.long_entry_rule,
+            long_entry_rules: parsed.rules.long_entry_rules,
             long_exit_rules: parsed.rules.long_exit_rules,
-            short_entry_rule: parsed.rules.short_entry_rule,
+            short_entry_rules: parsed.rules.short_entry_rules,
             short_exit_rules: parsed.rules.short_exit_rules,
           });
           setSelectedStrategyName(saved.name);
@@ -429,9 +460,9 @@ export const TradeManagerModal: React.FC<TradeManagerModalProps> = ({ sessionId,
 
       const response = await applyTradeStrategy(sessionId, {
         strategy_name: name || undefined,
-        long_entry_rule: parsed.rules.long_entry_rule,
+        long_entry_rules: parsed.rules.long_entry_rules,
         long_exit_rules: parsed.rules.long_exit_rules,
-        short_entry_rule: parsed.rules.short_entry_rule,
+        short_entry_rules: parsed.rules.short_entry_rules,
         short_exit_rules: parsed.rules.short_exit_rules,
       });
       console.log('[TradeManagerModal] Apply response', {

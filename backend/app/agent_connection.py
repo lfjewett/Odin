@@ -1,5 +1,5 @@
 """
-Agent WebSocket Connection Manager (ACP v0.4.1)
+Agent WebSocket Connection Manager (ACP v0.4.2)
 
 Manages WebSocket connections to ACP agents and handles session-based subscriptions.
 Each agent connection can serve multiple sessions (clients).
@@ -24,8 +24,8 @@ from app.models import Agent
 logger = logging.getLogger(__name__)
 
 
-ACP_SPEC_VERSION = "ACP-0.4.1"
-COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1"}
+ACP_SPEC_VERSION = "ACP-0.4.2"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RECORDS_PER_CHUNK = 5000
 DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES = 10 * 1024 * 1024
@@ -35,7 +35,7 @@ class AgentConnection:
     """
     Manages WebSocket connection and subscriptions for a single agent.
     
-    ACP v0.4.1: Supports multiple concurrent sessions per agent.
+    ACP v0.4.2: Supports multiple concurrent sessions per agent.
     Each session is isolated (session_id in all messages).
     """
     
@@ -71,6 +71,7 @@ class AgentConnection:
         self.running = False
         self.reconnect_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
+        self._subscription_version_by_session: dict[str, int] = {}
         
     @property
     def agent_id(self) -> str:
@@ -90,8 +91,18 @@ class AgentConnection:
         return self.agent.config.agent_url.rstrip("/")
 
     def _build_subscription_id(self, session_id: str) -> str:
-        """Build a stable, per-connection subscription id for a session."""
-        return f"{session_id}::{self.agent_id}"
+        """Build the current per-connection subscription id for a session."""
+        version = int(self._subscription_version_by_session.get(session_id, 0))
+        if version <= 0:
+            version = 1
+            self._subscription_version_by_session[session_id] = version
+        return f"{session_id}::{self.agent_id}::v{version}"
+
+    def _next_subscription_id(self, session_id: str) -> str:
+        """Advance and return a new subscription id for a session."""
+        version = int(self._subscription_version_by_session.get(session_id, 0)) + 1
+        self._subscription_version_by_session[session_id] = version
+        return f"{session_id}::{self.agent_id}::v{version}"
 
     @staticmethod
     def _format_history_timestamp(value: datetime) -> str:
@@ -387,12 +398,14 @@ class AgentConnection:
             return False
 
         normalized_params = params or {}
+        selected_indicator_id = self.agent.config.selected_indicator_id
         existing = self.subscriptions.get(session_id)
         if existing and not force:
             existing_params = existing.get("params") or {}
             if (
                 existing.get("symbol") == symbol
                 and existing.get("interval") == interval
+                and existing.get("indicator_id") == selected_indicator_id
                 and existing_params == normalized_params
             ):
                 logger.info(
@@ -403,7 +416,7 @@ class AgentConnection:
         # ACP v0.4.0: Include session_id and per-connection subscription_id.
         # Multiple indicator instances can share a session_id, so subscription_id
         # must be unique per connection to avoid sequence/state collisions.
-        subscription_id = self._build_subscription_id(session_id)
+        subscription_id = self._next_subscription_id(session_id)
         message = {
             "type": "subscribe",
             "spec_version": ACP_SPEC_VERSION,
@@ -414,6 +427,8 @@ class AgentConnection:
             "interval": interval,
             "params": normalized_params
         }
+        if self.agent.config.agent_type == "indicator" and selected_indicator_id:
+            message["indicator_id"] = selected_indicator_id
         
         success = await self.send_message(message)
         if success:
@@ -422,6 +437,7 @@ class AgentConnection:
                 "subscription_id": subscription_id,
                 "symbol": symbol,
                 "interval": interval,
+                "indicator_id": selected_indicator_id,
                 "params": normalized_params
             }
             logger.info(f"📊 [{self.agent_id}] Subscribed session {session_id}: {symbol} @ {interval}")
@@ -526,6 +542,7 @@ class AgentConnection:
         # Always clear local subscription state to avoid stale-session reuse,
         # even if the agent connection is unavailable during cleanup.
         self.subscriptions.pop(session_id, None)
+        self._subscription_version_by_session.pop(session_id, None)
 
         if success:
             logger.info(f"🚫 [{self.agent_id}] Unsubscribed session: {session_id}")

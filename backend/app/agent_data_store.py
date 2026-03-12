@@ -133,6 +133,9 @@ class SessionDataStore:
         self,
         record: dict[str, Any],
         source_agent_id: str | None = None,
+        schema: str | None = None,
+        subscription_id: str | None = None,
+        output_id: str | None = None,
     ) -> dict[str, Any] | None:
         """
         Ingest a non-OHLC record (e.g., event, line) with deduplication.
@@ -153,6 +156,14 @@ class SessionDataStore:
 
         # Ingest
         normalized = dict(record)
+        if source_agent_id and not normalized.get("agent_id"):
+            normalized["agent_id"] = source_agent_id
+        if schema and not normalized.get("schema"):
+            normalized["schema"] = schema
+        if subscription_id and not normalized.get("subscription_id"):
+            normalized["subscription_id"] = subscription_id
+        if output_id and not normalized.get("output_id"):
+            normalized["output_id"] = output_id
         self.latest_non_ohlc_by_key[dedup_key] = normalized
         self.last_event_ts = str(normalized.get("ts") or self.last_event_ts)
 
@@ -171,3 +182,20 @@ class SessionDataStore:
     def get_finalized_candles(self) -> list[dict[str, Any]]:
         """Get finalized candles in order"""
         return list(self.finalized_bars)
+
+    def get_non_ohlc_records(self) -> list[dict[str, Any]]:
+        """Get canonical non-OHLC records sorted by timestamp then id."""
+        enriched: list[dict[str, Any]] = []
+        for (source_agent_id, _record_id), record in self.latest_non_ohlc_by_key.items():
+            normalized = dict(record)
+            if source_agent_id and not normalized.get("agent_id"):
+                normalized["agent_id"] = source_agent_id
+            enriched.append(normalized)
+
+        return sorted(
+            enriched,
+            key=lambda record: (
+                str(record.get("ts") or ""),
+                str(record.get("id") or ""),
+            ),
+        )

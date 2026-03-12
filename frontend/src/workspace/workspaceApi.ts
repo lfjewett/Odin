@@ -129,9 +129,9 @@ export interface TradeStrategyRecord {
   session_id: string;
   name: string;
   description: string;
-  long_entry_rule: string;
+  long_entry_rules: string[];
   long_exit_rules: string[];
-  short_entry_rule: string;
+  short_entry_rules: string[];
   short_exit_rules: string[];
   created_at: string;
   updated_at: string;
@@ -191,6 +191,65 @@ export interface ApplyTradeStrategyResponse {
   performance?: TradePerformance;
 }
 
+export type ResearchOutputSchema = "line" | "area" | "histogram";
+
+export interface ResearchRecord {
+  id: string;
+  ts: string;
+  value?: number;
+  upper?: number;
+  lower?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface EvaluateResearchExpressionResponse {
+  session_id: string;
+  expression: string;
+  schema: ResearchOutputSchema;
+  records: ResearchRecord[];
+  count: number;
+}
+
+export interface CreateCsvExportPayload {
+  start_date: string;
+  end_date: string;
+  interval?: string;
+  settle_min_delay_seconds?: number;
+  settle_poll_seconds?: number;
+  settle_timeout_seconds?: number;
+}
+
+export interface CreateCsvExportResponse {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  session_id: string;
+  symbol: string;
+  interval: string;
+  start_date: string;
+  end_date: string;
+}
+
+export interface CsvExportJobStatus {
+  job_id: string;
+  session_id: string;
+  symbol: string;
+  interval: string;
+  status: "queued" | "running" | "completed" | "failed";
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+  start_date: string;
+  end_date: string;
+  total_chunks: number;
+  completed_chunks: number;
+  current_chunk: number;
+  chunk_window: { from: string; to: string } | null;
+  candle_count: number;
+  overlay_count: number;
+  ready: boolean;
+}
+
 export async function getSessionVariables(sessionId: string): Promise<SessionVariablesResponse> {
   const response = await fetch(`${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/variables`);
   if (!response.ok) {
@@ -225,9 +284,9 @@ export async function saveTradeStrategy(
   strategyName: string,
   payload: {
     description?: string;
-    long_entry_rule: string;
+    long_entry_rules: string[];
     long_exit_rules: string[];
-    short_entry_rule: string;
+    short_entry_rules: string[];
     short_exit_rules: string[];
   }
 ): Promise<TradeStrategyRecord> {
@@ -268,9 +327,9 @@ export async function deleteTradeStrategy(sessionId: string, strategyName: strin
 export async function validateTradeStrategy(
   sessionId: string,
   payload: {
-    long_entry_rule: string;
+    long_entry_rules: string[];
     long_exit_rules: string[];
-    short_entry_rule: string;
+    short_entry_rules: string[];
     short_exit_rules: string[];
   }
 ): Promise<TradeStrategyValidationResponse> {
@@ -294,9 +353,9 @@ export async function applyTradeStrategy(
   sessionId: string,
   payload: {
     strategy_name?: string;
-    long_entry_rule: string;
+    long_entry_rules: string[];
     long_exit_rules: string[];
-    short_entry_rule: string;
+    short_entry_rules: string[];
     short_exit_rules: string[];
   }
 ): Promise<ApplyTradeStrategyResponse> {
@@ -314,4 +373,64 @@ export async function applyTradeStrategy(
   }
 
   return response.json();
+}
+
+export async function evaluateResearchExpression(
+  sessionId: string,
+  payload: {
+    expression: string;
+    output_schema: ResearchOutputSchema;
+  }
+): Promise<EvaluateResearchExpressionResponse> {
+  const response = await fetch(`${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/research/evaluate`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to evaluate research expression: ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+export async function createCsvExportJob(
+  sessionId: string,
+  payload: CreateCsvExportPayload
+): Promise<CreateCsvExportResponse> {
+  const response = await fetch(`${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/exports/csv`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to create CSV export job: ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+export async function getCsvExportJobStatus(sessionId: string, jobId: string): Promise<CsvExportJobStatus> {
+  const response = await fetch(
+    `${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/exports/csv/${encodeURIComponent(jobId)}`
+  );
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to fetch CSV export job status: ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+export function getCsvExportDownloadUrl(sessionId: string, jobId: string): string {
+  return `${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/exports/csv/${encodeURIComponent(jobId)}/download`;
 }

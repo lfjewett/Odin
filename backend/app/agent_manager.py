@@ -14,7 +14,14 @@ from datetime import datetime, timezone
 
 import yaml
 
-from app.models import Agent, AgentConfig, AgentStatus
+from app.models import (
+    Agent,
+    AgentConfig,
+    AgentStatus,
+    infer_selected_indicator_id,
+    normalize_indicator_config,
+    normalize_indicator_outputs_and_description,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,26 @@ class AgentManager:
             for agent_data in agent_list:
                 try:
                     agent_config = AgentConfig(**agent_data)
+                    if agent_config.agent_type == "indicator":
+                        normalized_outputs, normalized_description, inferred_indicator_id = normalize_indicator_outputs_and_description(
+                            outputs=agent_config.outputs,
+                            description=agent_config.description,
+                            indicators=agent_config.indicators,
+                            agent_id=agent_config.agent_id,
+                            config_schema=agent_config.config_schema,
+                            selected_indicator_id=agent_config.selected_indicator_id,
+                        )
+                        agent_config.outputs = normalized_outputs
+                        agent_config.description = normalized_description
+                        agent_config.selected_indicator_id = inferred_indicator_id
+                        agent_config.config_schema = normalize_indicator_config(
+                            agent_id=agent_config.agent_id,
+                            config_schema=agent_config.config_schema,
+                            indicators=agent_config.indicators,
+                            outputs=agent_config.outputs,
+                            selected_indicator_id=agent_config.selected_indicator_id,
+                        )
+
                     agent_status = AgentStatus(agent_id=agent_config.agent_id)
                     agent = Agent(config=agent_config, status=agent_status)
                     
@@ -93,6 +120,32 @@ class AgentManager:
 
     def add_or_update_agent(self, agent_config: AgentConfig) -> Agent:
         """Register or update an agent at runtime."""
+        if agent_config.agent_type == "indicator":
+            normalized_outputs, normalized_description, inferred_indicator_id = normalize_indicator_outputs_and_description(
+                outputs=agent_config.outputs,
+                description=agent_config.description,
+                indicators=agent_config.indicators,
+                agent_id=agent_config.agent_id,
+                config_schema=agent_config.config_schema,
+                selected_indicator_id=agent_config.selected_indicator_id,
+            )
+            agent_config.outputs = normalized_outputs
+            agent_config.description = normalized_description
+            agent_config.selected_indicator_id = inferred_indicator_id or infer_selected_indicator_id(
+                agent_id=agent_config.agent_id,
+                indicators=agent_config.indicators,
+                outputs=agent_config.outputs,
+                config_schema=agent_config.config_schema,
+                selected_indicator_id=agent_config.selected_indicator_id,
+            )
+            agent_config.config_schema = normalize_indicator_config(
+                agent_id=agent_config.agent_id,
+                config_schema=agent_config.config_schema,
+                indicators=agent_config.indicators,
+                outputs=agent_config.outputs,
+                selected_indicator_id=agent_config.selected_indicator_id,
+            )
+
         existing = self.agents.get(agent_config.agent_id)
         if existing:
             existing.config = agent_config
@@ -188,6 +241,8 @@ class AgentManager:
                 }
                 if agent.config.indicators:
                     agent_dict["indicators"] = agent.config.indicators
+                if agent.config.selected_indicator_id:
+                    agent_dict["selected_indicator_id"] = agent.config.selected_indicator_id
                 agents_data.append(agent_dict)
             
             yaml_path.parent.mkdir(parents=True, exist_ok=True)

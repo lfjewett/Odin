@@ -123,7 +123,7 @@
           "schema": {
             "type": "string",
             "description": "Output record schema",
-            "enum": ["ohlc", "line", "event", "band", "histogram", "forecast"]
+            "enum": ["ohlc", "line", "event", "band", "area", "histogram", "forecast"]
           },
           "label": {
             "type": "string",
@@ -226,7 +226,7 @@
                 "output_id": { "type": "string", "minLength": 1 },
                 "schema": {
                   "type": "string",
-                  "enum": ["ohlc", "line", "event", "band", "histogram", "forecast"]
+                  "enum": ["ohlc", "line", "event", "band", "area", "histogram", "forecast"]
                 },
                 "label": { "type": "string", "minLength": 1 },
                 "is_primary": { "type": "boolean" },

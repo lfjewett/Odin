@@ -1,0 +1,254 @@
+.research-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.82);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+
+.research-content {
+  width: 84%;
+  height: 84%;
+  max-height: calc(100vh - 40px);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.research-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding: 10px 14px;
+  background: var(--surface-2);
+}
+
+.research-header h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.research-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+
+.research-close:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+
+.research-body {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1.5fr 1fr;
+  gap: 14px;
+  padding: 14px;
+}
+
+.research-editor,
+.research-variables {
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 12px;
+}
+
+.research-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.research-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.research-select,
+.research-textarea {
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border-radius: 8px;
+  outline: none;
+}
+
+.research-select {
+  height: 34px;
+  padding: 0 10px;
+}
+
+.research-textarea {
+  width: 100%;
+  min-height: 260px;
+  flex: 1;
+  padding: 10px;
+  resize: vertical;
+  font-family: "IBM Plex Mono", "SF Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.research-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.research-button {
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border-radius: 7px;
+  font-size: 12px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.research-button:hover {
+  background: var(--surface-3);
+}
+
+.research-button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.research-button-secondary {
+  color: var(--text-muted);
+}
+
+.research-state-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-height: 20px;
+  flex-wrap: wrap;
+}
+
+.research-running,
+.research-status {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.research-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.research-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.research-variables {
+  overflow: auto;
+}
+
+.research-variables h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.research-variable-block {
+  margin-bottom: 12px;
+}
+
+.research-variable-block h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+.research-variable-block ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.research-inline-token-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.research-inline-token-list--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.research-variable-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.research-variable-block--indicators {
+  grid-column: 1 / -1;
+}
+
+.research-variable-block--indicators .research-inline-token-list--three {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.research-variable-block li {
+  margin: 0;
+  padding: 0;
+}
+
+.research-variable-token {
+  width: 100%;
+  text-align: left;
+  font-family: "IBM Plex Mono", "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.research-variable-token:hover {
+  color: var(--text-primary);
+  background: var(--surface-3);
+}
+
+.research-loading {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 1240px) {
+  .research-variable-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .research-variable-block--indicators .research-inline-token-list--three {
+    grid-template-columns: 1fr;
+  }
+}

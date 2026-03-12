@@ -9,7 +9,13 @@ from zoneinfo import ZoneInfo
 
 from app.agent_data_store import SessionDataStore
 from app.agent_manager import agent_manager
-from app.models import build_variable_name
+from app.models import (
+    build_area_field_legacy_variable_name,
+    build_area_field_variable_name,
+    build_area_metadata_legacy_variable_name,
+    build_area_metadata_variable_name,
+    build_variable_name,
+)
 
 TOKEN_PATTERN = re.compile(
     r"\s*(>=|<=|==|!=|>|<|AND\b|OR\b|NOT\b|\(|\)|\[|\]|,|!|[A-Za-z_][A-Za-z0-9_:\-]*|\d+(?:\.\d+)?|\+|\-|\*|\/|%)",
@@ -247,7 +253,15 @@ def validate_rule_ast(node: dict[str, Any]) -> list[str]:
                 )
             return
 
-        if node_type in {"identifier", "number"}:
+        if node_type == "identifier":
+            if bool_context:
+                errors.append(
+                    f"Identifier '{current.get('name')}' is not supported as a boolean expression. "
+                    "Use a comparison (e.g. VAR > 0) or IN_BULL_TRADE / IN_BEAR_TRADE."
+                )
+            return
+
+        if node_type == "number":
             return
 
         if node_type == "indexed_variable":
@@ -264,25 +278,35 @@ def validate_rule_ast(node: dict[str, Any]) -> list[str]:
 
 
 def validate_strategy_v2(
-    long_entry_rule: str,
-    long_exit_rules: list[str],
-    short_entry_rule: str = "",
+    long_entry_rules: list[str] | None = None,
+    long_exit_rules: list[str] | None = None,
+    short_entry_rules: list[str] | None = None,
     short_exit_rules: list[str] | None = None,
+    # Backward compatibility: accept single-string format
+    long_entry_rule: str = "",
+    short_entry_rule: str = "",
 ) -> StrategyValidationResult:
     errors: list[str] = []
-    normalized_long_entry = long_entry_rule.strip()
-    normalized_long_exits = [rule.strip() for rule in long_exit_rules if rule and rule.strip()]
-    normalized_short_entry = short_entry_rule.strip()
+    
+    # Support both new array format and old single-string format
+    if long_entry_rule and not long_entry_rules:
+        long_entry_rules = [long_entry_rule]
+    if short_entry_rule and not short_entry_rules:
+        short_entry_rules = [short_entry_rule]
+    
+    normalized_long_entries = [rule.strip() for rule in (long_entry_rules or []) if rule and rule.strip()]
+    normalized_long_exits = [rule.strip() for rule in (long_exit_rules or []) if rule and rule.strip()]
+    normalized_short_entries = [rule.strip() for rule in (short_entry_rules or []) if rule and rule.strip()]
     normalized_short_exits = [rule.strip() for rule in (short_exit_rules or []) if rule and rule.strip()]
 
-    if not normalized_long_entry and not normalized_short_entry:
-        errors.append("At least one entry rule is required (long_entry_rule or short_entry_rule)")
+    if not normalized_long_entries and not normalized_short_entries:
+        errors.append("At least one entry rule is required (long_entry_rules or short_entry_rules)")
 
-    if normalized_long_entry and not normalized_long_exits:
-        errors.append("At least one long exit rule is required when long_entry_rule is set")
+    if normalized_long_entries and not normalized_long_exits:
+        errors.append("At least one long exit rule is required when long_entry_rules are set")
 
-    if normalized_short_entry and not normalized_short_exits:
-        errors.append("At least one short exit rule is required when short_entry_rule is set")
+    if normalized_short_entries and not normalized_short_exits:
+        errors.append("At least one short exit rule is required when short_entry_rules are set")
 
     if not errors and not normalized_long_exits and not normalized_short_exits:
         errors.append("At least one exit rule is required")
@@ -290,12 +314,12 @@ def validate_strategy_v2(
     if errors:
         return StrategyValidationResult(valid=False, errors=errors)
 
-    if normalized_long_entry:
+    for idx, rule in enumerate(normalized_long_entries):
         try:
-            long_entry_ast = parse_rule(normalized_long_entry)
-            errors.extend([f"long_entry: {err}" for err in validate_rule_ast(long_entry_ast)])
+            long_entry_ast = parse_rule(rule)
+            errors.extend([f"long_entry[{idx + 1}]: {err}" for err in validate_rule_ast(long_entry_ast)])
         except ValueError as exc:
-            errors.append(f"long_entry: {exc}")
+            errors.append(f"long_entry[{idx + 1}]: {exc}")
 
     for idx, rule in enumerate(normalized_long_exits):
         try:
@@ -304,12 +328,12 @@ def validate_strategy_v2(
         except ValueError as exc:
             errors.append(f"long_exit[{idx + 1}]: {exc}")
 
-    if normalized_short_entry:
+    for idx, rule in enumerate(normalized_short_entries):
         try:
-            short_entry_ast = parse_rule(normalized_short_entry)
-            errors.extend([f"short_entry: {err}" for err in validate_rule_ast(short_entry_ast)])
+            short_entry_ast = parse_rule(rule)
+            errors.extend([f"short_entry[{idx + 1}]: {err}" for err in validate_rule_ast(short_entry_ast)])
         except ValueError as exc:
-            errors.append(f"short_entry: {exc}")
+            errors.append(f"short_entry[{idx + 1}]: {exc}")
 
     for idx, rule in enumerate(normalized_short_exits):
         try:
@@ -338,7 +362,41 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
-def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bull_trade: bool, in_bear_trade: bool, history: deque | None = None) -> float:
+def _resolve_position_value(identifier: str, resolver: dict[str, Any], position_side: str | None) -> float | None:
+    side = (position_side or "").lower()
+    if side not in {"long", "short"}:
+        return None
+
+    normalized = identifier.upper()
+    if side == "long":
+        key_map = {
+            "SHARES_HELD": "_long_shares_held",
+            "ENTRY_PRICE": "_long_entry_price",
+            "UNREALIZED_PNL": "_long_unrealized_pnl",
+        }
+    else:
+        key_map = {
+            "SHARES_HELD": "_short_shares_held",
+            "ENTRY_PRICE": "_short_entry_price",
+            "UNREALIZED_PNL": "_short_unrealized_pnl",
+        }
+
+    hidden_key = key_map.get(normalized)
+    if hidden_key is None:
+        return None
+
+    numeric = _to_float(resolver.get(hidden_key))
+    return numeric if numeric is not None else 0.0
+
+
+def _evaluate_value(
+    value_node: dict[str, Any],
+    resolver: dict[str, Any],
+    in_bull_trade: bool,
+    in_bear_trade: bool,
+    history: deque | None = None,
+    position_side: str | None = None,
+) -> float:
     value_type = value_node.get("type")
     if value_type == "number":
         return float(value_node["value"])
@@ -349,6 +407,10 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
             return 1.0 if in_bull_trade else 0.0
         if identifier.upper() == "IN_BEAR_TRADE":
             return 1.0 if in_bear_trade else 0.0
+
+        position_value = _resolve_position_value(identifier, resolver, position_side)
+        if position_value is not None:
+            return position_value
 
         resolved = resolver.get(identifier)
         numeric = _to_float(resolved)
@@ -377,6 +439,10 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
             return 1.0 if historical_context.get("_in_bull_trade", False) else 0.0
         if identifier.upper() == "IN_BEAR_TRADE":
             return 1.0 if historical_context.get("_in_bear_trade", False) else 0.0
+
+        position_value = _resolve_position_value(identifier, historical_context, position_side)
+        if position_value is not None:
+            return position_value
         
         resolved = historical_context.get(identifier)
         numeric = _to_float(resolved)
@@ -385,8 +451,8 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
         return numeric
 
     if value_type == "arithmetic":
-        left = _evaluate_value(value_node["left"], resolver, in_bull_trade, in_bear_trade, history)
-        right = _evaluate_value(value_node["right"], resolver, in_bull_trade, in_bear_trade, history)
+        left = _evaluate_value(value_node["left"], resolver, in_bull_trade, in_bear_trade, history, position_side)
+        right = _evaluate_value(value_node["right"], resolver, in_bull_trade, in_bear_trade, history, position_side)
         operator = value_node.get("operator")
         if operator == "+":
             return left + right
@@ -417,8 +483,8 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
                 return 0.0
             
             # Evaluate both arguments at current and previous bars
-            current_a = _evaluate_value(args[0], resolver, in_bull_trade, in_bear_trade, history)
-            current_b = _evaluate_value(args[1], resolver, in_bull_trade, in_bear_trade, history)
+            current_a = _evaluate_value(args[0], resolver, in_bull_trade, in_bear_trade, history, position_side)
+            current_b = _evaluate_value(args[1], resolver, in_bull_trade, in_bear_trade, history, position_side)
             
             # Get previous context
             prev_context = history[-2]
@@ -428,8 +494,8 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
             # Create a temporary history for previous bar evaluation (exclude current)
             prev_history = deque(list(history)[:-1], maxlen=history.maxlen)
             
-            prev_a = _evaluate_value(args[0], prev_context, prev_in_bull, prev_in_bear, prev_history)
-            prev_b = _evaluate_value(args[1], prev_context, prev_in_bull, prev_in_bear, prev_history)
+            prev_a = _evaluate_value(args[0], prev_context, prev_in_bull, prev_in_bear, prev_history, position_side)
+            prev_b = _evaluate_value(args[1], prev_context, prev_in_bull, prev_in_bear, prev_history, position_side)
             
             if func_name in {"CROSSES_ABOVE", "CROSSED_ABOVE"}:
                 # Cross above: current A > B and previous A <= B
@@ -438,22 +504,8 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
                 # Cross below: current A < B and previous A >= B
                 return 1.0 if (current_a < current_b and prev_a >= prev_b) else 0.0
         
-        # Regular functions
-        evaluated_args = [_evaluate_value(arg, resolver, in_bull_trade, in_bear_trade, history) for arg in args]
-        
-        if func_name == "MIN":
-            if not evaluated_args:
-                raise ValueError("MIN function requires at least one argument")
-            return min(evaluated_args)
-        if func_name == "MAX":
-            if not evaluated_args:
-                raise ValueError("MAX function requires at least one argument")
-            return max(evaluated_args)
-        if func_name == "ABS":
-            if len(evaluated_args) != 1:
-                raise ValueError("ABS function requires exactly one argument")
-            return abs(evaluated_args[0])
-        
+        # Functions that take expression (boolean) arguments must be dispatched
+        # before evaluated_args — passing a compare/bool node to _evaluate_value fails.
         if func_name == "BARS_SINCE":
             if len(args) != 1:
                 raise ValueError("BARS_SINCE function requires exactly 1 argument (condition)")
@@ -462,7 +514,7 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
             
             # Check if condition is true now (at current bar)
             try:
-                if _evaluate_expression(args[0], resolver, in_bull_trade, in_bear_trade, history):
+                if _evaluate_expression(args[0], resolver, in_bull_trade, in_bear_trade, history, position_side):
                     return 0.0
             except ValueError:
                 pass
@@ -477,7 +529,7 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
                 temp_history = deque(list(history)[:-(i)], maxlen=history.maxlen) if i > 0 else history
                 
                 try:
-                    if _evaluate_expression(args[0], hist_context, hist_in_bull, hist_in_bear, temp_history):
+                    if _evaluate_expression(args[0], hist_context, hist_in_bull, hist_in_bear, temp_history, position_side):
                         return float(i)
                 except ValueError:
                     # If evaluation fails, continue searching
@@ -485,27 +537,89 @@ def _evaluate_value(value_node: dict[str, Any], resolver: dict[str, Any], in_bul
             
             # Condition never met in available history
             return 999999.0
-        
+
+        if func_name in {"LONG_ENTRIES_SINCE", "SHORT_ENTRIES_SINCE"}:
+            if len(args) != 1:
+                raise ValueError(f"{func_name} requires exactly 1 argument (condition)")
+            if history is None or len(history) < 2:
+                return 999999.0
+
+            entry_key = "_long_entry_taken" if func_name == "LONG_ENTRIES_SINCE" else "_short_entry_taken"
+            history_list = list(history)
+
+            # Walk backward to find the most recent false→true transition of the condition
+            trigger_bar_index = None
+            for i in range(len(history_list) - 1, 0, -1):
+                curr = history_list[i]
+                prev = history_list[i - 1]
+                curr_in_bull = curr.get("_in_bull_trade", False)
+                curr_in_bear = curr.get("_in_bear_trade", False)
+                prev_in_bull = prev.get("_in_bull_trade", False)
+                prev_in_bear = prev.get("_in_bear_trade", False)
+                try:
+                    temp_curr = deque(history_list[:i + 1], maxlen=history.maxlen)
+                    temp_prev = deque(history_list[:i], maxlen=history.maxlen)
+                    curr_val = _evaluate_expression(args[0], curr, curr_in_bull, curr_in_bear, temp_curr, position_side)
+                    prev_val = _evaluate_expression(args[0], prev, prev_in_bull, prev_in_bear, temp_prev, position_side)
+                except ValueError:
+                    continue
+                if curr_val and not prev_val:
+                    trigger_bar_index = i
+                    break
+
+            if trigger_bar_index is None:
+                return 999999.0
+
+            # Count entries taken from the trigger bar onward (inclusive)
+            count = sum(1 for bar in history_list[trigger_bar_index:] if bar.get(entry_key, False))
+            return float(count)
+
+        # Regular numeric functions (args are all numeric values)
+        evaluated_args = [
+            _evaluate_value(arg, resolver, in_bull_trade, in_bear_trade, history, position_side)
+            for arg in args
+        ]
+
+        if func_name == "MIN":
+            if not evaluated_args:
+                raise ValueError("MIN function requires at least one argument")
+            return min(evaluated_args)
+        if func_name == "MAX":
+            if not evaluated_args:
+                raise ValueError("MAX function requires at least one argument")
+            return max(evaluated_args)
+        if func_name == "ABS":
+            if len(evaluated_args) != 1:
+                raise ValueError("ABS function requires exactly one argument")
+            return abs(evaluated_args[0])
+
         raise ValueError(f"Unknown function '{func_name}'")
 
     raise ValueError(f"Unexpected value node type '{value_type}'")
 
 
-def _evaluate_expression(node: dict[str, Any], resolver: dict[str, Any], in_bull_trade: bool, in_bear_trade: bool = False, history: deque | None = None) -> bool:
+def _evaluate_expression(
+    node: dict[str, Any],
+    resolver: dict[str, Any],
+    in_bull_trade: bool,
+    in_bear_trade: bool = False,
+    history: deque | None = None,
+    position_side: str | None = None,
+) -> bool:
     node_type = node.get("type")
 
     if node_type == "and":
-        return _evaluate_expression(node["left"], resolver, in_bull_trade, in_bear_trade, history) and _evaluate_expression(
-            node["right"], resolver, in_bull_trade, in_bear_trade, history
+        return _evaluate_expression(node["left"], resolver, in_bull_trade, in_bear_trade, history, position_side) and _evaluate_expression(
+            node["right"], resolver, in_bull_trade, in_bear_trade, history, position_side
         )
 
     if node_type == "or":
-        return _evaluate_expression(node["left"], resolver, in_bull_trade, in_bear_trade, history) or _evaluate_expression(
-            node["right"], resolver, in_bull_trade, in_bear_trade, history
+        return _evaluate_expression(node["left"], resolver, in_bull_trade, in_bear_trade, history, position_side) or _evaluate_expression(
+            node["right"], resolver, in_bull_trade, in_bear_trade, history, position_side
         )
 
     if node_type == "not":
-        return not _evaluate_expression(node["operand"], resolver, in_bull_trade, in_bear_trade, history)
+        return not _evaluate_expression(node["operand"], resolver, in_bull_trade, in_bear_trade, history, position_side)
 
     if node_type == "bool_identifier":
         identifier = str(node.get("name", "")).upper()
@@ -516,8 +630,8 @@ def _evaluate_expression(node: dict[str, Any], resolver: dict[str, Any], in_bull
         return False
 
     if node_type == "compare":
-        left = _evaluate_value(node["left"], resolver, in_bull_trade, in_bear_trade, history)
-        right = _evaluate_value(node["right"], resolver, in_bull_trade, in_bear_trade, history)
+        left = _evaluate_value(node["left"], resolver, in_bull_trade, in_bear_trade, history, position_side)
+        right = _evaluate_value(node["right"], resolver, in_bull_trade, in_bear_trade, history, position_side)
         operator = node.get("operator")
         if operator == ">":
             return left > right
@@ -533,6 +647,13 @@ def _evaluate_expression(node: dict[str, Any], resolver: dict[str, Any], in_bull
             return abs(left - right) >= 1e-9  # Float inequality with tolerance
         raise ValueError(f"Unsupported comparator '{operator}'")
 
+    if node_type == "identifier":
+        identifier = str(node.get("name", ""))
+        raise ValueError(
+            f"Identifier '{identifier}' is not supported as a boolean expression. "
+            "Use a comparison (e.g. VAR > 0) or IN_BULL_TRADE / IN_BEAR_TRADE."
+        )
+
     # Special handling for WITHIN as an expression-level construct
     if node_type == "function":
         func_name = str(node.get("name", "")).upper()
@@ -545,7 +666,7 @@ def _evaluate_expression(node: dict[str, Any], resolver: dict[str, Any], in_bull
                 return False
             
             # Second argument must evaluate to a number (bars count)
-            bars_value = _evaluate_value(args[1], resolver, in_bull_trade, in_bear_trade, history)
+            bars_value = _evaluate_value(args[1], resolver, in_bull_trade, in_bear_trade, history, position_side)
             bars = int(bars_value)
             
             if bars < 1:
@@ -564,7 +685,7 @@ def _evaluate_expression(node: dict[str, Any], resolver: dict[str, Any], in_bull
                 temp_history = deque(list(history)[:-(i)], maxlen=history.maxlen) if i > 0 else history
                 
                 try:
-                    if _evaluate_expression(args[0], hist_context, hist_in_bull, hist_in_bear, temp_history):
+                    if _evaluate_expression(args[0], hist_context, hist_in_bull, hist_in_bear, temp_history, position_side):
                         return True
                 except ValueError:
                     # If evaluation fails for a historical bar, skip it
@@ -573,7 +694,7 @@ def _evaluate_expression(node: dict[str, Any], resolver: dict[str, Any], in_bull
             return False
         
         # For other functions used as boolean expressions, evaluate as value != 0
-        result = _evaluate_value(node, resolver, in_bull_trade, in_bear_trade, history)
+        result = _evaluate_value(node, resolver, in_bull_trade, in_bear_trade, history, position_side)
         return result != 0.0
 
     raise ValueError(f"Unsupported expression node type '{node_type}'")
@@ -588,6 +709,19 @@ def _build_indicator_variable_maps(data_store: SessionDataStore) -> dict[str, di
         agent = agent_manager.get_agent(agent_id)
         if not agent:
             continue
+
+        records_for_agent = [
+            record
+            for (source_agent_id, _record_id), record in data_store.latest_non_ohlc_by_key.items()
+            if source_agent_id == agent_id
+        ]
+
+        configured_output_ids = {
+            str(output.get("output_id"))
+            for output in agent.config.outputs
+            if output.get("output_id") is not None
+        }
+        requires_output_id_disambiguation = len(configured_output_ids) > 1
 
         output_configs: list[tuple[str, str | None, str]] = []
         for output in agent.config.outputs:
@@ -609,21 +743,63 @@ def _build_indicator_variable_maps(data_store: SessionDataStore) -> dict[str, di
                 continue
 
             if schema == "area":
-                base_name = build_variable_name(agent.config.agent_name, output)
                 for field in ("upper", "lower"):
-                    variable_name = f"{base_name}:{field}"
+                    variable_name = build_area_field_variable_name(
+                        agent.config.agent_name,
+                        output,
+                        field,
+                    )
                     output_configs.append((variable_name, str(output_id) if output_id else None, field))
                     variables_by_name[variable_name] = {}
+
+                    legacy_variable_name = build_area_field_legacy_variable_name(
+                        agent.config.agent_name,
+                        output,
+                        field,
+                    )
+                    if legacy_variable_name != variable_name:
+                        output_configs.append((legacy_variable_name, str(output_id) if output_id else None, field))
+                        variables_by_name[legacy_variable_name] = {}
+
+                metadata_keys: set[str] = set()
+                for record in records_for_agent:
+                    record_output_id = record.get("output_id")
+                    if output_id and record_output_id and str(record_output_id) != str(output_id):
+                        continue
+
+                    metadata = record.get("metadata")
+                    if not isinstance(metadata, dict):
+                        continue
+
+                    for metadata_key, metadata_value in metadata.items():
+                        if isinstance(metadata_value, bool):
+                            continue
+                        if isinstance(metadata_value, (int, float)):
+                            metadata_keys.add(str(metadata_key))
+
+                for metadata_key in sorted(metadata_keys):
+                    variable_name = build_area_metadata_variable_name(
+                        agent.config.agent_name,
+                        output,
+                        metadata_key,
+                    )
+                    output_configs.append((variable_name, str(output_id) if output_id else None, f"metadata:{metadata_key}"))
+                    variables_by_name[variable_name] = {}
+
+                    legacy_variable_name = build_area_metadata_legacy_variable_name(
+                        agent.config.agent_name,
+                        output,
+                        metadata_key,
+                    )
+                    if legacy_variable_name != variable_name:
+                        output_configs.append((legacy_variable_name, str(output_id) if output_id else None, f"metadata:{metadata_key}"))
+                        variables_by_name[legacy_variable_name] = {}
                 continue
 
         if not output_configs:
             continue
 
-        has_multiple_outputs = len(output_configs) > 1
-
-        for (source_agent_id, _record_id), record in data_store.latest_non_ohlc_by_key.items():
-            if source_agent_id != agent_id:
-                continue
+        for record in records_for_agent:
 
             ts = str(record.get("ts", "")).strip()
             if not ts:
@@ -635,9 +811,18 @@ def _build_indicator_variable_maps(data_store: SessionDataStore) -> dict[str, di
             for variable_name, configured_output_id, field_name in output_configs:
                 if configured_output_id and record_output_id and configured_output_id != record_output_id:
                     continue
-                if has_multiple_outputs and configured_output_id and record_output_id is None:
+                if requires_output_id_disambiguation and configured_output_id and record_output_id is None:
                     continue
-                source_value = record.get(field_name)
+
+                source_value = None
+                if field_name.startswith("metadata:"):
+                    metadata_field = field_name.split(":", 1)[1]
+                    metadata_obj = record.get("metadata")
+                    if isinstance(metadata_obj, dict):
+                        source_value = metadata_obj.get(metadata_field)
+                else:
+                    source_value = record.get(field_name)
+
                 source_numeric = _to_float(source_value)
                 if source_numeric is None:
                     if field_name != "value":
@@ -650,32 +835,231 @@ def _build_indicator_variable_maps(data_store: SessionDataStore) -> dict[str, di
     return variables_by_name
 
 
+def _build_position_context(
+    *,
+    close_price: float,
+    long_shares: int,
+    long_entry_price: float,
+    long_entry_shares: int,
+    short_shares: int,
+    short_entry_price: float,
+    short_entry_shares: int,
+) -> dict[str, float]:
+    in_long = long_shares > 0 and long_entry_shares > 0 and long_entry_price > 0
+    in_short = short_shares > 0 and short_entry_shares > 0 and short_entry_price > 0
+
+    long_unrealized_pnl = (close_price - long_entry_price) * long_entry_shares if in_long else 0.0
+    short_unrealized_pnl = (short_entry_price - close_price) * short_entry_shares if in_short else 0.0
+
+    public_shares_held = 0.0
+    public_entry_price = 0.0
+    public_unrealized_pnl = 0.0
+    if in_long and not in_short:
+        public_shares_held = float(long_shares)
+        public_entry_price = float(long_entry_price)
+        public_unrealized_pnl = float(long_unrealized_pnl)
+    elif in_short and not in_long:
+        public_shares_held = float(-short_shares)
+        public_entry_price = float(short_entry_price)
+        public_unrealized_pnl = float(short_unrealized_pnl)
+
+    return {
+        "SHARES_HELD": public_shares_held,
+        "ENTRY_PRICE": public_entry_price,
+        "UNREALIZED_PNL": public_unrealized_pnl,
+        "_long_shares_held": float(long_shares) if in_long else 0.0,
+        "_long_entry_price": float(long_entry_price) if in_long else 0.0,
+        "_long_unrealized_pnl": float(long_unrealized_pnl),
+        "_short_shares_held": float(-short_shares) if in_short else 0.0,
+        "_short_entry_price": float(short_entry_price) if in_short else 0.0,
+        "_short_unrealized_pnl": float(short_unrealized_pnl),
+    }
+
+
+def _compute_equity(cash: float, long_shares: int, short_shares: int, fill_price: float) -> float:
+    return cash + (long_shares * fill_price) - (short_shares * fill_price)
+
+
+def _is_boolean_expression_node(node: dict[str, Any]) -> bool:
+    node_type = str(node.get("type") or "")
+    if node_type in {"and", "or", "not", "compare", "bool_identifier"}:
+        return True
+    if node_type == "function":
+        func_name = str(node.get("name") or "").upper()
+        return func_name == "WITHIN"
+    return False
+
+
+def evaluate_research_expression(
+    session_id: str,
+    expression: str,
+    output_schema: str,
+    data_store: SessionDataStore,
+) -> dict[str, Any]:
+    normalized_expression = expression.strip()
+    if not normalized_expression:
+        raise ValueError("Expression is required")
+
+    normalized_schema = output_schema.strip().lower()
+    if normalized_schema not in {"line", "area", "histogram"}:
+        raise ValueError("Unsupported output schema. Expected one of: line, area, histogram")
+
+    ast = parse_rule(normalized_expression)
+    candles = list(data_store.latest_by_candle_id.values())
+    candles.sort(key=lambda candle: candle.get("ts", ""))
+
+    indicator_values = _build_indicator_variable_maps(data_store)
+    records: list[dict[str, Any]] = []
+
+    max_history = 200
+    context_history: deque[dict[str, Any]] = deque(maxlen=max_history)
+    daily_pnl = 0.0
+    current_day_et: Any = None
+
+    for candle in candles:
+        candle_id = str(candle.get("id", "")).strip()
+        candle_ts = str(candle.get("ts", "")).strip()
+        if not candle_id or not candle_ts:
+            continue
+
+        open_price = float(candle.get("open") or 0)
+        high_price = float(candle.get("high") or 0)
+        low_price = float(candle.get("low") or 0)
+        close_price = float(candle.get("close") or 0)
+        volume = float(candle.get("volume") or 0)
+
+        body = abs(close_price - open_price)
+        range_val = high_price - low_price
+        upper_wick = high_price - max(open_price, close_price)
+        lower_wick = min(open_price, close_price) - low_price
+
+        candle_date_et = None
+        try:
+            dt_utc = datetime.fromisoformat(candle_ts.replace('Z', '+00:00'))
+            dt_et = dt_utc.astimezone(ZoneInfo("America/New_York"))
+            hour_et = dt_et.hour
+            minute_et = dt_et.minute
+            time_hhmm = hour_et * 100 + minute_et
+            candle_date_et = dt_et.date()
+        except (ValueError, KeyError, OSError):
+            hour_et = 0
+            minute_et = 0
+            time_hhmm = 0
+
+        if candle_date_et is not None:
+            if current_day_et is None:
+                current_day_et = candle_date_et
+            elif candle_date_et != current_day_et:
+                daily_pnl = 0.0
+                current_day_et = candle_date_et
+
+        context: dict[str, Any] = {
+            "OPEN": open_price,
+            "HIGH": high_price,
+            "LOW": low_price,
+            "CLOSE": close_price,
+            "VOLUME": volume,
+            "BODY": body,
+            "RANGE": range_val,
+            "UPPER_WICK": upper_wick,
+            "LOWER_WICK": lower_wick,
+            "TIME": time_hhmm,
+            "HOUR": hour_et,
+            "MINUTE": minute_et,
+            "DAILY_PNL": daily_pnl,
+        }
+        context.update(
+            _build_position_context(
+                close_price=close_price,
+                long_shares=0,
+                long_entry_price=0.0,
+                long_entry_shares=0,
+                short_shares=0,
+                short_entry_price=0.0,
+                short_entry_shares=0,
+            )
+        )
+
+        for variable_name, values_by_candle_id in indicator_values.items():
+            context[variable_name] = values_by_candle_id.get(candle_ts) or values_by_candle_id.get(candle_id)
+
+        context["_in_bull_trade"] = False
+        context["_in_bear_trade"] = False
+        context_history.append(context.copy())
+        context_history[-1]["_long_entry_taken"] = False
+        context_history[-1]["_short_entry_taken"] = False
+
+        try:
+            if _is_boolean_expression_node(ast):
+                numeric_value = 1.0 if _evaluate_expression(ast, context, False, False, context_history, None) else 0.0
+            else:
+                numeric_value = _evaluate_value(ast, context, False, False, context_history, None)
+        except ValueError as exc:
+            error_msg = str(exc)
+            if "is not available or non-numeric" in error_msg:
+                continue
+            if "exceeds available history" in error_msg:
+                continue
+            raise
+
+        base_record: dict[str, Any] = {
+            "id": f"research-{normalized_schema}-{session_id}-{candle_id}",
+            "ts": candle_ts,
+            "metadata": {"subgraph": True},
+        }
+
+        if normalized_schema == "area":
+            base_record["upper"] = max(float(numeric_value), 0.0)
+            base_record["lower"] = min(float(numeric_value), 0.0)
+        else:
+            base_record["value"] = float(numeric_value)
+
+        records.append(base_record)
+
+    return {
+        "session_id": session_id,
+        "expression": normalized_expression,
+        "schema": normalized_schema,
+        "records": records,
+        "count": len(records),
+    }
+
+
 def evaluate_strategy(
     session_id: str,
     strategy_name: str,
-    long_entry_rule: str,
-    long_exit_rules: list[str],
-    data_store: SessionDataStore,
-    short_entry_rule: str = "",
+    long_entry_rules: list[str] | None = None,
+    long_exit_rules: list[str] | None = None,
+    data_store: SessionDataStore | None = None,
+    short_entry_rules: list[str] | None = None,
     short_exit_rules: list[str] | None = None,
+    # Backward compatibility: accept single-string format
+    long_entry_rule: str = "",
+    short_entry_rule: str = "",
 ) -> dict[str, Any]:
-    normalized_long_entry = long_entry_rule.strip()
-    normalized_long_exits = [rule.strip() for rule in long_exit_rules if rule and rule.strip()]
-    normalized_short_entry = short_entry_rule.strip()
+    # Support both new array format and old single-string format
+    if long_entry_rule and not long_entry_rules:
+        long_entry_rules = [long_entry_rule]
+    if short_entry_rule and not short_entry_rules:
+        short_entry_rules = [short_entry_rule]
+        
+    normalized_long_entries = [rule.strip() for rule in (long_entry_rules or []) if rule and rule.strip()]
+    normalized_long_exits = [rule.strip() for rule in (long_exit_rules or []) if rule and rule.strip()]
+    normalized_short_entries = [rule.strip() for rule in (short_entry_rules or []) if rule and rule.strip()]
     normalized_short_exits = [rule.strip() for rule in (short_exit_rules or []) if rule and rule.strip()]
 
     validation = validate_strategy_v2(
-        long_entry_rule=normalized_long_entry,
+        long_entry_rules=normalized_long_entries,
         long_exit_rules=normalized_long_exits,
-        short_entry_rule=normalized_short_entry,
+        short_entry_rules=normalized_short_entries,
         short_exit_rules=normalized_short_exits,
     )
     if not validation.valid:
         raise ValueError("; ".join(validation.errors))
 
-    long_entry_ast = parse_rule(normalized_long_entry) if normalized_long_entry else None
+    long_entry_asts = [parse_rule(rule) for rule in normalized_long_entries]
     long_exit_asts = [parse_rule(rule) for rule in normalized_long_exits]
-    short_entry_ast = parse_rule(normalized_short_entry) if normalized_short_entry else None
+    short_entry_asts = [parse_rule(rule) for rule in normalized_short_entries]
     short_exit_asts = [parse_rule(rule) for rule in normalized_short_exits]
 
     candles = list(data_store.latest_by_candle_id.values())
@@ -689,13 +1073,18 @@ def evaluate_strategy(
     starting_capital = 10000.0
     lot_size = 100
     cash = starting_capital
-    shares = 0
-    entry_price = 0.0
-    entry_shares = 0
+    long_shares = 0
+    long_entry_price = 0.0
+    long_entry_shares = 0
+    short_shares = 0
+    short_entry_price = 0.0
+    short_entry_shares = 0
     closed_trade_pnls: list[float] = []
     closed_trade_returns: list[float] = []
     equity_curve: list[dict[str, Any]] = []
-    
+    daily_pnl = 0.0
+    current_day_et: Any = None
+
     # Historical context for lookback support (keep last 200 bars)
     max_history = 200
     context_history: deque[dict[str, Any]] = deque(maxlen=max_history)
@@ -719,17 +1108,27 @@ def evaluate_strategy(
         lower_wick = min(open_price, close_price) - low_price
         
         # Time-based variables (Eastern Time for market hours)
+        candle_date_et = None
         try:
             dt_utc = datetime.fromisoformat(candle_ts.replace('Z', '+00:00'))
             dt_et = dt_utc.astimezone(ZoneInfo("America/New_York"))
             hour_et = dt_et.hour
             minute_et = dt_et.minute
             time_hhmm = hour_et * 100 + minute_et
+            candle_date_et = dt_et.date()
         except (ValueError, KeyError, OSError):
             # If timestamp parsing fails, set to 0
             hour_et = 0
             minute_et = 0
             time_hhmm = 0
+
+        # Daily P&L reset on new trading day (Eastern Time)
+        if candle_date_et is not None:
+            if current_day_et is None:
+                current_day_et = candle_date_et
+            elif candle_date_et != current_day_et:
+                daily_pnl = 0.0
+                current_day_et = candle_date_et
         
         context: dict[str, Any] = {
             "OPEN": open_price,
@@ -744,7 +1143,19 @@ def evaluate_strategy(
             "TIME": time_hhmm,
             "HOUR": hour_et,
             "MINUTE": minute_et,
+            "DAILY_PNL": daily_pnl,
         }
+        context.update(
+            _build_position_context(
+                close_price=close_price,
+                long_shares=long_shares,
+                long_entry_price=long_entry_price,
+                long_entry_shares=long_entry_shares,
+                short_shares=short_shares,
+                short_entry_price=short_entry_price,
+                short_entry_shares=short_entry_shares,
+            )
+        )
 
         for variable_name, values_by_candle_id in indicator_values.items():
             context[variable_name] = values_by_candle_id.get(candle_ts) or values_by_candle_id.get(candle_id)
@@ -752,27 +1163,29 @@ def evaluate_strategy(
         # Store state in context for historical lookback
         context["_in_bull_trade"] = in_bull_trade
         context["_in_bear_trade"] = in_bear_trade
-        
+
         # Add current context to history
         context_history.append(context.copy())
 
+        # Track whether entries were actually executed this bar (back-filled after actions)
+        long_entry_executed = False
+        short_entry_executed = False
+
         try:
-            long_entry_match = (
-                _evaluate_expression(long_entry_ast, context, in_bull_trade, in_bear_trade, context_history)
-                if long_entry_ast
-                else False
+            long_entry_match = any(
+                _evaluate_expression(ast, context, in_bull_trade, in_bear_trade, context_history, "long")
+                for ast in long_entry_asts
             )
             long_exit_match = any(
-                _evaluate_expression(ast, context, in_bull_trade, in_bear_trade, context_history)
+                _evaluate_expression(ast, context, in_bull_trade, in_bear_trade, context_history, "long")
                 for ast in long_exit_asts
             )
-            short_entry_match = (
-                _evaluate_expression(short_entry_ast, context, in_bull_trade, in_bear_trade, context_history)
-                if short_entry_ast
-                else False
+            short_entry_match = any(
+                _evaluate_expression(ast, context, in_bull_trade, in_bear_trade, context_history, "short")
+                for ast in short_entry_asts
             )
             short_exit_match = any(
-                _evaluate_expression(ast, context, in_bull_trade, in_bear_trade, context_history)
+                _evaluate_expression(ast, context, in_bull_trade, in_bear_trade, context_history, "short")
                 for ast in short_exit_asts
             )
         except ValueError as exc:
@@ -790,10 +1203,86 @@ def evaluate_strategy(
         ts = str(candle.get("ts") or _now_iso())
         fill_price = float(candle.get("close") or 0)
 
-        if not in_bull_trade and not in_bear_trade and long_entry_match:
+        if long_exit_match and in_bull_trade:
+            in_bull_trade = False
+            logger.info(
+                "[TradeEngine] LONG EXIT SIGNAL ts=%s shares=%d",
+                ts, long_shares
+            )
+            if long_shares > 0 and long_entry_shares > 0:
+                cash += long_shares * fill_price
+                pnl = (fill_price - long_entry_price) * long_entry_shares
+                invested = long_entry_price * long_entry_shares
+                if invested > 0:
+                    closed_trade_returns.append(pnl / invested)
+                closed_trade_pnls.append(pnl)
+                daily_pnl += pnl
+                logger.info(
+                    "[TradeEngine] LONG EXIT EXECUTED shares=%d exit_price=%.2f entry_price=%.2f pnl=%.2f new_cash=%.2f",
+                    long_entry_shares, fill_price, long_entry_price, pnl, cash
+                )
+                long_shares = 0
+                long_entry_price = 0.0
+                long_entry_shares = 0
+            else:
+                logger.warning(
+                    "[TradeEngine] LONG EXIT SKIPPED - no shares held (entry was likely skipped)"
+                )
+            markers.append(
+                {
+                    "id": f"trade-long-exit-{session_id}-{candle_id}",
+                    "candle_id": candle_id,
+                    "ts": ts,
+                    "title": "LONG EXIT",
+                    "description": f"{strategy_name} long exit",
+                    "severity": "warning",
+                    "action": "LONG_EXIT",
+                }
+            )
+
+        if short_exit_match and in_bear_trade:
+            in_bear_trade = False
+            logger.info(
+                "[TradeEngine] SHORT EXIT SIGNAL ts=%s shares=%d",
+                ts, short_shares
+            )
+            if short_shares > 0 and short_entry_shares > 0:
+                cash -= short_entry_shares * fill_price
+                pnl = (short_entry_price - fill_price) * short_entry_shares
+                invested = short_entry_price * short_entry_shares
+                if invested > 0:
+                    closed_trade_returns.append(pnl / invested)
+                closed_trade_pnls.append(pnl)
+                daily_pnl += pnl
+                logger.info(
+                    "[TradeEngine] SHORT EXIT EXECUTED shares=%d exit_price=%.2f entry_price=%.2f pnl=%.2f cash=%.2f",
+                    short_entry_shares, fill_price, short_entry_price, pnl, cash
+                )
+                short_shares = 0
+                short_entry_price = 0.0
+                short_entry_shares = 0
+            else:
+                logger.warning(
+                    "[TradeEngine] SHORT EXIT SKIPPED - no short shares held"
+                )
+            markers.append(
+                {
+                    "id": f"trade-short-exit-{session_id}-{candle_id}",
+                    "candle_id": candle_id,
+                    "ts": ts,
+                    "title": "SHORT EXIT",
+                    "description": f"{strategy_name} short exit",
+                    "severity": "warning",
+                    "action": "SHORT_EXIT",
+                }
+            )
+
+        if long_entry_match and not in_bull_trade:
             in_bull_trade = True
+            long_entry_executed = True
             share_cost = fill_price
-            quantity = int(cash // share_cost) if share_cost > 0 else 0
+            buying_power = _compute_equity(cash, long_shares, short_shares, fill_price)
+            quantity = int(buying_power // share_cost) if share_cost > 0 else 0
 
             logger.info(
                 "[TradeEngine] LONG ENTRY SIGNAL ts=%s close=%.2f cash=%.2f quantity=%d",
@@ -802,12 +1291,12 @@ def evaluate_strategy(
             
             if quantity > 0:
                 cash -= quantity * fill_price
-                shares = quantity
-                entry_price = fill_price
-                entry_shares = quantity
+                long_shares = quantity
+                long_entry_price = fill_price
+                long_entry_shares = quantity
                 logger.info(
                     "[TradeEngine] LONG ENTRY EXECUTED shares=%d entry_price=%.2f cost=%.2f remaining_cash=%.2f",
-                    entry_shares, entry_price, entry_shares * entry_price, cash
+                    long_entry_shares, long_entry_price, long_entry_shares * long_entry_price, cash
                 )
             else:
                 logger.warning(
@@ -825,10 +1314,12 @@ def evaluate_strategy(
                     "action": "LONG_ENTRY",
                 }
             )
-        elif not in_bull_trade and not in_bear_trade and short_entry_match:
+        if short_entry_match and not in_bear_trade:
             in_bear_trade = True
+            short_entry_executed = True
             share_cost = fill_price
-            quantity = int(cash // share_cost) if share_cost > 0 else 0
+            buying_power = _compute_equity(cash, long_shares, short_shares, fill_price)
+            quantity = int(buying_power // share_cost) if share_cost > 0 else 0
 
             logger.info(
                 "[TradeEngine] SHORT ENTRY SIGNAL ts=%s close=%.2f cash=%.2f quantity=%d",
@@ -837,12 +1328,12 @@ def evaluate_strategy(
 
             if quantity > 0:
                 cash += quantity * fill_price
-                shares = -quantity
-                entry_price = fill_price
-                entry_shares = quantity
+                short_shares = quantity
+                short_entry_price = fill_price
+                short_entry_shares = quantity
                 logger.info(
                     "[TradeEngine] SHORT ENTRY EXECUTED shares=%d entry_price=%.2f proceeds=%.2f cash=%.2f",
-                    entry_shares, entry_price, entry_shares * entry_price, cash
+                    short_entry_shares, short_entry_price, short_entry_shares * short_entry_price, cash
                 )
             else:
                 logger.warning(
@@ -861,81 +1352,14 @@ def evaluate_strategy(
                     "action": "SHORT_ENTRY",
                 }
             )
-        elif long_exit_match and in_bull_trade:
-            in_bull_trade = False
-            logger.info(
-                "[TradeEngine] LONG EXIT SIGNAL ts=%s shares=%d",
-                ts, shares
-            )
-            if shares > 0:
-                cash += shares * fill_price
-                pnl = (fill_price - entry_price) * entry_shares
-                invested = entry_price * entry_shares
-                if invested > 0:
-                    closed_trade_returns.append(pnl / invested)
-                closed_trade_pnls.append(pnl)
-                logger.info(
-                    "[TradeEngine] LONG EXIT EXECUTED shares=%d exit_price=%.2f entry_price=%.2f pnl=%.2f new_cash=%.2f",
-                    entry_shares, fill_price, entry_price, pnl, cash
-                )
-                shares = 0
-                entry_price = 0.0
-                entry_shares = 0
-            else:
-                logger.warning(
-                    "[TradeEngine] LONG EXIT SKIPPED - no shares held (entry was likely skipped)"
-                )
-            markers.append(
-                {
-                    "id": f"trade-long-exit-{session_id}-{candle_id}",
-                    "candle_id": candle_id,
-                    "ts": ts,
-                    "title": "LONG EXIT",
-                    "description": f"{strategy_name} long exit",
-                    "severity": "warning",
-                    "action": "LONG_EXIT",
-                }
-            )
-        elif short_exit_match and in_bear_trade:
-            in_bear_trade = False
-            logger.info(
-                "[TradeEngine] SHORT EXIT SIGNAL ts=%s shares=%d",
-                ts, shares
-            )
-            if shares < 0 and entry_shares > 0:
-                cash -= entry_shares * fill_price
-                pnl = (entry_price - fill_price) * entry_shares
-                invested = entry_price * entry_shares
-                if invested > 0:
-                    closed_trade_returns.append(pnl / invested)
-                closed_trade_pnls.append(pnl)
-                logger.info(
-                    "[TradeEngine] SHORT EXIT EXECUTED shares=%d exit_price=%.2f entry_price=%.2f pnl=%.2f cash=%.2f",
-                    entry_shares, fill_price, entry_price, pnl, cash
-                )
-                shares = 0
-                entry_price = 0.0
-                entry_shares = 0
-            else:
-                logger.warning(
-                    "[TradeEngine] SHORT EXIT SKIPPED - no short shares held"
-                )
-            markers.append(
-                {
-                    "id": f"trade-short-exit-{session_id}-{candle_id}",
-                    "candle_id": candle_id,
-                    "ts": ts,
-                    "title": "SHORT EXIT",
-                    "description": f"{strategy_name} short exit",
-                    "severity": "warning",
-                    "action": "SHORT_EXIT",
-                }
-            )
-
         equity_curve.append({
             "ts": ts,
-            "equity": cash + shares * fill_price,
+            "equity": _compute_equity(cash, long_shares, short_shares, fill_price),
         })
+
+        # Back-fill entry execution flags into this bar's history snapshot
+        context_history[-1]["_long_entry_taken"] = long_entry_executed
+        context_history[-1]["_short_entry_taken"] = short_entry_executed
 
     final_equity = equity_curve[-1]["equity"] if equity_curve else starting_capital
     total_pl = final_equity - starting_capital
@@ -970,9 +1394,9 @@ def evaluate_strategy(
     result = {
         "session_id": session_id,
         "strategy_name": strategy_name,
-        "long_entry_rule": normalized_long_entry,
+        "long_entry_rules": normalized_long_entries,
         "long_exit_rules": normalized_long_exits,
-        "short_entry_rule": normalized_short_entry,
+        "short_entry_rules": normalized_short_entries,
         "short_exit_rules": normalized_short_exits,
         "markers": markers,
         "marker_count": len(markers),

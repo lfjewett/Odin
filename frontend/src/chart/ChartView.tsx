@@ -1,5 +1,21 @@
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import { createChart, IChartApi, ISeriesApi, Time, ISeriesPrimitive, IPrimitivePaneView, IPrimitivePaneRenderer } from "lightweight-charts";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from "react";
+import {
+  AreaSeries,
+  BarSeries,
+  CandlestickSeries,
+  createChart,
+  createSeriesMarkers,
+  HistogramSeries,
+  IChartApi,
+  ISeriesApi,
+  ISeriesMarkersPluginApi,
+  ISeriesPrimitive,
+  IPrimitivePaneRenderer,
+  IPrimitivePaneView,
+  LineSeries,
+  SeriesMarker,
+  Time,
+} from "lightweight-charts";
 import { CanvasRenderingTarget2D } from 'fancy-canvas';
 import { AreaRecord, MarketCandle, OverlayRecord, OverlaySchema } from "../types/events";
 import type { OHLCBar } from "../history/fetchHistory";
@@ -12,6 +28,21 @@ interface ChartViewProps {
   overlayData: Map<string, OverlayRecord[]>;
   overlaySchemas?: Map<string, OverlaySchema>;
   overlayLineColors?: Map<string, string>;
+  overlayAreaStyles?: Map<
+    string,
+    {
+      fillMode: "solid" | "conditional";
+      opacityPercent: number;
+      conditionalUpColor?: string;
+      conditionalDownColor?: string;
+    }
+  >;
+  /**
+   * UI-level sub-graph override map: agentId → true.
+   * When an agentId is present and set to true the overlay is forced into a
+   * dedicated sub-graph pane regardless of what the agent emits in metadata.
+   */
+  overlaySubgraphForced?: Map<string, boolean>;
   tradeMarkers?: TradeMarker[];
   selectedSymbol: string;
   selectedInterval?: string;
@@ -43,6 +74,68 @@ function overlayAgentId(seriesKey: string): string {
   return agentId || seriesKey;
 }
 
+type ChartCompatApi = IChartApi<Time> & {
+  addSeries?: (definition: any, options?: any, paneIndex?: number) => ISeriesApi<any>;
+  addAreaSeries?: (options?: any) => ISeriesApi<any>;
+  addBarSeries?: (options?: any) => ISeriesApi<any>;
+  addCandlestickSeries?: (options?: any) => ISeriesApi<any>;
+  addHistogramSeries?: (options?: any) => ISeriesApi<any>;
+  addLineSeries?: (options?: any) => ISeriesApi<any>;
+};
+
+function splitPaneOptions(options?: Record<string, unknown>): {
+  normalizedOptions: Record<string, unknown>;
+  paneIndex?: number;
+} {
+  if (!options || typeof options !== "object") {
+    return { normalizedOptions: {}, paneIndex: undefined };
+  }
+
+  const { pane, ...rest } = options as Record<string, unknown> & { pane?: unknown };
+  const paneIndex = typeof pane === "number" ? pane : undefined;
+  return { normalizedOptions: rest, paneIndex };
+}
+
+function addLineSeriesCompat(chart: ChartCompatApi, options?: Record<string, unknown>): ISeriesApi<any> {
+  const { normalizedOptions, paneIndex } = splitPaneOptions(options);
+  if (typeof chart.addSeries === "function") {
+    return chart.addSeries(LineSeries as any, normalizedOptions as any, paneIndex);
+  }
+  return chart.addLineSeries!(options as any);
+}
+
+function addAreaSeriesCompat(chart: ChartCompatApi, options?: Record<string, unknown>): ISeriesApi<any> {
+  const { normalizedOptions, paneIndex } = splitPaneOptions(options);
+  if (typeof chart.addSeries === "function") {
+    return chart.addSeries(AreaSeries as any, normalizedOptions as any, paneIndex);
+  }
+  return chart.addAreaSeries!(options as any);
+}
+
+function addBarSeriesCompat(chart: ChartCompatApi, options?: Record<string, unknown>): ISeriesApi<any> {
+  const { normalizedOptions, paneIndex } = splitPaneOptions(options);
+  if (typeof chart.addSeries === "function") {
+    return chart.addSeries(BarSeries as any, normalizedOptions as any, paneIndex);
+  }
+  return chart.addBarSeries!(options as any);
+}
+
+function addCandlestickSeriesCompat(chart: ChartCompatApi, options?: Record<string, unknown>): ISeriesApi<any> {
+  const { normalizedOptions, paneIndex } = splitPaneOptions(options);
+  if (typeof chart.addSeries === "function") {
+    return chart.addSeries(CandlestickSeries as any, normalizedOptions as any, paneIndex);
+  }
+  return chart.addCandlestickSeries!(options as any);
+}
+
+function addHistogramSeriesCompat(chart: ChartCompatApi, options?: Record<string, unknown>): ISeriesApi<any> {
+  const { normalizedOptions, paneIndex } = splitPaneOptions(options);
+  if (typeof chart.addSeries === "function") {
+    return chart.addSeries(HistogramSeries as any, normalizedOptions as any, paneIndex);
+  }
+  return chart.addHistogramSeries!(options as any);
+}
+
 interface AreaGradientStyle {
   enabled?: boolean;
   direction?: "vertical" | "horizontal";
@@ -51,10 +144,10 @@ interface AreaGradientStyle {
 }
 
 interface AreaRenderStyle {
+  fillMode: "solid" | "conditional";
   primaryColor: string;
   secondaryColor: string;
-  opacity: number;
-  transparency: number;
+  fillAlpha: number;
   gradient?: AreaGradientStyle;
 }
 
@@ -68,27 +161,88 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function readAreaRenderStyle(record: OverlayRecord | undefined, fallbackColor: string): AreaRenderStyle {
+/**
+ * Safe min/max for large arrays. Avoids spread operator which causes stack overflow
+ * with >65k items. Used for 231k+ minute candles in 1Y timeframes.
+ */
+function findMin(values: number[]): number | null {
+  if (values.length === 0) return null;
+  let result = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] < result) result = values[i];
+  }
+  return result;
+}
+
+function findMax(values: number[]): number | null {
+  if (values.length === 0) return null;
+  let result = values[0];
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] > result) result = values[i];
+  }
+  return result;
+}
+
+function normalizeLogicalRange(
+  range: { from: number; to: number } | null | undefined
+): { from: number; to: number } | null {
+  if (!range) {
+    return null;
+  }
+
+  const { from, to } = range;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) {
+    return null;
+  }
+
+  return { from, to };
+}
+
+function readAreaRenderStyle(
+  record: OverlayRecord | undefined,
+  fallbackColor: string,
+  uiStyle?: {
+    fillMode: "solid" | "conditional";
+    opacityPercent: number;
+    conditionalUpColor?: string;
+    conditionalDownColor?: string;
+  },
+  conditionalUpColor: string = "#22c55e",
+  conditionalDownColor: string = "#ef4444",
+): AreaRenderStyle {
   const metadata = record?.metadata;
   const render = (metadata && typeof metadata === "object"
     ? (metadata as Record<string, unknown>).render
     : undefined) as Record<string, unknown> | undefined;
 
-  const primaryColor = typeof render?.primary_color === "string" && render.primary_color.trim()
-    ? render.primary_color.trim()
-    : fallbackColor;
+  const fillMode = uiStyle?.fillMode === "solid"
+    ? "solid"
+    : (render?.fill_mode === "solid" ? "solid" : "conditional");
 
-  const secondaryColor = typeof render?.secondary_color === "string"
-    ? render.secondary_color.trim()
-    : "";
+  const hasPrimaryColor = typeof render?.primary_color === "string" && render.primary_color.trim().length > 0;
+  const hasSecondaryColor = typeof render?.secondary_color === "string" && render.secondary_color.trim().length > 0;
+  const primaryColorRaw = hasPrimaryColor ? String(render?.primary_color).trim() : fallbackColor;
+  const secondaryColorRaw = hasSecondaryColor ? String(render?.secondary_color).trim() : "";
 
-  const opacity = Number.isFinite(Number(render?.opacity))
-    ? clamp(Number(render?.opacity), 0, 1)
-    : 1;
+  const hasOpacity = Number.isFinite(Number(render?.opacity));
+  const hasTransparency = Number.isFinite(Number(render?.transparency));
+  const opacity = hasOpacity ? clamp(Number(render?.opacity), 0, 1) : 1;
+  const transparency = hasTransparency ? clamp(Number(render?.transparency), 0, 100) : 0;
 
-  const transparency = Number.isFinite(Number(render?.transparency))
-    ? clamp(Number(render?.transparency), 0, 100)
-    : 0;
+  const metadataAlpha = clamp(opacity * (1 - transparency / 100), 0, 1);
+  const fillAlpha = uiStyle
+    ? clamp(uiStyle.opacityPercent / 100, 0, 1)
+    : (hasOpacity || hasTransparency ? metadataAlpha : 0.5);
+
+  const resolvedUpColor = uiStyle?.conditionalUpColor || conditionalUpColor;
+  const resolvedDownColor = uiStyle?.conditionalDownColor || conditionalDownColor;
+
+  const primaryColor = fillMode === "conditional"
+    ? resolvedUpColor
+    : (primaryColorRaw || fallbackColor);
+  const secondaryColor = fillMode === "conditional"
+    ? resolvedDownColor
+    : (secondaryColorRaw || primaryColor);
 
   const gradientRaw = render?.gradient;
   const gradient = gradientRaw && typeof gradientRaw === "object"
@@ -105,10 +259,10 @@ function readAreaRenderStyle(record: OverlayRecord | undefined, fallbackColor: s
     : undefined;
 
   return {
+    fillMode,
     primaryColor,
     secondaryColor,
-    opacity,
-    transparency,
+    fillAlpha,
     gradient,
   };
 }
@@ -135,7 +289,7 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
       return;
     }
 
-    const alpha = clamp(this.style.opacity * (1 - this.style.transparency / 100), 0, 1);
+    const alpha = clamp(this.style.fillAlpha, 0, 1);
     if (alpha <= 0) {
       return;
     }
@@ -174,9 +328,9 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
         const segmentMidLower = (left.lower + right.lower) / 2;
         const isInverted = segmentMidUpper < segmentMidLower;
 
-        const baseColor = isInverted
-          ? this.style.secondaryColor
-          : this.style.primaryColor;
+        const baseColor = this.style.fillMode === "solid"
+          ? this.style.primaryColor
+          : (isInverted ? this.style.secondaryColor : this.style.primaryColor);
 
         if (!baseColor) {
           continue;
@@ -486,12 +640,79 @@ function normalizeHistoryBars(bars: OHLCBar[]): OHLCBar[] {
   });
 }
 
+/**
+ * Returns true when the overlay should be rendered in a separate sub-graph pane
+ * rather than overlaid on the main price chart.
+ *
+ * Priority order:
+ *   1. UI-level force override (overlaySubgraphForced.get(agentId) === true)
+ *   2. schema === "histogram" (always a sub-graph)
+ *   3. first record's metadata.subgraph === true  (agent opt-in, e.g. ATR)
+ */
+function isSubgraphOverlay(
+  schema: OverlaySchema,
+  records: OverlayRecord[],
+  agentId: string,
+  forcedOverrides?: Map<string, boolean>
+): boolean {
+  if (forcedOverrides?.get(agentId) === true) return true;
+  if (schema === "histogram") return true;
+  const firstRecord = records[0];
+  if (
+    firstRecord?.metadata &&
+    (firstRecord.metadata as Record<string, unknown>)["subgraph"] === true
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function readOverlayColor(record: OverlayRecord | undefined): string | null {
+  const metadata = record?.metadata as Record<string, unknown> | undefined;
+  const candidate = metadata?.color;
+  if (typeof candidate !== "string") {
+    return null;
+  }
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function hasTrendColorMode(records: OverlayRecord[]): boolean {
+  const metadata = records[0]?.metadata as Record<string, unknown> | undefined;
+  return metadata?.color_mode === "trend";
+}
+
+function resolveSubgraphPaneKey(
+  schema: OverlaySchema,
+  records: OverlayRecord[],
+  agentId: string,
+  seriesKey: string,
+): string {
+  const metadata = records[0]?.metadata as Record<string, unknown> | undefined;
+  const group = metadata?.subgraph_group;
+  if (typeof group === "string" && group.trim().length > 0) {
+    return `${agentId}::subgraph::${group.trim()}`;
+  }
+
+  if (agentId === "__research__") {
+    return `${agentId}::subgraph::1`;
+  }
+
+  if (schema === "histogram") {
+    return `${seriesKey}::hist`;
+  }
+
+  return seriesKey;
+}
+
 export function ChartView({ 
   onCandleReceived,
   onSnapshotRequested,
   overlayData,
   overlaySchemas,
   overlayLineColors,
+  overlayAreaStyles,
+  overlaySubgraphForced,
   tradeMarkers = [],
   selectedSymbol, 
   selectedInterval = "1m",
@@ -501,12 +722,73 @@ export function ChartView({
   isRightCollapsed,
   candleType = "candlestick"
 }: ChartViewProps) {
+  const SUBGRAPH_PANE_STRETCH_FACTOR = 0.5;
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<any> | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [selectedCandleDetails, setSelectedCandleDetails] = useState<MarketCandle | null>(null);
+  const [candleWindowRevision, setCandleWindowRevision] = useState(0);
+  const [historyBarCount, setHistoryBarCount] = useState(0);
+  const [visibleLogicalRange, setVisibleLogicalRange] = useState<{ from: number; to: number } | null>(null);
+  const [isScrubberActive, setIsScrubberActive] = useState(false);
+
+  const selectedIndicatorRows = useMemo(() => {
+    if (!selectedCandleDetails) {
+      return [] as Array<{ seriesName: string; field: string; value: number }>;
+    }
+
+    const selectedUnix = toUnixSeconds(selectedCandleDetails.ts);
+    if (selectedUnix === null) {
+      return [] as Array<{ seriesName: string; field: string; value: number }>;
+    }
+
+    const excludedKeys = new Set(["id", "ts", "seq", "rev", "output_id", "metadata"]);
+    const rows: Array<{ seriesName: string; field: string; value: number }> = [];
+
+    for (const [seriesKey, records] of overlayData.entries()) {
+      if (!records || records.length === 0) continue;
+
+      const parts = seriesKey.split("::");
+      const seriesName = parts.length >= 3
+        ? `${parts[0]}:${parts[2] === "default" ? parts[1] : parts[2]}`
+        : seriesKey;
+
+      const matchingRecord = records.find((record) => {
+        const recordUnix = toUnixSeconds(String(record.ts || ""));
+        return recordUnix !== null && recordUnix === selectedUnix;
+      });
+
+      if (!matchingRecord) continue;
+
+      for (const [field, rawValue] of Object.entries(matchingRecord as Record<string, unknown>)) {
+        if (excludedKeys.has(field)) continue;
+        if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+          rows.push({ seriesName, field, value: rawValue });
+        }
+      }
+
+      const metadata = matchingRecord.metadata;
+      if (metadata && typeof metadata === "object") {
+        for (const [metadataKey, metadataValue] of Object.entries(metadata as Record<string, unknown>)) {
+          if (typeof metadataValue === "number" && Number.isFinite(metadataValue)) {
+            rows.push({
+              seriesName,
+              field: `metadata.${metadataKey}`,
+              value: metadataValue,
+            });
+          }
+        }
+      }
+    }
+
+    return rows.sort((a, b) => {
+      const bySeries = a.seriesName.localeCompare(b.seriesName);
+      if (bySeries !== 0) return bySeries;
+      return a.field.localeCompare(b.field);
+    });
+  }, [selectedCandleDetails, overlayData]);
   
   // Store candle data by timestamp for lookup
   const candleDataRef = useRef<Map<number, MarketCandle>>(new Map());
@@ -521,6 +803,91 @@ export function ChartView({
       }
     >
   >(new Map());
+  const seriesMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const seriesMarkersSeriesRef = useRef<ISeriesApi<any> | null>(null);
+
+  // Sub-graph pane tracking: maps seriesKey → pane index (1-based; 0 = main chart)
+  const subgraphPaneAssignmentsRef = useRef<Map<string, number>>(new Map());
+  const nextSubgraphPaneRef = useRef<number>(1);
+  const initializedSubgraphPanesRef = useRef<Set<number>>(new Set());
+  // Tracks the pane each line series was actually created on so we can detect changes
+  const lineSeriesActualPaneRef = useRef<Map<string, number>>(new Map());
+  const areaSeriesActualPaneRef = useRef<Map<string, number>>(new Map());
+  const overlayRenderLatencyMsRef = useRef<number[]>([]);
+  const overlayRenderLastLogAtRef = useRef<number>(0);
+
+  const updateVisibleLogicalRange = useCallback((range: { from: number; to: number } | null) => {
+    setVisibleLogicalRange(normalizeLogicalRange(range));
+  }, []);
+
+  const moveViewportToStart = useCallback((nextStart: number) => {
+    const chart = chartRef.current;
+    const logicalRange = visibleLogicalRange;
+
+    if (!chart || !logicalRange || historyBarCount <= 0) {
+      return;
+    }
+
+    const visibleSpan = Math.max(1, logicalRange.to - logicalRange.from);
+    const maxStart = Math.max(0, historyBarCount - visibleSpan);
+    const clampedStart = clamp(nextStart, 0, maxStart);
+
+    chart.timeScale().setVisibleLogicalRange({
+      from: clampedStart,
+      to: clampedStart + visibleSpan,
+    });
+  }, [historyBarCount, visibleLogicalRange]);
+
+  const navigatorMetrics = useMemo(() => {
+    const logicalRange = visibleLogicalRange;
+    if (!logicalRange || historyBarCount <= 0) {
+      return null;
+    }
+
+    const visibleSpan = Math.max(1, logicalRange.to - logicalRange.from);
+    const maxStart = Math.max(0, historyBarCount - visibleSpan);
+    const effectiveStart = clamp(logicalRange.from, 0, maxStart);
+    const sliderValue = maxStart === 0 ? 1000 : Math.round((effectiveStart / maxStart) * 1000);
+    const visibleBars = Math.max(1, Math.round(visibleSpan));
+    const leftBars = Math.max(0, Math.round(effectiveStart));
+    const rightBars = Math.max(0, Math.round(maxStart - effectiveStart));
+
+    return {
+      sliderValue,
+      visibleBars,
+      maxStart,
+    };
+  }, [historyBarCount, visibleLogicalRange]);
+
+  const handleNavigatorChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const metrics = navigatorMetrics;
+    if (!metrics) {
+      return;
+    }
+
+    const rawValue = Number(event.target.value);
+    if (!Number.isFinite(rawValue)) {
+      return;
+    }
+
+    const ratio = clamp(rawValue / 1000, 0, 1);
+    moveViewportToStart(metrics.maxStart * ratio);
+  }, [moveViewportToStart, navigatorMetrics]);
+
+  useEffect(() => {
+    if (!isScrubberActive) {
+      return;
+    }
+
+    const handlePointerEnd = () => setIsScrubberActive(false);
+    window.addEventListener("pointerup", handlePointerEnd);
+    window.addEventListener("pointercancel", handlePointerEnd);
+
+    return () => {
+      window.removeEventListener("pointerup", handlePointerEnd);
+      window.removeEventListener("pointercancel", handlePointerEnd);
+    };
+  }, [isScrubberActive]);
 
   // Handle snapshot data from backend
   const handleSnapshot = useCallback((bars: OHLCBar[]) => {
@@ -606,10 +973,14 @@ export function ChartView({
       chartData = Array.from(uniqueByTime.values()).sort((a, b) => a.time - b.time);
       
       seriesRef.current.setData(chartData);
+      setHistoryBarCount(chartData.length);
       
       if (chartRef.current) {
         chartRef.current.timeScale().fitContent();
+        updateVisibleLogicalRange(chartRef.current.timeScale().getVisibleLogicalRange());
       }
+
+      setCandleWindowRevision((current) => current + 1);
       
       console.log("[ChartView] Chart populated with", chartData.length, "bars");
     } catch (error) {
@@ -703,22 +1074,23 @@ export function ChartView({
     });
 
     // Create the appropriate series type based on candleType
+    const compatChart = chart as ChartCompatApi;
     let series: ISeriesApi<any>;
     
     if (candleType === "bar") {
-      series = chart.addBarSeries({
+      series = addBarSeriesCompat(compatChart, {
         upColor: chartUp,
         downColor: chartDown,
         priceLineVisible: false,
       });
     } else if (candleType === "line") {
-      series = chart.addLineSeries({
+      series = addLineSeriesCompat(compatChart, {
         color: chartUp,
         lineWidth: 2,
         priceLineVisible: false,
       });
     } else if (candleType === "area") {
-      series = chart.addAreaSeries({
+      series = addAreaSeriesCompat(compatChart, {
         topColor: `${chartUp}40`,
         bottomColor: `${chartUp}05`,
         lineColor: chartUp,
@@ -727,7 +1099,7 @@ export function ChartView({
       });
     } else {
       // Default to candlestick
-      series = chart.addCandlestickSeries({
+      series = addCandlestickSeriesCompat(compatChart, {
         upColor: chartUp,
         downColor: chartDown,
         borderVisible: true,
@@ -754,6 +1126,7 @@ export function ChartView({
       
       // Store the candle data
       candleDataRef.current.set(time, candle);
+      setHistoryBarCount(candleDataRef.current.size);
       
       // Format data based on chart type
       if (candleType === 'line' || candleType === 'area') {
@@ -777,6 +1150,13 @@ export function ChartView({
     };
 
     onCandleReceived(handleCandle);
+
+        const handleVisibleLogicalRangeChange = (range: { from: number; to: number } | null) => {
+          updateVisibleLogicalRange(range);
+        };
+
+        chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleLogicalRangeChange);
+        updateVisibleLogicalRange(chart.timeScale().getVisibleLogicalRange());
 
     // Double-click handler to show candle details
     let clickedCandleTime: number | null = null;
@@ -938,12 +1318,23 @@ export function ChartView({
         containerRef.current.removeEventListener('dblclick', handleDoubleClick);
       }
       if (chart) {
+        chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleLogicalRangeChange);
         chart.unsubscribeClick(handleChartClick);
         chart.remove();
       }
       // Null out refs so history loading knows the chart was destroyed
       chartRef.current = null;
       seriesRef.current = null;
+      setVisibleLogicalRange(null);
+      setHistoryBarCount(0);
+      // Reset sub-graph pane tracking so fresh pane indices are assigned after chart recreation
+      subgraphPaneAssignmentsRef.current.clear();
+      nextSubgraphPaneRef.current = 1;
+      initializedSubgraphPanesRef.current.clear();
+      lineSeriesActualPaneRef.current.clear();
+      areaSeriesActualPaneRef.current.clear();
+      seriesMarkersRef.current = null;
+      seriesMarkersSeriesRef.current = null;
     };
   }, [onCandleReceived, candleType]);
 
@@ -985,72 +1376,179 @@ export function ChartView({
       return;
     }
 
+    const renderStartedAt = performance.now();
+
     try {
       const chart = chartRef.current;
       const existingLineSeries = overlayLineSeriesRef.current;
       const existingAreaSeries = overlayAreaSeriesRef.current;
       const incomingAgentIds = new Set(overlayData.keys());
-
-      console.log("[ChartView] Updating overlays:", {
-        overlayDataKeys: Array.from(overlayData.keys()),
-        overlayColorKeys: overlayLineColors ? Array.from(overlayLineColors.keys()) : [],
-        existingLineSeriesKeys: Array.from(existingLineSeries.keys()),
-        existingAreaSeriesKeys: Array.from(existingAreaSeries.keys())
-      });
+      const candleTimes = Array.from(candleDataRef.current.keys());
+      const hasCandleWindow = candleTimes.length > 0;
+      const minCandleTime = hasCandleWindow ? findMin(candleTimes) : null;
+      const maxCandleTime = hasCandleWindow ? findMax(candleTimes) : null;
+      const isInCandleWindow = (time: number): boolean => {
+        if (!hasCandleWindow || minCandleTime === null || maxCandleTime === null) {
+          return true;
+        }
+        return time >= minCandleTime && time <= maxCandleTime;
+      };
 
       for (const [seriesKey, overlaySeries] of existingLineSeries.entries()) {
         if (!incomingAgentIds.has(seriesKey)) {
-          console.log(`[ChartView] Removing line overlay series for ${seriesKey}`);
           chart.removeSeries(overlaySeries);
           existingLineSeries.delete(seriesKey);
+          subgraphPaneAssignmentsRef.current.delete(seriesKey);
+          lineSeriesActualPaneRef.current.delete(seriesKey);
         }
       }
 
       for (const [seriesKey, areaSeries] of existingAreaSeries.entries()) {
         if (!incomingAgentIds.has(seriesKey)) {
-          console.log(`[ChartView] Removing area overlay series for ${seriesKey}`);
           chart.removeSeries(areaSeries.upperSeries);
           chart.removeSeries(areaSeries.lowerSeries);
           existingAreaSeries.delete(seriesKey);
+          subgraphPaneAssignmentsRef.current.delete(seriesKey);
+          areaSeriesActualPaneRef.current.delete(seriesKey);
         }
       }
+
+      // Helper: get a stable sub-pane index for a series key, allocating a new one if needed
+      const getSubgraphPane = (key: string): number => {
+        if (subgraphPaneAssignmentsRef.current.has(key)) {
+          return subgraphPaneAssignmentsRef.current.get(key)!;
+        }
+        const pane = nextSubgraphPaneRef.current;
+        nextSubgraphPaneRef.current += 1;
+        subgraphPaneAssignmentsRef.current.set(key, pane);
+        return pane;
+      };
+
+      const ensureSubgraphPaneStretch = (paneIndex: number) => {
+        if (paneIndex === 0 || initializedSubgraphPanesRef.current.has(paneIndex)) {
+          return;
+        }
+        const pane = chart.panes().find((candidate) => candidate.paneIndex() === paneIndex);
+        if (!pane) {
+          return;
+        }
+        pane.setStretchFactor(SUBGRAPH_PANE_STRETCH_FACTOR);
+        initializedSubgraphPanesRef.current.add(paneIndex);
+      };
 
       for (const [seriesKey, records] of overlayData.entries()) {
         try {
           const schema = overlaySchemas?.get(seriesKey) || "line";
           const agentId = overlayAgentId(seriesKey);
           const seriesColor = overlayLineColors?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
+          const areaStyleOverride = overlayAreaStyles?.get(agentId);
+          const upColor = cssVar("--chart-up", "#22c55e");
+          const downColor = cssVar("--chart-down", "#ef4444");
 
-          console.log(`[ChartView] Processing overlay for ${seriesKey}: schema=${schema}, color=${seriesColor}, records=${records.length}`);
+          // --- Histogram schema: always render in a dedicated sub-graph pane ---
+          if (schema === "histogram") {
+            const paneKey = resolveSubgraphPaneKey(schema, records, agentId, seriesKey);
+            const subPane = getSubgraphPane(paneKey);
+            ensureSubgraphPaneStretch(subPane);
+            let histSeries = existingLineSeries.get(seriesKey);
+            if (!histSeries) {
+              histSeries = addHistogramSeriesCompat(chart as ChartCompatApi, {
+                color: seriesColor,
+                priceLineVisible: false,
+                lastValueVisible: true,
+                pane: subPane,
+              } as any);
+              existingLineSeries.set(seriesKey, histSeries);
 
+              const possibleAreaSeries = existingAreaSeries.get(seriesKey);
+              if (possibleAreaSeries) {
+                chart.removeSeries(possibleAreaSeries.upperSeries);
+                chart.removeSeries(possibleAreaSeries.lowerSeries);
+                existingAreaSeries.delete(seriesKey);
+              }
+            } else {
+              histSeries.applyOptions({ color: seriesColor });
+            }
+
+            const histData = records
+              .map((record) => {
+                const time = toUnixSeconds(record.ts);
+                const value = Number(record.value);
+                if (time === null || !Number.isFinite(value) || !isInCandleWindow(time)) return null;
+                const explicitColor = readOverlayColor(record);
+                const color = explicitColor || (value >= 0 ? upColor : downColor);
+                return { time, value, color };
+              })
+              .filter((p): p is { time: number; value: number; color: string } => p !== null)
+              .sort((a, b) => a.time - b.time);
+
+            const uniqueHistData = new Map<number, { time: number; value: number; color: string }>();
+            for (const point of histData) uniqueHistData.set(point.time, point);
+            const dedupHistData = Array.from(uniqueHistData.values()).sort((a, b) => a.time - b.time);
+
+            histSeries.setData(dedupHistData.length > 0 ? dedupHistData : []);
+            continue;
+          }
+
+          // --- Area schema: supports sub-graph routing via metadata/UI override ---
           if (schema === "area") {
+            const wantsSubgraph = isSubgraphOverlay(schema, records, agentId, overlaySubgraphForced);
+            const paneKey = resolveSubgraphPaneKey(schema, records, agentId, seriesKey);
+            const areaPane = wantsSubgraph ? getSubgraphPane(paneKey) : 0;
+            if (wantsSubgraph) {
+              ensureSubgraphPaneStretch(areaPane);
+            }
             let areaSeries = existingAreaSeries.get(seriesKey);
 
+            const actualPane = areaSeriesActualPaneRef.current.get(seriesKey) ?? 0;
+            if (areaSeries && actualPane !== areaPane) {
+              chart.removeSeries(areaSeries.upperSeries);
+              chart.removeSeries(areaSeries.lowerSeries);
+              existingAreaSeries.delete(seriesKey);
+              areaSeriesActualPaneRef.current.delete(seriesKey);
+              if (!wantsSubgraph) subgraphPaneAssignmentsRef.current.delete(seriesKey);
+              areaSeries = undefined;
+            }
+
             if (!areaSeries) {
-              const upperSeries = chart.addLineSeries({
-                color: seriesColor,
-                lineWidth: 2,
+              const upperSeries = addLineSeriesCompat(chart as ChartCompatApi, {
+                color: "rgba(0, 0, 0, 0)",
+                lineWidth: 0,
+                lineVisible: false,
+                crosshairMarkerVisible: false,
                 priceLineVisible: false,
                 lastValueVisible: false,
+                pane: areaPane,
               });
-              const lowerSeries = chart.addLineSeries({
-                color: seriesColor,
-                lineWidth: 2,
+              const lowerSeries = addLineSeriesCompat(chart as ChartCompatApi, {
+                color: "rgba(0, 0, 0, 0)",
+                lineWidth: 0,
+                lineVisible: false,
+                crosshairMarkerVisible: false,
                 priceLineVisible: false,
                 lastValueVisible: false,
+                pane: areaPane,
               });
 
-              const defaultStyle = readAreaRenderStyle(undefined, seriesColor);
+              const defaultStyle = readAreaRenderStyle(
+                undefined,
+                seriesColor,
+                areaStyleOverride,
+                upColor,
+                downColor,
+              );
               const primitive = new AreaBetweenPrimitive(chart, upperSeries, defaultStyle);
               upperSeries.attachPrimitive(primitive);
 
               areaSeries = { upperSeries, lowerSeries, primitive };
               existingAreaSeries.set(seriesKey, areaSeries);
+              areaSeriesActualPaneRef.current.set(seriesKey, areaPane);
 
               const possibleLineSeries = existingLineSeries.get(seriesKey);
               if (possibleLineSeries) {
                 chart.removeSeries(possibleLineSeries);
                 existingLineSeries.delete(seriesKey);
+                lineSeriesActualPaneRef.current.delete(seriesKey);
               }
             }
 
@@ -1060,7 +1558,12 @@ export function ChartView({
                 const upper = Number((record as AreaRecord).upper);
                 const lower = Number((record as AreaRecord).lower);
 
-                if (time === null || !Number.isFinite(upper) || !Number.isFinite(lower)) {
+                if (
+                  time === null ||
+                  !Number.isFinite(upper) ||
+                  !Number.isFinite(lower) ||
+                  !isInCandleWindow(time)
+                ) {
                   return null;
                 }
 
@@ -1080,10 +1583,26 @@ export function ChartView({
 
             if (deduplicatedAreaData.length > 0) {
               const latestRecord = records[records.length - 1];
-              const style = readAreaRenderStyle(latestRecord, seriesColor);
+              const style = readAreaRenderStyle(
+                latestRecord,
+                seriesColor,
+                areaStyleOverride,
+                upColor,
+                downColor,
+              );
 
-              areaSeries.upperSeries.applyOptions({ color: style.primaryColor || seriesColor });
-              areaSeries.lowerSeries.applyOptions({ color: style.secondaryColor || style.primaryColor || seriesColor });
+              areaSeries.upperSeries.applyOptions({
+                color: "rgba(0, 0, 0, 0)",
+                lineWidth: 0,
+                lineVisible: false,
+                crosshairMarkerVisible: false,
+              });
+              areaSeries.lowerSeries.applyOptions({
+                color: "rgba(0, 0, 0, 0)",
+                lineWidth: 0,
+                lineVisible: false,
+                crosshairMarkerVisible: false,
+              });
 
               areaSeries.upperSeries.setData(
                 deduplicatedAreaData.map((point) => ({ time: point.time, value: point.upper }))
@@ -1092,36 +1611,91 @@ export function ChartView({
                 deduplicatedAreaData.map((point) => ({ time: point.time, value: point.lower }))
               );
               areaSeries.primitive.update(deduplicatedAreaData, style);
+            } else {
+              areaSeries.upperSeries.setData([]);
+              areaSeries.lowerSeries.setData([]);
+              areaSeries.primitive.update(
+                [],
+                readAreaRenderStyle(
+                  undefined,
+                  seriesColor,
+                  areaStyleOverride,
+                  upColor,
+                  downColor,
+                )
+              );
             }
 
             continue;
           }
 
+          // --- Line / band / forecast / event schemas ---
+          // Sub-graph detection: UI-level override OR agent metadata opt-in
+          const wantsSubgraph = isSubgraphOverlay(schema, records, agentId, overlaySubgraphForced);
+          const paneKey = resolveSubgraphPaneKey(schema, records, agentId, seriesKey);
+          const linePane = wantsSubgraph ? getSubgraphPane(paneKey) : 0;
+          if (wantsSubgraph) {
+            ensureSubgraphPaneStretch(linePane);
+          }
+          const explicitLineColor = readOverlayColor(records[records.length - 1]);
+          const trendMode = hasTrendColorMode(records);
+
           let overlaySeries = existingLineSeries.get(seriesKey);
+
+          // If the desired pane changed (e.g. force_subgraph toggled), the series must be
+          // destroyed and recreated — lightweight-charts does not support moving series between panes.
+          const actualPane = lineSeriesActualPaneRef.current.get(seriesKey) ?? 0;
+          if (overlaySeries && actualPane !== linePane) {
+            chart.removeSeries(overlaySeries);
+            existingLineSeries.delete(seriesKey);
+            lineSeriesActualPaneRef.current.delete(seriesKey);
+            if (!wantsSubgraph) subgraphPaneAssignmentsRef.current.delete(seriesKey);
+            overlaySeries = undefined;
+          }
+
           if (!overlaySeries) {
-            overlaySeries = chart.addLineSeries({
-              color: seriesColor,
+            let resolvedLineColor = explicitLineColor || seriesColor;
+            if (!explicitLineColor && trendMode && records.length > 1) {
+              const firstValue = Number(records[0]?.value);
+              const lastValue = Number(records[records.length - 1]?.value);
+              if (Number.isFinite(firstValue) && Number.isFinite(lastValue)) {
+                resolvedLineColor = lastValue >= firstValue ? upColor : downColor;
+              }
+            }
+            overlaySeries = addLineSeriesCompat(chart as ChartCompatApi, {
+              color: resolvedLineColor,
               lineWidth: 2,
               priceLineVisible: false,
-              lastValueVisible: false,
-            });
+              lastValueVisible: wantsSubgraph, // show last value label on sub-pane
+              pane: linePane,
+            } as any);
             existingLineSeries.set(seriesKey, overlaySeries);
+            lineSeriesActualPaneRef.current.set(seriesKey, linePane);
 
             const possibleAreaSeries = existingAreaSeries.get(seriesKey);
             if (possibleAreaSeries) {
               chart.removeSeries(possibleAreaSeries.upperSeries);
               chart.removeSeries(possibleAreaSeries.lowerSeries);
               existingAreaSeries.delete(seriesKey);
+              areaSeriesActualPaneRef.current.delete(seriesKey);
             }
           } else {
-            overlaySeries.applyOptions({ color: seriesColor });
+            let resolvedLineColor = explicitLineColor || seriesColor;
+            if (!explicitLineColor && trendMode && records.length > 1) {
+              const firstValue = Number(records[0]?.value);
+              const lastValue = Number(records[records.length - 1]?.value);
+              if (Number.isFinite(firstValue) && Number.isFinite(lastValue)) {
+                resolvedLineColor = lastValue >= firstValue ? upColor : downColor;
+              }
+            }
+            overlaySeries.applyOptions({ color: resolvedLineColor });
           }
 
           const lineData = records
             .map((record) => {
               const time = toUnixSeconds(record.ts);
               const value = Number(record.value);
-              if (time === null || !Number.isFinite(value)) {
+              if (time === null || !Number.isFinite(value) || !isInCandleWindow(time)) {
                 return null;
               }
 
@@ -1144,20 +1718,54 @@ export function ChartView({
 
           if (deduplicatedLineData.length > 0) {
             overlaySeries.setData(deduplicatedLineData);
+          } else {
+            overlaySeries.setData([]);
           }
         } catch (error) {
           console.error(`[ChartView] Failed to render overlay for series ${seriesKey}:`, error);
         }
       }
+
     } catch (error) {
       console.error("[ChartView] Failed to update overlay series:", error);
+    } finally {
+      const elapsedMs = performance.now() - renderStartedAt;
+      const samples = overlayRenderLatencyMsRef.current;
+      samples.push(elapsedMs);
+      if (samples.length > 240) {
+        samples.shift();
+      }
+
+      const now = Date.now();
+      if (now - overlayRenderLastLogAtRef.current >= 5000 && samples.length >= 10) {
+        const ordered = [...samples].sort((a, b) => a - b);
+        const p50 = ordered[Math.floor(ordered.length * 0.5)] ?? 0;
+        const p95 = ordered[Math.min(ordered.length - 1, Math.floor(ordered.length * 0.95))] ?? 0;
+        const max = ordered[ordered.length - 1] ?? 0;
+        const avg = ordered.reduce((sum, value) => sum + value, 0) / ordered.length;
+
+        console.debug("[ChartView][Perf] overlay render latency", {
+          sample_count: ordered.length,
+          avg_ms: Number(avg.toFixed(2)),
+          p50_ms: Number(p50.toFixed(2)),
+          p95_ms: Number(p95.toFixed(2)),
+          max_ms: Number(max.toFixed(2)),
+        });
+
+        overlayRenderLastLogAtRef.current = now;
+      }
     }
-  }, [overlayData, overlaySchemas, overlayLineColors]);
+  }, [overlayData, overlaySchemas, overlayLineColors, overlayAreaStyles, overlaySubgraphForced, candleWindowRevision, SUBGRAPH_PANE_STRETCH_FACTOR]);
 
   useEffect(() => {
     if (!seriesRef.current) {
       return;
     }
+
+    const candleTimes = Array.from(candleDataRef.current.keys());
+    const hasCandleWindow = candleTimes.length > 0;
+    const minCandleTime = hasCandleWindow ? findMin(candleTimes) : null;
+    const maxCandleTime = hasCandleWindow ? findMax(candleTimes) : null;
 
     const markerByTime = new Map<number, {
       time: number;
@@ -1172,6 +1780,14 @@ export function ChartView({
     for (const marker of tradeMarkers) {
       const time = toUnixSeconds(marker.ts);
       if (time === null) {
+        continue;
+      }
+      if (
+        hasCandleWindow &&
+        minCandleTime !== null &&
+        maxCandleTime !== null &&
+        (time < minCandleTime || time > maxCandleTime)
+      ) {
         continue;
       }
 
@@ -1205,8 +1821,21 @@ export function ChartView({
     }
 
     const markerData = Array.from(markerByTime.values()).sort((a, b) => a.time - b.time);
-    seriesRef.current.setMarkers(markerData);
-  }, [tradeMarkers]);
+    const currentSeries = seriesRef.current;
+    const legacySetMarkers = (currentSeries as any)?.setMarkers;
+    if (typeof legacySetMarkers === "function") {
+      legacySetMarkers.call(currentSeries, markerData);
+      return;
+    }
+
+    const typedMarkers = markerData as SeriesMarker<Time>[];
+    if (!seriesMarkersRef.current || seriesMarkersSeriesRef.current !== currentSeries) {
+      seriesMarkersRef.current = createSeriesMarkers(currentSeries as any, typedMarkers);
+      seriesMarkersSeriesRef.current = currentSeries as any;
+    } else {
+      seriesMarkersRef.current.setMarkers(typedMarkers);
+    }
+  }, [tradeMarkers, candleWindowRevision]);
 
   const timeframeOptions = [
     { label: "1D", days: 1 },
@@ -1218,7 +1847,7 @@ export function ChartView({
   ];
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+    <div className="chart-view-shell">
       {/* Loading/Error Indicator */}
       {(isLoadingHistory || historyError) && (
         <div
@@ -1394,6 +2023,47 @@ export function ChartView({
                   ${(selectedCandleDetails.high - selectedCandleDetails.low).toFixed(2)}
                 </span>
               </div>
+
+              <div style={{ height: "1px", background: "#333", margin: "6px 0" }} />
+
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <span style={{ color: "#999", fontSize: "13px" }}>Indicator Values:</span>
+                <span style={{ color: "#64748b", fontSize: "11px" }}>
+                  {selectedIndicatorRows.length > 0 ? `${selectedIndicatorRows.length} found` : "none at this candle"}
+                </span>
+              </div>
+
+              {selectedIndicatorRows.length > 0 && (
+                <div
+                  style={{
+                    maxHeight: "180px",
+                    overflowY: "auto",
+                    border: "1px solid #333",
+                    borderRadius: "4px",
+                    padding: "8px",
+                    background: "rgba(15, 23, 42, 0.45)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                  }}
+                >
+                  {selectedIndicatorRows.map((row, index) => (
+                    <div
+                      key={`${row.seriesName}:${row.field}:${index}`}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: "12px",
+                        fontFamily: "monospace",
+                        gap: "12px",
+                      }}
+                    >
+                      <span style={{ color: "#94a3b8" }}>{row.seriesName}:{row.field}</span>
+                      <span style={{ color: "#e2e8f0", fontWeight: 600 }}>{row.value.toFixed(6)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
             
             <div style={{ marginTop: "16px", paddingTop: "12px", borderTop: "1px solid #333" }}>
@@ -1425,8 +2095,24 @@ export function ChartView({
         </div>
       )}
 
-      {/* Chart Canvas */}
       <div ref={containerRef} className="chart-canvas" />
+
+      {navigatorMetrics && historyBarCount > navigatorMetrics.visibleBars + 3 && (
+        <div className="chart-scrubber-dock" role="group" aria-label="Timeline scrubber">
+          <input
+            id="chart-timeline-scrubber"
+            type="range"
+            min="0"
+            max="1000"
+            step="1"
+            value={navigatorMetrics.sliderValue}
+            onChange={handleNavigatorChange}
+            onPointerDown={() => setIsScrubberActive(true)}
+            className={`chart-nav-slider ${isScrubberActive ? "is-active" : ""}`}
+            aria-label="Scrub chart timeline"
+          />
+        </div>
+      )}
     </div>
   );
 }

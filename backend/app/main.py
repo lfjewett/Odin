@@ -1,9 +1,9 @@
 """
-Odin Backend - FastAPI WebSocket Server (ACP v0.4.1)
+Odin Backend - FastAPI WebSocket Server (ACP v0.4.2)
 
 Manages WebSocket connections from the frontend and routes them to ACP agents:
 - Accepts WebSocket connections from the frontend (each is a client_id)
-- Loads agent configurations from overlay_agents.yaml (ACP v0.4.1)
+- Loads agent configurations from overlay_agents.yaml (ACP v0.4.2)
 - Connects to ACP agents via WebSocket
 - Routes ACP messages to specific sessions (not broadcast-all)
 - Maintains canonical candle store per session with deduplication
@@ -14,31 +14,54 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import csv
 import logging
+import os
+import re
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
+from time import monotonic, perf_counter
 from typing import Any, Set
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.agent_data_store import SessionDataStore
 from app.agent_manager import agent_manager
-from app.models import AgentConfig, SessionManager, Variable, build_variable_name
-from app.trade_engine import evaluate_strategy, validate_strategy_v2
+from app.models import (
+    AgentConfig,
+    SessionManager,
+    UI_MANAGED_INDICATOR_CONFIG_KEYS,
+    Variable,
+    build_area_field_variable_name,
+    build_area_metadata_variable_name,
+    build_variable_name,
+    infer_selected_indicator_id,
+    normalize_indicator_config,
+)
+from app.trade_engine import evaluate_research_expression, evaluate_strategy, validate_strategy_v2
 from app.trade_strategy_store import TradeStrategyStore
 from app.workspace_store import WorkspaceStore
 
-ACP_SPEC_VERSION = "ACP-0.4.1"
-ACP_API_VERSION = "0.4.1"
-COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1"}
+ACP_SPEC_VERSION = "ACP-0.4.2"
+ACP_API_VERSION = "0.4.2"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
-SUBSCRIBE_PROPAGATION_DELAY_SECONDS = 0.05
+SUBSCRIBE_PROPAGATION_DELAY_SECONDS = 0.2
+EXPORT_CHUNK_MONTHS = 6
+EXPORT_SETTLE_MIN_DELAY_SECONDS = 6.0
+EXPORT_SETTLE_POLL_SECONDS = 2.0
+EXPORT_SETTLE_TIMEOUT_SECONDS = 120.0
+TRADE_RECOMPUTE_WARN_MS = 750.0
+OVERLAY_INGEST_WARN_RPS = 1500.0
 INDICATOR_OHLC_FIELDS = {
     "id",
     "seq",
@@ -93,29 +116,60 @@ class UpsertWorkspaceRequest(BaseModel):
 
 class UpsertTradeStrategyRequest(BaseModel):
     description: str = ""
-    long_entry_rule: str
+    long_entry_rules: list[str] = Field(default_factory=list)
     long_exit_rules: list[str] = Field(default_factory=list)
-    short_entry_rule: str = ""
+    short_entry_rules: list[str] = Field(default_factory=list)
     short_exit_rules: list[str] = Field(default_factory=list)
+    # Backward compatibility: accept single-string format
+    long_entry_rule: str = ""
+    short_entry_rule: str = ""
 
 
 class ValidateTradeStrategyRequest(BaseModel):
-    long_entry_rule: str
+    long_entry_rules: list[str] = Field(default_factory=list)
     long_exit_rules: list[str] = Field(default_factory=list)
-    short_entry_rule: str = ""
+    short_entry_rules: list[str] = Field(default_factory=list)
     short_exit_rules: list[str] = Field(default_factory=list)
+    # Backward compatibility: accept single-string format
+    long_entry_rule: str = ""
+    short_entry_rule: str = ""
 
 
 class ApplyTradeStrategyRequest(BaseModel):
     strategy_name: str | None = None
-    long_entry_rule: str = ""
+    long_entry_rules: list[str] = Field(default_factory=list)
     long_exit_rules: list[str] = Field(default_factory=list)
-    short_entry_rule: str = ""
+    short_entry_rules: list[str] = Field(default_factory=list)
     short_exit_rules: list[str] = Field(default_factory=list)
+    # Backward compatibility: accept single-string format
+    long_entry_rule: str = ""
+    short_entry_rule: str = ""
 
 
-def _normalize_strategy_rules_payload(payload: dict[str, Any]) -> tuple[str, list[str], str, list[str]]:
-    long_entry_rule = str(payload.get("long_entry_rule") or "").strip()
+class EvaluateResearchExpressionRequest(BaseModel):
+    expression: str = Field(min_length=1)
+    output_schema: str = Field(default="line")
+
+
+class CreateCsvExportRequest(BaseModel):
+    start_date: str = Field(min_length=1)
+    end_date: str = Field(min_length=1)
+    interval: str = Field(default="1m")
+    settle_min_delay_seconds: float = Field(default=EXPORT_SETTLE_MIN_DELAY_SECONDS, ge=0)
+    settle_poll_seconds: float = Field(default=EXPORT_SETTLE_POLL_SECONDS, gt=0)
+    settle_timeout_seconds: float = Field(default=EXPORT_SETTLE_TIMEOUT_SECONDS, gt=0)
+
+
+def _normalize_strategy_rules_payload(payload: dict[str, Any]) -> tuple[list[str], list[str], list[str], list[str]]:
+    # Support both new array format and old single-string format
+    long_entry_rules_list = payload.get("long_entry_rules", [])
+    long_entry_rule_str = payload.get("long_entry_rule", "")
+    if isinstance(long_entry_rules_list, list):
+        long_entry_rules = [str(rule).strip() for rule in long_entry_rules_list if str(rule).strip()]
+    else:
+        long_entry_rules = []
+    if long_entry_rule_str and not long_entry_rules:
+        long_entry_rules = [str(long_entry_rule_str).strip()]
 
     raw_long_exits = payload.get("long_exit_rules")
     if isinstance(raw_long_exits, list):
@@ -123,41 +177,61 @@ def _normalize_strategy_rules_payload(payload: dict[str, Any]) -> tuple[str, lis
     else:
         long_exit_rules = []
 
-    short_entry_rule = str(payload.get("short_entry_rule") or "").strip()
+    short_entry_rules_list = payload.get("short_entry_rules", [])
+    short_entry_rule_str = payload.get("short_entry_rule", "")
+    if isinstance(short_entry_rules_list, list):
+        short_entry_rules = [str(rule).strip() for rule in short_entry_rules_list if str(rule).strip()]
+    else:
+        short_entry_rules = []
+    if short_entry_rule_str and not short_entry_rules:
+        short_entry_rules = [str(short_entry_rule_str).strip()]
+
     raw_short_exits = payload.get("short_exit_rules")
     if isinstance(raw_short_exits, list):
         short_exit_rules = [str(rule).strip() for rule in raw_short_exits if str(rule).strip()]
     else:
         short_exit_rules = []
 
-    return long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules
+    return long_entry_rules, long_exit_rules, short_entry_rules, short_exit_rules
 
 
 def sanitize_indicator_params(
     params: dict[str, Any] | None,
     indicators_catalog: list[dict[str, Any]] | None,
+    selected_indicator_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Normalize indicator params to agent-declared schema ranges/types.
 
     Prevents subscribe rejection (e.g., period out of allowed bounds).
-    Unknown params are passed through unchanged.
+    Unknown params are dropped.
     """
     incoming = dict(params or {})
     catalog = indicators_catalog or []
 
     schema_by_name: dict[str, dict[str, Any]] = {}
     for indicator in catalog:
+        if selected_indicator_id and indicator.get("indicator_id") != selected_indicator_id:
+            continue
+
         params_schema = indicator.get("params_schema")
         if isinstance(params_schema, dict):
             for key, schema in params_schema.items():
                 if isinstance(schema, dict):
-                    schema_by_name.setdefault(str(key), schema)
+                    schema_by_name[str(key)] = schema
+
+        if selected_indicator_id:
+            break
+
+    normalized: dict[str, Any] = {}
+
+    aggregation_interval = incoming.get("aggregation_interval")
+    if isinstance(aggregation_interval, str) and aggregation_interval.strip():
+        normalized["aggregation_interval"] = aggregation_interval.strip()
 
     if not schema_by_name:
-        return incoming
+        return normalized
 
-    normalized: dict[str, Any] = dict(incoming)
     for key, schema in schema_by_name.items():
         if key not in incoming:
             continue
@@ -184,19 +258,24 @@ def sanitize_indicator_params(
                 if isinstance(max_value, (int, float)):
                     coerced_float = min(coerced_float, float(max_value))
                 normalized[key] = coerced_float
+            elif field_type == "boolean":
+                if isinstance(value, str):
+                    normalized[key] = value.strip().lower() == "true"
+                else:
+                    normalized[key] = bool(value)
+            else:
+                normalized[key] = value
         except (TypeError, ValueError):
             if "default" in schema:
                 normalized[key] = schema.get("default")
             elif isinstance(min_value, (int, float)):
                 normalized[key] = int(min_value) if field_type == "integer" else float(min_value)
-            else:
-                normalized.pop(key, None)
 
     return normalized
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("ODIN_LOG_LEVEL", "WARNING").upper(), logging.WARNING),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -212,6 +291,10 @@ session_data_stores: dict[str, SessionDataStore] = {}
 
 # Track backend-assigned stream sequence numbers: session_id -> latest_seq
 session_seq_counters: dict[str, int] = {}
+
+# Track latest subscribe request epoch for each session to prevent stale
+# long-running subscribe flows from applying after a newer interval/symbol switch.
+session_subscribe_epochs: dict[str, int] = {}
 
 # Track outbound sequence numbers sent from backend -> indicator agent:
 # (indicator_agent_id, session_id) -> latest_seq
@@ -242,6 +325,532 @@ applied_trade_strategy_by_session: dict[str, dict[str, Any]] = {}
 
 # Cooldown guard for indicator subscription recovery attempts.
 indicator_recovery_last_attempt: dict[tuple[str, str], datetime] = {}
+
+# CSV export job tracking (in-memory, per backend process).
+csv_export_jobs: dict[str, dict[str, Any]] = {}
+csv_export_tasks: dict[str, asyncio.Task] = {}
+csv_export_root = Path(__file__).parent.parent / "data" / "exports"
+
+# Runtime telemetry (Phase 0 baseline).
+telemetry_counters: dict[str, int] = {
+    "overlay_ingest_records_total": 0,
+    "overlay_ingest_history_messages_total": 0,
+    "overlay_ingest_update_messages_total": 0,
+    "trade_recompute_total": 0,
+    "trade_recompute_failed_total": 0,
+}
+telemetry_latency_ms: dict[str, deque[float]] = {
+    "trade_recompute": deque(maxlen=1024),
+}
+overlay_ingest_samples: deque[tuple[float, int]] = deque(maxlen=4096)
+
+
+def _increment_telemetry_counter(name: str, amount: int = 1) -> None:
+    telemetry_counters[name] = int(telemetry_counters.get(name, 0)) + int(amount)
+
+
+def _record_latency_ms(name: str, value_ms: float) -> None:
+    bucket = telemetry_latency_ms.setdefault(name, deque(maxlen=1024))
+    bucket.append(float(value_ms))
+
+
+def _percentile_from_sorted(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    index = int(math.ceil((percentile / 100.0) * len(values))) - 1
+    index = max(0, min(index, len(values) - 1))
+    return float(values[index])
+
+
+def _latency_summary(values: deque[float]) -> dict[str, float]:
+    if not values:
+        return {"count": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0, "avg_ms": 0.0}
+
+    ordered = sorted(float(v) for v in values)
+    total = sum(ordered)
+    return {
+        "count": float(len(ordered)),
+        "p50_ms": round(_percentile_from_sorted(ordered, 50), 3),
+        "p95_ms": round(_percentile_from_sorted(ordered, 95), 3),
+        "max_ms": round(ordered[-1], 3),
+        "avg_ms": round(total / len(ordered), 3),
+    }
+
+
+def _record_overlay_ingest(records_count: int) -> None:
+    now = monotonic()
+    overlay_ingest_samples.append((now, int(records_count)))
+    _increment_telemetry_counter("overlay_ingest_records_total", int(records_count))
+
+
+def _overlay_ingest_rps(window_seconds: float = 60.0) -> float:
+    now = monotonic()
+    while overlay_ingest_samples and now - overlay_ingest_samples[0][0] > window_seconds:
+        overlay_ingest_samples.popleft()
+
+    if not overlay_ingest_samples:
+        return 0.0
+
+    count = sum(sample_count for _, sample_count in overlay_ingest_samples)
+    earliest = overlay_ingest_samples[0][0]
+    elapsed = max(now - earliest, 1.0)
+    return float(count) / elapsed
+
+
+def _active_overlay_records_by_session() -> dict[str, int]:
+    return {
+        session_id: len(data_store.latest_non_ohlc_by_key)
+        for session_id, data_store in session_data_stores.items()
+    }
+
+
+def _telemetry_snapshot() -> dict[str, Any]:
+    return {
+        "emitted_at": datetime.now(timezone.utc).isoformat(),
+        "counters": {key: int(value) for key, value in telemetry_counters.items()},
+        "overlay_ingest": {
+            "rps_60s": round(_overlay_ingest_rps(60.0), 3),
+            "warn_threshold_rps": OVERLAY_INGEST_WARN_RPS,
+        },
+        "latency_ms": {
+            metric_name: _latency_summary(metric_values)
+            for metric_name, metric_values in telemetry_latency_ms.items()
+        },
+        "active_overlay_records_by_session": _active_overlay_records_by_session(),
+        "active_sessions": len(session_data_stores),
+    }
+
+
+def _parse_export_date(value: str, *, end_of_day: bool) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("Date is required")
+
+    try:
+        if "T" in raw:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed
+
+        parsed_date = datetime.strptime(raw, "%Y-%m-%d").date()
+        if end_of_day:
+            return datetime(
+                year=parsed_date.year,
+                month=parsed_date.month,
+                day=parsed_date.day,
+                hour=23,
+                minute=59,
+                second=59,
+                microsecond=999999,
+                tzinfo=timezone.utc,
+            )
+
+        return datetime(
+            year=parsed_date.year,
+            month=parsed_date.month,
+            day=parsed_date.day,
+            tzinfo=timezone.utc,
+        )
+    except ValueError as exc:
+        raise ValueError("Date must be ISO datetime or YYYY-MM-DD") from exc
+
+
+def _add_months_utc(value: datetime, months: int) -> datetime:
+    year = value.year + (value.month - 1 + months) // 12
+    month = (value.month - 1 + months) % 12 + 1
+    max_day = [
+        31,
+        29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][month - 1]
+    day = min(value.day, max_day)
+    return value.replace(year=year, month=month, day=day)
+
+
+def _iter_export_windows(start_at: datetime, end_at: datetime) -> list[tuple[datetime, datetime]]:
+    windows: list[tuple[datetime, datetime]] = []
+    cursor = start_at
+    while cursor <= end_at:
+        next_cursor = _add_months_utc(cursor, EXPORT_CHUNK_MONTHS)
+        window_end = min(end_at, next_cursor - timedelta(microseconds=1))
+        windows.append((cursor, window_end))
+        cursor = window_end + timedelta(microseconds=1)
+    return windows
+
+
+def _parse_record_ts(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _record_in_range(record: dict[str, Any], start_at: datetime, end_at: datetime) -> bool:
+    parsed = _parse_record_ts(record.get("ts"))
+    if not parsed:
+        return False
+    return start_at <= parsed <= end_at
+
+
+async def _wait_for_export_settle(
+    data_store: SessionDataStore,
+    min_delay_seconds: float,
+    poll_seconds: float,
+    timeout_seconds: float,
+) -> None:
+    await asyncio.sleep(min_delay_seconds)
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+    stable_ticks = 0
+    last_signature: tuple[int, int, str] | None = None
+
+    while datetime.now(timezone.utc) < deadline:
+        signature = (
+            len(data_store.latest_by_candle_id),
+            len(data_store.latest_non_ohlc_by_key),
+            str(data_store.last_event_ts or ""),
+        )
+
+        if signature == last_signature:
+            stable_ticks += 1
+        else:
+            stable_ticks = 0
+
+        if stable_ticks >= 2:
+            return
+
+        last_signature = signature
+        await asyncio.sleep(poll_seconds)
+
+    raise TimeoutError("Export settle timeout: data did not stabilize before timeout")
+
+
+def _sorted_candles_for_push(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda record: (
+            str(record.get("ts") or ""),
+            str(record.get("id") or ""),
+            int(record.get("rev") or 0),
+        ),
+    )
+
+
+def _format_export_csv(
+    *,
+    session_id: str,
+    symbol: str,
+    interval: str,
+    candles: list[dict[str, Any]],
+    overlays: list[dict[str, Any]],
+    output_path: Path,
+) -> tuple[int, int]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _safe_column_part(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "unknown"
+        normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", text)
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        return normalized.lower() or "unknown"
+
+    def _short_agent_label(agent_id: Any) -> str:
+        raw = str(agent_id or "").strip().lower()
+        if not raw:
+            return "unknown"
+
+        prefixes = (
+            "odin_indicator_agent__",
+            "indicator_agent__",
+            "odin_price_agent__",
+            "price_agent__",
+            "odin_",
+        )
+        for prefix in prefixes:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
+
+        return _safe_column_part(raw)
+
+    def _overlay_base_column(record: dict[str, Any]) -> str:
+        agent_id = _short_agent_label(record.get("agent_id"))
+        output_id = _safe_column_part(record.get("output_id"))
+        schema = _safe_column_part(record.get("schema"))
+
+        if output_id == "unknown":
+            output_id = "default"
+
+        if output_id == "default":
+            return f"agent_{agent_id}_{schema}"
+
+        return f"agent_{agent_id}_{output_id}_{schema}"
+
+    def _csv_scalar(value: Any) -> Any:
+        if value is None:
+            return ""
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        return json.dumps(value, sort_keys=True)
+
+    sorted_candles = sorted(
+        candles,
+        key=lambda candle: (
+            str(candle.get("ts") or ""),
+            str(candle.get("id") or ""),
+            int(candle.get("rev") or 0),
+        ),
+    )
+
+    overlays_by_ts: dict[str, list[dict[str, Any]]] = {}
+    dynamic_columns: set[str] = set()
+
+    for overlay in overlays:
+        ts = str(overlay.get("ts") or "").strip()
+        if not ts:
+            continue
+
+        overlays_by_ts.setdefault(ts, []).append(overlay)
+
+        base = _overlay_base_column(overlay)
+        for field_name in ("value", "upper", "lower", "center", "title", "severity", "action"):
+            if overlay.get(field_name) is not None:
+                dynamic_columns.add(f"{base}.{field_name}")
+
+        metadata = overlay.get("metadata")
+        if isinstance(metadata, dict):
+            for metadata_key, metadata_value in metadata.items():
+                if metadata_value is None:
+                    continue
+                dynamic_columns.add(f"{base}.meta.{_safe_column_part(metadata_key)}")
+
+    fieldnames = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "bar_state",
+        "symbol",
+        "interval",
+        *sorted(dynamic_columns),
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for candle in sorted_candles:
+            ts = str(candle.get("ts") or "")
+            row: dict[str, Any] = {
+                "timestamp": ts,
+                "open": candle.get("open"),
+                "high": candle.get("high"),
+                "low": candle.get("low"),
+                "close": candle.get("close"),
+                "volume": candle.get("volume"),
+                "bar_state": candle.get("bar_state") or "",
+                "symbol": symbol,
+                "interval": interval,
+            }
+
+            for overlay in overlays_by_ts.get(ts, []):
+                base = _overlay_base_column(overlay)
+                for field_name in ("value", "upper", "lower", "center", "title", "severity", "action"):
+                    if overlay.get(field_name) is not None:
+                        row[f"{base}.{field_name}"] = _csv_scalar(overlay.get(field_name))
+
+                metadata = overlay.get("metadata")
+                if isinstance(metadata, dict):
+                    for metadata_key, metadata_value in metadata.items():
+                        if metadata_value is None:
+                            continue
+                        row[f"{base}.meta.{_safe_column_part(metadata_key)}"] = _csv_scalar(metadata_value)
+
+            writer.writerow(row)
+
+    return len(sorted_candles), len(overlays)
+
+
+async def _run_csv_export_job(job_id: str) -> None:
+    job = csv_export_jobs.get(job_id)
+    if not job:
+        return
+
+    job["status"] = "running"
+    job["started_at"] = datetime.now(timezone.utc).isoformat()
+    job["error"] = None
+
+    export_session_id: str | None = None
+
+    try:
+        session_id = str(job["session_id"])
+        symbol = str(job["symbol"])
+        interval = str(job["interval"])
+        start_at = _parse_export_date(str(job["start_date"]), end_of_day=False)
+        end_at = _parse_export_date(str(job["end_date"]), end_of_day=True)
+
+        session = session_manager.get_session(session_id)
+        if not session:
+            raise RuntimeError("Session not found")
+
+        source_connection = agent_manager.get_connection(session.agent_id)
+        if not source_connection:
+            raise RuntimeError(f"Primary agent connection unavailable: {session.agent_id}")
+
+        export_session_id = f"{session_id}::export::{job_id[:8]}"
+        session_manager.create_session(
+            session_id=export_session_id,
+            client_id=session.client_id,
+            agent_id=session.agent_id,
+            symbol=symbol,
+            interval=interval,
+        )
+
+        export_store = SessionDataStore(
+            session_id=export_session_id,
+            agent_id=session.agent_id,
+            symbol=symbol,
+            interval=interval,
+        )
+        export_days = max(1, math.ceil((end_at - start_at).total_seconds() / 86400))
+        export_store.update_retention(export_days + 2, interval)
+        session_data_stores[export_session_id] = export_store
+        session_seq_counters[export_session_id] = -1
+
+        indicator_connections: list[tuple[str, Any]] = []
+        for indicator_agent in agent_manager.list_indicator_agents():
+            if indicator_agent.config.agent_id == session.agent_id:
+                continue
+            indicator_connection = agent_manager.get_connection(indicator_agent.config.agent_id)
+            if not indicator_connection:
+                continue
+
+            indicator_params = sanitize_indicator_params(
+                indicator_agent.config.config_schema,
+                indicator_agent.config.indicators,
+                indicator_agent.config.selected_indicator_id,
+            )
+            subscribed = await indicator_connection.subscribe(
+                session_id=export_session_id,
+                symbol=symbol,
+                interval=interval,
+                params=indicator_params,
+                force=True,
+            )
+            if subscribed:
+                indicator_connections.append((indicator_agent.config.agent_id, indicator_connection))
+
+        windows = _iter_export_windows(start_at, end_at)
+        job["total_chunks"] = len(windows)
+        job["completed_chunks"] = 0
+
+        for index, (window_start, window_end) in enumerate(windows, start=1):
+            job["current_chunk"] = index
+            job["chunk_window"] = {
+                "from": window_start.isoformat(),
+                "to": window_end.isoformat(),
+            }
+
+            from_ts = source_connection._format_history_timestamp(window_start)
+            to_ts = source_connection._format_history_timestamp(window_end)
+            history_bars = await source_connection.fetch_history(symbol, from_ts, to_ts, interval)
+
+            ingested_chunk: list[dict[str, Any]] = []
+            for bar in history_bars:
+                normalized = export_store.ingest_ohlc(bar)
+                if normalized:
+                    ingested_chunk.append(normalized)
+
+            if ingested_chunk and indicator_connections:
+                candles_for_push = [to_indicator_ohlc(candle) for candle in _sorted_candles_for_push(ingested_chunk)]
+                await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
+                for _indicator_id, indicator_connection in indicator_connections:
+                    await indicator_connection.send_history_push(
+                        session_id=export_session_id,
+                        symbol=symbol,
+                        interval=interval,
+                        candles=candles_for_push,
+                    )
+
+            await _wait_for_export_settle(
+                export_store,
+                min_delay_seconds=float(job["settle_min_delay_seconds"]),
+                poll_seconds=float(job["settle_poll_seconds"]),
+                timeout_seconds=float(job["settle_timeout_seconds"]),
+            )
+
+            job["completed_chunks"] = index
+
+        candles_for_export = [
+            candle for candle in export_store.get_canonical_candles() if _record_in_range(candle, start_at, end_at)
+        ]
+        overlays_for_export = [
+            overlay for overlay in export_store.get_non_ohlc_records() if _record_in_range(overlay, start_at, end_at)
+        ]
+
+        output_path = csv_export_root / f"{job_id}.csv"
+        candle_count, overlay_count = _format_export_csv(
+            session_id=session_id,
+            symbol=symbol,
+            interval=interval,
+            candles=candles_for_export,
+            overlays=overlays_for_export,
+            output_path=output_path,
+        )
+
+        job["status"] = "completed"
+        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        job["download_file"] = str(output_path)
+        job["candle_count"] = candle_count
+        job["overlay_count"] = overlay_count
+    except Exception as exc:
+        job["status"] = "failed"
+        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        job["error"] = str(exc)
+        logger.exception("CSV export job failed (job_id=%s)", job_id)
+    finally:
+        if export_session_id:
+            for connection in agent_manager.connections.values():
+                try:
+                    if export_session_id in connection.subscriptions:
+                        await connection.unsubscribe(export_session_id)
+                except Exception as exc:
+                    logger.debug("Failed to unsubscribe export session %s: %s", export_session_id, exc)
+
+            session_manager.delete_session(export_session_id)
+            session_data_stores.pop(export_session_id, None)
+            session_seq_counters.pop(export_session_id, None)
+            session_subscribe_epochs.pop(export_session_id, None)
+            session_trade_revisions.pop(export_session_id, None)
+            latest_trade_results_by_session.pop(export_session_id, None)
+            applied_trade_strategy_by_session.pop(export_session_id, None)
+            clear_history_response_state_for_session(export_session_id)
+            for key in [key for key in indicator_seq_counters.keys() if key[1] == export_session_id]:
+                indicator_seq_counters.pop(key, None)
+
+        csv_export_tasks.pop(job_id, None)
 
 
 def _bump_domain_revision(domain: str) -> int:
@@ -385,7 +994,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Odin Backend",
-    description="Trading platform backend - ACP v0.4.0 session router",
+    description="Trading platform backend - ACP v0.4.2 session router",
     version=ACP_API_VERSION,
     lifespan=lifespan,
 )
@@ -440,6 +1049,20 @@ async def get_agent(agent_id: str):
     if not agent:
         return {"error": "Agent not found"}, 404
     return agent
+
+
+@app.get("/api/runtime/telemetry")
+async def get_runtime_telemetry():
+    """Phase 0 runtime telemetry snapshot for ingest/load baselining."""
+    snapshot = _telemetry_snapshot()
+    rps = float(snapshot.get("overlay_ingest", {}).get("rps_60s", 0.0))
+    if rps >= OVERLAY_INGEST_WARN_RPS:
+        logger.warning(
+            "[Telemetry] overlay ingest rate high: %.2f rps (threshold=%.2f)",
+            rps,
+            OVERLAY_INGEST_WARN_RPS,
+        )
+    return snapshot
 
 
 async def fetch_agent_metadata(agent_url: str) -> dict:
@@ -558,7 +1181,7 @@ async def rebootstrap_indicator_subscription(indicator_agent_id: str, session_id
     )
 
 
-async def recover_indicator_subscription(indicator_agent_id: str, session_id: str) -> None:
+async def recover_indicator_subscription(indicator_agent_id: str, session_id: str) -> bool:
     """
     Recover indicator subscription state when agent rejects history_push with SUBSCRIPTION_NOT_FOUND.
 
@@ -579,7 +1202,7 @@ async def recover_indicator_subscription(indicator_agent_id: str, session_id: st
 
     indicator_connection = agent_manager.get_connection(indicator_agent_id)
     if not indicator_connection:
-        return
+        return False
 
     subscription = indicator_connection.subscriptions.get(session_id)
     if not subscription:
@@ -588,16 +1211,17 @@ async def recover_indicator_subscription(indicator_agent_id: str, session_id: st
             indicator_agent_id,
             session_id,
         )
-        return
+        return False
 
     symbol = str(subscription.get("symbol") or "")
     interval = str(subscription.get("interval") or "")
     params = sanitize_indicator_params(
         subscription.get("params") or {},
         indicator_connection.agent.config.indicators,
+        indicator_connection.agent.config.selected_indicator_id,
     )
     if not symbol or not interval:
-        return
+        return False
 
     subscribe_ok = await indicator_connection.subscribe(
         session_id=session_id,
@@ -612,31 +1236,34 @@ async def recover_indicator_subscription(indicator_agent_id: str, session_id: st
             indicator_agent_id,
             session_id,
         )
-        return
+        return False
 
     data_store = session_data_stores.get(session_id)
     if not data_store:
-        return
+        return False
 
     canonical_candles = data_store.get_canonical_candles()
     if not canonical_candles:
-        return
+        return True
 
     candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
     await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
 
-    await indicator_connection.send_history_push(
+    send_ok = await indicator_connection.send_history_push(
         session_id=session_id,
         symbol=symbol,
         interval=interval,
         candles=candles_for_indicator,
     )
+    if not send_ok:
+        return False
     logger.info(
         "[Recovery] Recovered indicator subscription for %s (session=%s, candles=%s)",
         indicator_agent_id,
         session_id,
         len(candles_for_indicator),
     )
+    return True
 
 
 @app.post("/api/agents/discover")
@@ -666,9 +1293,9 @@ async def add_agent(request: AddAgentRequest):
     base_agent_id = metadata["agent_id"]
     agent_type = metadata["agent_type"]
     selected_indicator = None
-    runtime_config = sanitize_indicator_params(request.params or {}, metadata.get("indicators") or [])
     outputs = metadata.get("outputs") or []
     description = metadata.get("description", "")
+    selected_indicator_id: str | None = None
 
     final_agent_id = base_agent_id
     final_name = metadata["agent_name"]
@@ -680,6 +1307,7 @@ async def add_agent(request: AddAgentRequest):
         selected_indicator = next((item for item in indicators if item.get("indicator_id") == request.indicator_id), None)
         if not selected_indicator:
             raise HTTPException(status_code=400, detail=f"Unknown indicator_id: {request.indicator_id}")
+        selected_indicator_id = request.indicator_id
         indicator_base_agent_id = f"{base_agent_id}__{request.indicator_id}"
         final_agent_id, instance_index = next_available_indicator_instance(indicator_base_agent_id)
         final_name = f"{metadata['agent_name']} - {selected_indicator.get('name', request.indicator_id)}"
@@ -687,6 +1315,30 @@ async def add_agent(request: AddAgentRequest):
             final_name = f"{final_name} ({instance_index})"
         outputs = selected_indicator.get("outputs") or outputs
         description = selected_indicator.get("description") or description
+
+    runtime_config = sanitize_indicator_params(
+        request.params or {},
+        metadata.get("indicators") or [],
+        selected_indicator_id,
+    )
+    # Forward all UI-managed keys from incoming params so they survive sanitize_indicator_params.
+    # See UI_MANAGED_INDICATOR_CONFIG_KEYS in models.py (line_color, visible, force_subgraph, etc.).
+    _incoming_params = request.params or {}
+    _ui_keys = {
+        k: _incoming_params[k]
+        for k in UI_MANAGED_INDICATOR_CONFIG_KEYS
+        if k in _incoming_params and _incoming_params[k] is not None
+    }
+    stored_config = normalize_indicator_config(
+        agent_id=final_agent_id,
+        config_schema={
+            **runtime_config,
+            **_ui_keys,
+        },
+        indicators=metadata.get("indicators") or [],
+        outputs=outputs,
+        selected_indicator_id=selected_indicator_id,
+    )
 
     agent_config = AgentConfig(
         spec_version=ACP_SPEC_VERSION,
@@ -696,9 +1348,10 @@ async def add_agent(request: AddAgentRequest):
         agent_version=metadata["agent_version"],
         description=description,
         agent_type=agent_type,
-        config_schema=runtime_config,
+        config_schema=stored_config,
         outputs=outputs,
         indicators=metadata.get("indicators") or [],
+        selected_indicator_id=selected_indicator_id,
         transport_limits=metadata.get("transport_limits") or {},
     )
 
@@ -780,9 +1433,51 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    updated_config = dict(agent.config.config_schema or {})
-    updated_config.update(request.params or {})
-    updated_config = sanitize_indicator_params(updated_config, agent.config.indicators)
+    selected_indicator_id = agent.config.selected_indicator_id or infer_selected_indicator_id(
+        agent_id=agent.config.agent_id,
+        indicators=agent.config.indicators,
+        outputs=agent.config.outputs,
+        config_schema=agent.config.config_schema,
+        selected_indicator_id=agent.config.selected_indicator_id,
+    )
+    existing_runtime_config = sanitize_indicator_params(
+        agent.config.config_schema,
+        agent.config.indicators,
+        selected_indicator_id,
+    )
+    request_runtime_config = sanitize_indicator_params(
+        request.params or {},
+        agent.config.indicators,
+        selected_indicator_id,
+    )
+    updated_runtime_config = {
+        **existing_runtime_config,
+        **request_runtime_config,
+    }
+    # Forward all UI-managed keys: preserve existing values, allow request to override.
+    # This ensures keys like visible, force_subgraph, line_color survive the
+    # sanitize_indicator_params pipeline which only keeps schema-declared keys.
+    _existing_ui_keys = {
+        k: agent.config.config_schema[k]
+        for k in UI_MANAGED_INDICATOR_CONFIG_KEYS
+        if k in agent.config.config_schema and agent.config.config_schema[k] is not None
+    }
+    _request_ui_keys = {
+        k: (request.params or {})[k]
+        for k in UI_MANAGED_INDICATOR_CONFIG_KEYS
+        if k in (request.params or {}) and (request.params or {})[k] is not None
+    }
+    updated_config = normalize_indicator_config(
+        agent_id=agent.config.agent_id,
+        config_schema={
+            **updated_runtime_config,
+            **_existing_ui_keys,
+            **_request_ui_keys,
+        },
+        indicators=agent.config.indicators,
+        outputs=agent.config.outputs,
+        selected_indicator_id=selected_indicator_id,
+    )
 
     updated_agent_config = AgentConfig(
         spec_version=agent.config.spec_version,
@@ -795,6 +1490,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
         config_schema=updated_config,
         outputs=agent.config.outputs,
         indicators=agent.config.indicators,
+        selected_indicator_id=selected_indicator_id,
         transport_limits=agent.config.transport_limits,
     )
 
@@ -816,7 +1512,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                 session_id=session_id,
                 symbol=symbol,
                 interval=interval,
-                params=updated_config,
+                params=updated_runtime_config,
             )
 
             if session_id in session_data_stores:
@@ -865,6 +1561,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
             continue
 
         try:
+            recompute_started = perf_counter()
             result = evaluate_strategy(
                 session_id=session_id,
                 strategy_name=str(strategy.get("strategy_name") or "Unsaved Strategy"),
@@ -874,6 +1571,17 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                 short_exit_rules=list(strategy.get("short_exit_rules") or []),
                 data_store=data_store,
             )
+            recompute_ms = (perf_counter() - recompute_started) * 1000.0
+            _increment_telemetry_counter("trade_recompute_total")
+            _record_latency_ms("trade_recompute", recompute_ms)
+            if recompute_ms >= TRADE_RECOMPUTE_WARN_MS:
+                logger.warning(
+                    "[Telemetry] auto trade recompute latency high: %.2fms session=%s strategy=%s threshold=%.2fms",
+                    recompute_ms,
+                    session_id,
+                    strategy.get("strategy_name"),
+                    TRADE_RECOMPUTE_WARN_MS,
+                )
             latest_trade_results_by_session[session_id] = result
             await emit_state_event(
                 event_name="trade.results.recomputed",
@@ -886,6 +1594,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                 },
             )
         except Exception as exc:
+            _increment_telemetry_counter("trade_recompute_failed_total")
             logger.warning("Auto-recompute failed for session %s after agent update: %s", session_id, exc)
 
     return {"agent": updated_agent.to_frontend_format()}
@@ -1088,11 +1797,41 @@ async def get_session_variables(session_id: str):
 
             # For area schema, expose upper/lower bounds as independent variables
             elif output_schema == "area":
-                label = output.get("label", output_id)
                 for field in ["upper", "lower"]:
-                    var_name = f"{agent_name}:{label}:{field}"
+                    var_name = build_area_field_variable_name(agent_name, output, field)
                     variables.append(Variable(
                         name=var_name,
+                        type="indicator",
+                        schema="area",
+                        agent_id=agent_id,
+                        output_id=output_id
+                    ))
+
+                # Also expose numeric metadata fields for area outputs.
+                # Useful for rich area indicators that emit additional context
+                # (e.g. directional state, phase, confidence) in record.metadata.
+                metadata_numeric_keys: set[str] = set()
+                for (record_agent_id, _record_id), record in data_store.latest_non_ohlc_by_key.items():
+                    if record_agent_id != agent_id:
+                        continue
+
+                    record_output_id = record.get("output_id")
+                    if output_id and record_output_id and str(record_output_id) != str(output_id):
+                        continue
+
+                    metadata = record.get("metadata")
+                    if not isinstance(metadata, dict):
+                        continue
+
+                    for metadata_key, metadata_value in metadata.items():
+                        if isinstance(metadata_value, bool):
+                            continue
+                        if isinstance(metadata_value, (int, float)):
+                            metadata_numeric_keys.add(str(metadata_key))
+
+                for metadata_key in sorted(metadata_numeric_keys):
+                    variables.append(Variable(
+                        name=build_area_metadata_variable_name(agent_name, output, metadata_key),
                         type="indicator",
                         schema="area",
                         agent_id=agent_id,
@@ -1119,6 +1858,151 @@ async def get_session_variables(session_id: str):
     }
 
 
+@app.post("/api/sessions/{session_id}/exports/csv")
+async def create_csv_export_job(session_id: str, request: CreateCsvExportRequest):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        raise HTTPException(status_code=404, detail="Session data store not found")
+
+    interval = str(request.interval or "").strip() or session.interval
+    if interval != session.interval:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Export interval must match active session interval ({session.interval})",
+        )
+
+    try:
+        start_at = _parse_export_date(request.start_date, end_of_day=False)
+        end_at = _parse_export_date(request.end_date, end_of_day=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if start_at > end_at:
+        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+
+    if not data_store.get_canonical_candles():
+        raise HTTPException(status_code=409, detail="Session has no candle data yet")
+
+    job_id = str(uuid4())
+    csv_export_jobs[job_id] = {
+        "job_id": job_id,
+        "session_id": session_id,
+        "symbol": session.symbol,
+        "interval": interval,
+        "start_date": request.start_date,
+        "end_date": request.end_date,
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "total_chunks": 0,
+        "completed_chunks": 0,
+        "current_chunk": 0,
+        "chunk_window": None,
+        "settle_min_delay_seconds": request.settle_min_delay_seconds,
+        "settle_poll_seconds": request.settle_poll_seconds,
+        "settle_timeout_seconds": request.settle_timeout_seconds,
+        "download_file": None,
+        "candle_count": 0,
+        "overlay_count": 0,
+    }
+
+    csv_export_tasks[job_id] = asyncio.create_task(_run_csv_export_job(job_id))
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "session_id": session_id,
+        "symbol": session.symbol,
+        "interval": interval,
+        "start_date": request.start_date,
+        "end_date": request.end_date,
+    }
+
+
+@app.get("/api/sessions/{session_id}/exports/csv/{job_id}")
+async def get_csv_export_job(session_id: str, job_id: str):
+    job = csv_export_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+
+    if str(job.get("session_id")) != session_id:
+        raise HTTPException(status_code=404, detail="Export job not found for session")
+
+    return {
+        "job_id": job_id,
+        "session_id": session_id,
+        "symbol": job.get("symbol"),
+        "interval": job.get("interval"),
+        "status": job.get("status"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "error": job.get("error"),
+        "start_date": job.get("start_date"),
+        "end_date": job.get("end_date"),
+        "total_chunks": job.get("total_chunks"),
+        "completed_chunks": job.get("completed_chunks"),
+        "current_chunk": job.get("current_chunk"),
+        "chunk_window": job.get("chunk_window"),
+        "candle_count": job.get("candle_count"),
+        "overlay_count": job.get("overlay_count"),
+        "ready": job.get("status") == "completed" and bool(job.get("download_file")),
+    }
+
+
+@app.get("/api/sessions/{session_id}/exports/csv/{job_id}/download")
+async def download_csv_export_job(session_id: str, job_id: str):
+    job = csv_export_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+
+    if str(job.get("session_id")) != session_id:
+        raise HTTPException(status_code=404, detail="Export job not found for session")
+
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Export job is not completed")
+
+    file_path_raw = str(job.get("download_file") or "").strip()
+    if not file_path_raw:
+        raise HTTPException(status_code=404, detail="Export file missing")
+
+    file_path = Path(file_path_raw)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Export file missing")
+
+    filename = f"odin_export_{session_id}_{job.get('start_date')}_{job.get('end_date')}.csv"
+    return FileResponse(path=file_path, media_type="text/csv", filename=filename)
+
+
+@app.post("/api/sessions/{session_id}/research/evaluate")
+async def evaluate_session_research_expression(session_id: str, request: EvaluateResearchExpressionRequest):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        raise HTTPException(status_code=404, detail="Session data store not found")
+
+    try:
+        result = evaluate_research_expression(
+            session_id=session_id,
+            expression=request.expression,
+            output_schema=request.output_schema,
+            data_store=data_store,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return result
+
+
 @app.get("/api/sessions/{session_id}/trade-strategies")
 async def list_trade_strategies(session_id: str):
     store = get_trade_strategy_store()
@@ -1141,14 +2025,14 @@ async def get_trade_strategy(session_id: str, strategy_name: str):
 
 @app.put("/api/sessions/{session_id}/trade-strategies/{strategy_name}")
 async def upsert_trade_strategy(session_id: str, strategy_name: str, request: UpsertTradeStrategyRequest):
-    long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(
+    long_entry_rules, long_exit_rules, short_entry_rules, short_exit_rules = _normalize_strategy_rules_payload(
         request.model_dump()
     )
 
     validation = validate_strategy_v2(
-        long_entry_rule=long_entry_rule,
+        long_entry_rules=long_entry_rules,
         long_exit_rules=long_exit_rules,
-        short_entry_rule=short_entry_rule,
+        short_entry_rules=short_entry_rules,
         short_exit_rules=short_exit_rules,
     )
     if not validation.valid:
@@ -1159,9 +2043,9 @@ async def upsert_trade_strategy(session_id: str, strategy_name: str, request: Up
         session_id=session_id,
         name=strategy_name,
         description=request.description,
-        long_entry_rule=long_entry_rule,
+        long_entry_rules=long_entry_rules,
         long_exit_rules=long_exit_rules,
-        short_entry_rule=short_entry_rule,
+        short_entry_rules=short_entry_rules,
         short_exit_rules=short_exit_rules,
     )
     return saved
@@ -1182,14 +2066,14 @@ async def delete_trade_strategy(session_id: str, strategy_name: str):
 
 @app.post("/api/sessions/{session_id}/trade-strategies/validate")
 async def validate_trade_strategy(session_id: str, request: ValidateTradeStrategyRequest):
-    long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(
+    long_entry_rules, long_exit_rules, short_entry_rules, short_exit_rules = _normalize_strategy_rules_payload(
         request.model_dump()
     )
 
     validation = validate_strategy_v2(
-        long_entry_rule=long_entry_rule,
+        long_entry_rules=long_entry_rules,
         long_exit_rules=long_exit_rules,
-        short_entry_rule=short_entry_rule,
+        short_entry_rules=short_entry_rules,
         short_exit_rules=short_exit_rules,
     )
     return {
@@ -1210,38 +2094,52 @@ async def apply_trade_strategy(session_id: str, request: ApplyTradeStrategyReque
         raise HTTPException(status_code=404, detail="Session data store not found")
 
     strategy_name = (request.strategy_name or "").strip()
-    long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(
+    long_entry_rules, long_exit_rules, short_entry_rules, short_exit_rules = _normalize_strategy_rules_payload(
         request.model_dump()
     )
 
-    if strategy_name and not long_entry_rule and not long_exit_rules and not short_entry_rule and not short_exit_rules:
+    if strategy_name and not long_entry_rules and not long_exit_rules and not short_entry_rules and not short_exit_rules:
         store = get_trade_strategy_store()
         saved = store.get_strategy(session_id, strategy_name)
         if not saved:
             raise HTTPException(status_code=404, detail="Strategy not found")
-        long_entry_rule, long_exit_rules, short_entry_rule, short_exit_rules = _normalize_strategy_rules_payload(saved)
+        long_entry_rules, long_exit_rules, short_entry_rules, short_exit_rules = _normalize_strategy_rules_payload(saved)
 
     if not strategy_name:
         strategy_name = "Unsaved Strategy"
 
-    if not long_entry_rule and not short_entry_rule:
+    if not long_entry_rules and not short_entry_rules:
         raise HTTPException(
             status_code=400,
             detail="Provide strategy rules (long and/or short), or provide strategy_name for a saved strategy",
         )
 
+    recompute_started = perf_counter()
     try:
         result = evaluate_strategy(
             session_id=session_id,
             strategy_name=strategy_name,
-            long_entry_rule=long_entry_rule,
+            long_entry_rules=long_entry_rules,
             long_exit_rules=long_exit_rules,
-            short_entry_rule=short_entry_rule,
+            short_entry_rules=short_entry_rules,
             short_exit_rules=short_exit_rules,
             data_store=data_store,
         )
     except ValueError as exc:
+        _increment_telemetry_counter("trade_recompute_failed_total")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    recompute_ms = (perf_counter() - recompute_started) * 1000.0
+    _increment_telemetry_counter("trade_recompute_total")
+    _record_latency_ms("trade_recompute", recompute_ms)
+    if recompute_ms >= TRADE_RECOMPUTE_WARN_MS:
+        logger.warning(
+            "[Telemetry] trade recompute latency high: %.2fms session=%s strategy=%s threshold=%.2fms",
+            recompute_ms,
+            session_id,
+            strategy_name,
+            TRADE_RECOMPUTE_WARN_MS,
+        )
 
     performance = result.get("performance") if isinstance(result, dict) else None
     logger.info(
@@ -1259,9 +2157,9 @@ async def apply_trade_strategy(session_id: str, request: ApplyTradeStrategyReque
     latest_trade_results_by_session[session_id] = result
     applied_trade_strategy_by_session[session_id] = {
         "strategy_name": strategy_name,
-        "long_entry_rule": long_entry_rule,
+        "long_entry_rules": long_entry_rules,
         "long_exit_rules": long_exit_rules,
-        "short_entry_rule": short_entry_rule,
+        "short_entry_rules": short_entry_rules,
         "short_exit_rules": short_exit_rules,
     }
 
@@ -1371,6 +2269,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if session_id in session_data_stores:
                 del session_data_stores[session_id]
             session_seq_counters.pop(session_id, None)
+            session_subscribe_epochs.pop(session_id, None)
             session_trade_revisions.pop(session_id, None)
             latest_trade_results_by_session.pop(session_id, None)
             applied_trade_strategy_by_session.pop(session_id, None)
@@ -1404,6 +2303,9 @@ async def handle_subscribe_request(
         })
         logger.warning(f"Invalid subscribe_request from {client_id}: missing required fields")
         return
+
+    request_epoch = int(session_subscribe_epochs.get(session_id, 0)) + 1
+    session_subscribe_epochs[session_id] = request_epoch
     
     # Get agent connection
     connection = agent_manager.get_connection(agent_id)
@@ -1426,6 +2328,10 @@ async def handle_subscribe_request(
         symbol=symbol,
         interval=interval
     )
+    session.agent_id = agent_id
+    session.symbol = symbol
+    session.interval = interval
+    session.last_activity_at = datetime.now(timezone.utc).isoformat()
     logger.info(f"📊 Using session {session_id} for client {client_id}: {agent_id} {symbol} @ {interval}")
 
     if not connection.metadata_fetched:
@@ -1482,6 +2388,14 @@ async def handle_subscribe_request(
             f"📚 Skipping historical fetch for session {session_id}: timeframe_days={timeframe_days}"
         )
 
+    if session_subscribe_epochs.get(session_id) != request_epoch:
+        logger.info(
+            "⏭️ Skipping stale subscribe flow for session %s (epoch=%s)",
+            session_id,
+            request_epoch,
+        )
+        return
+
     # Always send a snapshot so frontend can complete history-loading state.
     # Use canonical candles (all latest revisions) rather than finalized-only to include
     # in-flight bars like "session_reconciled" that haven't yet reached "final" state
@@ -1514,6 +2428,14 @@ async def handle_subscribe_request(
         params={"timeframe_days": timeframe_days}
     )
     logger.info(f"✅ [handle_subscribe_request] connection.subscribe returned: {subscribe_result}")
+
+    if session_subscribe_epochs.get(session_id) != request_epoch:
+        logger.info(
+            "⏭️ Skipping stale post-subscribe indicator flow for session %s (epoch=%s)",
+            session_id,
+            request_epoch,
+        )
+        return
     
     logger.info(f"📚 Price agent subscribed, now subscribing indicator agents for session {session_id}...")
     canonical_candles = data_store.get_canonical_candles()
@@ -1531,6 +2453,7 @@ async def handle_subscribe_request(
         indicator_params = sanitize_indicator_params(
             indicator_config.config_schema,
             indicator_config.indicators,
+            indicator_config.selected_indicator_id,
         )
 
         indicator_subscribe_result = await indicator_connection.subscribe(
@@ -1538,11 +2461,26 @@ async def handle_subscribe_request(
             symbol=symbol,
             interval=interval,
             params=indicator_params,
+            force=True,
         )
 
         if indicator_subscribe_result and canonical_candles:
+            if session_subscribe_epochs.get(session_id) != request_epoch:
+                logger.info(
+                    "⏭️ Skipping stale history_push for session %s (epoch=%s)",
+                    session_id,
+                    request_epoch,
+                )
+                return
             candles_for_indicator = [to_indicator_ohlc(candle) for candle in canonical_candles]
             await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
+            if session_subscribe_epochs.get(session_id) != request_epoch:
+                logger.info(
+                    "⏭️ Skipping stale delayed history_push for session %s (epoch=%s)",
+                    session_id,
+                    request_epoch,
+                )
+                return
             await indicator_connection.send_history_push(
                 session_id=session_id,
                 symbol=symbol,
@@ -1592,6 +2530,7 @@ async def handle_unsubscribe_request(
     if session_id in session_data_stores:
         del session_data_stores[session_id]
     session_seq_counters.pop(session_id, None)
+    session_subscribe_epochs.pop(session_id, None)
     session_trade_revisions.pop(session_id, None)
     latest_trade_results_by_session.pop(session_id, None)
     applied_trade_strategy_by_session.pop(session_id, None)
@@ -1863,6 +2802,8 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         error_code = str(message.get("code") or "")
         error_text = str(message.get("message") or "")
 
+        recovered = False
+
         if error_code == "SUBSCRIPTION_NOT_FOUND":
             logger.warning(
                 "[Recovery] Triggered by %s for indicator=%s session=%s message=%s",
@@ -1872,7 +2813,7 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
                 error_text,
             )
             try:
-                await recover_indicator_subscription(agent_id, session_id)
+                recovered = await recover_indicator_subscription(agent_id, session_id)
             except Exception as exc:
                 logger.warning(
                     "[Recovery] Failed for indicator=%s session=%s: %s",
@@ -1880,6 +2821,34 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
                     session_id,
                     exc,
                 )
+
+            if recovered:
+                logger.info(
+                    "[Recovery] Suppressing transient SUBSCRIPTION_NOT_FOUND for indicator=%s session=%s",
+                    agent_id,
+                    session_id,
+                )
+                agent = agent_manager.get_agent(agent_id)
+                previous_status: str | None = None
+                if agent:
+                    previous_status = agent.status.status
+                    agent.status.status = "online"
+                    agent.status.error_message = None
+
+                if previous_status == "error":
+                    await emit_state_event(
+                        event_name="agent.status.changed",
+                        domain="agent",
+                        session_id=session_id,
+                        target_client_id=client_id,
+                        payload={
+                            "agent_id": agent_id,
+                            "status": "online",
+                            "previous_status": previous_status,
+                            "error": None,
+                        },
+                    )
+                return
 
         agent = agent_manager.get_agent(agent_id)
         previous_status: str | None = None
@@ -2033,11 +3002,26 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         # Ingest overlay records into session data store
         if session_id in session_data_stores:
             data_store = session_data_stores[session_id]
+            ingested_count = 0
             for overlay_record in merged_overlays:
                 # Non-OHLC records use simple id-based dedup
-                result = data_store.ingest_non_ohlc(overlay_record, source_agent_id=agent_id)
+                result = data_store.ingest_non_ohlc(
+                    overlay_record,
+                    source_agent_id=agent_id,
+                    schema=str(overlay_record.get("schema") or message.get("schema") or ""),
+                    subscription_id=str(
+                        overlay_record.get("subscription_id")
+                        or message.get("subscription_id")
+                        or f"{session_id}::{agent_id}"
+                    ),
+                    output_id=str(overlay_record.get("output_id") or message.get("output_id") or ""),
+                )
                 if result:
+                    ingested_count += 1
                     logger.debug(f"📥 Overlay record ingested: id={result.get('id')}")
+            if ingested_count > 0:
+                _record_overlay_ingest(ingested_count)
+            _increment_telemetry_counter("overlay_ingest_history_messages_total")
         
         # Ensure agent_id is set to the runtime instance ID
         message["agent_id"] = agent_id
@@ -2071,9 +3055,17 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         
         if isinstance(record, dict) and session_id in session_data_stores:
             data_store = session_data_stores[session_id]
-            result = data_store.ingest_non_ohlc(record, source_agent_id=agent_id)
+            result = data_store.ingest_non_ohlc(
+                record,
+                source_agent_id=agent_id,
+                schema=str(message.get("schema") or record.get("schema") or ""),
+                subscription_id=str(message.get("subscription_id") or f"{session_id}::{agent_id}"),
+                output_id=str(message.get("output_id") or record.get("output_id") or ""),
+            )
             
             if result:
+                _record_overlay_ingest(1)
+                _increment_telemetry_counter("overlay_ingest_update_messages_total")
                 message["record"] = result
             else:
                 return
@@ -2094,7 +3086,13 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         
         if isinstance(record, dict) and session_id in session_data_stores:
             data_store = session_data_stores[session_id]
-            result = data_store.ingest_non_ohlc(record, source_agent_id=agent_id)
+            result = data_store.ingest_non_ohlc(
+                record,
+                source_agent_id=agent_id,
+                schema=str(message.get("schema") or record.get("schema") or "event"),
+                subscription_id=str(message.get("subscription_id") or f"{session_id}::{agent_id}"),
+                output_id=str(message.get("output_id") or record.get("output_id") or ""),
+            )
             
             if result:
                 message["record"] = result

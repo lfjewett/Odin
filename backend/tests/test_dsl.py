@@ -10,8 +10,20 @@ Tests for the Trade Manager Phase 1 DSL including:
 - Math operators and functions
 """
 
+from types import SimpleNamespace
+
 import pytest
-from app.trade_engine import RuleParser, validate_rule_ast, parse_rule, validate_strategy_v2
+from app.agent_data_store import SessionDataStore
+from app.models import build_area_field_variable_name, build_area_metadata_variable_name
+import app.trade_engine as trade_engine
+from app.trade_engine import (
+    RuleParser,
+    evaluate_research_expression,
+    evaluate_strategy,
+    validate_rule_ast,
+    parse_rule,
+    validate_strategy_v2,
+)
 
 
 def validate_long_only(entry_rule: str, exit_rule: str):
@@ -78,6 +90,255 @@ class TestIndicatorVariables:
         assert ast["left"]["left"]["type"] == "compare"
         assert ast["left"]["left"]["left"]["name"] == "SMA-20:SMA"
         assert ast["left"]["left"]["right"]["name"] == "SMA-50:SMA"
+
+
+class TestAreaMetadataVariableNames:
+    """Test canonical and legacy metadata variable naming behavior for area outputs."""
+
+    def test_canonical_metadata_name_drops_duplicate_output_label(self):
+        output = {
+            "schema": "area",
+            "output_id": "Gungnir",
+            "label": "Gungnir",
+        }
+
+        name = build_area_metadata_variable_name("Gungnir", output, "dist")
+        assert name == "Gungnir:dist"
+
+    def test_canonical_area_bounds_drop_duplicate_output_label(self):
+        output = {
+            "schema": "area",
+            "output_id": "Gungnir",
+            "label": "Gungnir",
+        }
+
+        upper_name = build_area_field_variable_name("Gungnir", output, "upper")
+        lower_name = build_area_field_variable_name("Gungnir", output, "lower")
+        assert upper_name == "Gungnir:upper"
+        assert lower_name == "Gungnir:lower"
+
+    def test_indicator_map_supports_canonical_and_legacy_metadata_names(self, monkeypatch):
+        store = SessionDataStore(
+            session_id="session-1",
+            agent_id="ohlc-agent",
+            symbol="TEST",
+            interval="5m",
+        )
+
+        indicator_agent_id = "indicator-gungnir"
+        ts = "2026-01-05T14:30:00+00:00"
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "rec-1")] = {
+            "id": "rec-1",
+            "ts": ts,
+            "output_id": "Gungnir",
+            "upper": 105.0,
+            "lower": 95.0,
+            "metadata": {"dist": 12.5},
+        }
+
+        fake_agent = SimpleNamespace(
+            config=SimpleNamespace(
+                agent_name="Gungnir",
+                outputs=[
+                    {
+                        "schema": "area",
+                        "output_id": "Gungnir",
+                        "label": "Gungnir",
+                    }
+                ],
+            )
+        )
+
+        monkeypatch.setattr(
+            trade_engine.agent_manager,
+            "get_agent",
+            lambda agent_id: fake_agent if agent_id == indicator_agent_id else None,
+        )
+
+        variables = trade_engine._build_indicator_variable_maps(store)
+
+        assert variables["Gungnir:upper"][ts] == 105.0
+        assert variables["Gungnir:Gungnir:upper"][ts] == 105.0
+        assert variables["Gungnir:lower"][ts] == 95.0
+        assert variables["Gungnir:Gungnir:lower"][ts] == 95.0
+        assert variables["Gungnir:dist"][ts] == 12.5
+        assert variables["Gungnir:Gungnir:meta_dist"][ts] == 12.5
+
+    def test_single_area_output_without_output_id_still_evaluates(self, monkeypatch):
+        store = SessionDataStore(
+            session_id="session-1",
+            agent_id="ohlc-agent",
+            symbol="TEST",
+            interval="5m",
+        )
+
+        candles = [
+            {"id": "c1", "ts": "2026-01-05T14:35:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+            {"id": "c2", "ts": "2026-01-05T20:55:00+00:00", "open": 100, "high": 101, "low": 98, "close": 99, "volume": 1000},
+        ]
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+
+        indicator_agent_id = "indicator-gungnir"
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "rec-1")] = {
+            "id": "rec-1",
+            "ts": "2026-01-05T14:35:00+00:00",
+            "upper": 110.0,
+            "lower": 100.0,
+            "metadata": {"dist": 10.0},
+        }
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "rec-2")] = {
+            "id": "rec-2",
+            "ts": "2026-01-05T20:55:00+00:00",
+            "upper": 111.0,
+            "lower": 101.0,
+            "metadata": {"dist": 10.0},
+        }
+
+        fake_agent = SimpleNamespace(
+            config=SimpleNamespace(
+                agent_name="Gungnir",
+                outputs=[
+                    {
+                        "schema": "area",
+                        "output_id": "Gungnir",
+                        "label": "Gungnir",
+                    }
+                ],
+            )
+        )
+
+        monkeypatch.setattr(
+            trade_engine.agent_manager,
+            "get_agent",
+            lambda agent_id: fake_agent if agent_id == indicator_agent_id else None,
+        )
+
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="gungnir-area-entry",
+            long_entry_rules=[
+                "TIME > 0930 AND TIME < 1550 AND Gungnir:upper > Gungnir:lower AND LOW < Gungnir:lower AND !IN_BULL_TRADE"
+            ],
+            long_exit_rules=["IN_BULL_TRADE AND TIME == 1555"],
+            short_entry_rules=[],
+            short_exit_rules=[],
+            data_store=store,
+        )
+
+
+class TestResearchExpressionEvaluation:
+    def test_boolean_expression_renders_binary_line(self, monkeypatch):
+        store = SessionDataStore(
+            session_id="session-r1",
+            agent_id="ohlc-agent",
+            symbol="SPY",
+            interval="5m",
+        )
+
+        candles = [
+            {"id": "c1", "ts": "2026-01-05T14:35:00+00:00", "open": 101, "high": 106, "low": 99, "close": 100, "volume": 1000},
+            {"id": "c2", "ts": "2026-01-05T20:55:00+00:00", "open": 100, "high": 104, "low": 98, "close": 99, "volume": 1000},
+        ]
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+
+        indicator_agent_id = "indicator-gungnir"
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "r1")] = {
+            "id": "r1",
+            "ts": "2026-01-05T14:35:00+00:00",
+            "output_id": "Gungnir",
+            "upper": 90.0,
+            "lower": 100.0,
+        }
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "r2")] = {
+            "id": "r2",
+            "ts": "2026-01-05T20:55:00+00:00",
+            "output_id": "Gungnir",
+            "upper": 90.0,
+            "lower": 100.0,
+        }
+
+        fake_agent = SimpleNamespace(
+            config=SimpleNamespace(
+                agent_name="Gungnir",
+                outputs=[{"schema": "area", "output_id": "Gungnir", "label": "Gungnir"}],
+            )
+        )
+        monkeypatch.setattr(
+            trade_engine.agent_manager,
+            "get_agent",
+            lambda agent_id: fake_agent if agent_id == indicator_agent_id else None,
+        )
+
+        result = evaluate_research_expression(
+            session_id="session-r1",
+            expression="TIME > 0930 AND TIME < 1550 AND Gungnir:upper < Gungnir:lower AND HIGH > Gungnir:lower",
+            output_schema="line",
+            data_store=store,
+        )
+
+        assert result["schema"] == "line"
+        assert result["count"] == 2
+        assert [record["value"] for record in result["records"]] == [1.0, 0.0]
+
+    def test_numeric_expression_renders_area_split(self, monkeypatch):
+        store = SessionDataStore(
+            session_id="session-r2",
+            agent_id="ohlc-agent",
+            symbol="SPY",
+            interval="5m",
+        )
+
+        candles = [
+            {"id": "c1", "ts": "2026-01-06T14:35:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+            {"id": "c2", "ts": "2026-01-06T14:40:00+00:00", "open": 100, "high": 101, "low": 98, "close": 99, "volume": 1000},
+        ]
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+
+        indicator_agent_id = "indicator-gungnir"
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "r1")] = {
+            "id": "r1",
+            "ts": "2026-01-06T14:35:00+00:00",
+            "output_id": "Gungnir",
+            "upper": 110.0,
+            "lower": 100.0,
+        }
+        store.latest_non_ohlc_by_key[(indicator_agent_id, "r2")] = {
+            "id": "r2",
+            "ts": "2026-01-06T14:40:00+00:00",
+            "output_id": "Gungnir",
+            "upper": 95.0,
+            "lower": 100.0,
+        }
+
+        fake_agent = SimpleNamespace(
+            config=SimpleNamespace(
+                agent_name="Gungnir",
+                outputs=[{"schema": "area", "output_id": "Gungnir", "label": "Gungnir"}],
+            )
+        )
+        monkeypatch.setattr(
+            trade_engine.agent_manager,
+            "get_agent",
+            lambda agent_id: fake_agent if agent_id == indicator_agent_id else None,
+        )
+
+        result = evaluate_research_expression(
+            session_id="session-r2",
+            expression="Gungnir:upper - Gungnir:lower",
+            output_schema="area",
+            data_store=store,
+        )
+
+        assert result["schema"] == "area"
+        assert result["count"] == 2
+        assert result["records"][0]["upper"] == 10.0
+        assert result["records"][0]["lower"] == 0.0
+        assert result["records"][1]["upper"] == 0.0
+        assert result["records"][1]["lower"] == -5.0
+        assert result["records"][0]["metadata"]["subgraph"] is True
 
 
 class TestBooleanIdentifiers:
@@ -260,6 +521,61 @@ class TestBuiltinCandles:
         assert ast["left"]["name"] == "LOWER_WICK"
 
 
+class TestPositionAwareVariables:
+    """Test runtime support for position-aware variables like ENTRY_PRICE"""
+
+    def _build_store(self) -> SessionDataStore:
+        store = SessionDataStore(session_id="session-1", agent_id="ohlc-agent", symbol="TEST", interval="5m")
+        candles = [
+            {"id": "c1", "ts": "2026-01-05T14:30:00+00:00", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000},
+            {"id": "c2", "ts": "2026-01-05T14:35:00+00:00", "open": 103, "high": 104, "low": 102, "close": 103, "volume": 1000},
+            {"id": "c3", "ts": "2026-01-05T14:40:00+00:00", "open": 101, "high": 102, "low": 100, "close": 101, "volume": 1000},
+            {"id": "c4", "ts": "2026-01-05T14:45:00+00:00", "open": 98, "high": 99, "low": 97, "close": 98, "volume": 1000},
+        ]
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+        return store
+
+    def test_entry_price_drives_long_and_short_exits(self):
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="entry-price-test",
+            long_entry_rule="TIME == 930 AND !IN_BULL_TRADE",
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE > ENTRY_PRICE + 2"],
+            short_entry_rule="TIME == 940 AND !IN_BEAR_TRADE AND !IN_BULL_TRADE",
+            short_exit_rules=["IN_BEAR_TRADE AND CLOSE < ENTRY_PRICE - 2"],
+            data_store=self._build_store(),
+        )
+
+        assert [marker["action"] for marker in result["markers"]] == [
+            "LONG_ENTRY",
+            "LONG_EXIT",
+            "SHORT_ENTRY",
+            "SHORT_EXIT",
+        ]
+        assert result["performance"]["total_trades"] == 2
+        assert result["performance"]["final_equity"] > result["performance"]["starting_capital"]
+
+    def test_long_and_short_can_be_open_together(self):
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="dual-side-test",
+            long_entry_rule="TIME == 930 AND !IN_BULL_TRADE",
+            long_exit_rules=["TIME == 935 AND IN_BULL_TRADE AND ENTRY_PRICE == 100"],
+            short_entry_rule="TIME == 930 AND !IN_BEAR_TRADE",
+            short_exit_rules=["TIME == 940 AND IN_BEAR_TRADE AND ENTRY_PRICE == 100"],
+            data_store=self._build_store(),
+        )
+
+        assert [marker["action"] for marker in result["markers"]] == [
+            "LONG_ENTRY",
+            "SHORT_ENTRY",
+            "LONG_EXIT",
+            "SHORT_EXIT",
+        ]
+        assert result["performance"]["total_trades"] == 2
+
+
 class TestWithinFunction:
     """Test WITHIN temporal logic"""
     
@@ -386,6 +702,157 @@ class TestComplexStrategies:
             "BODY < 0.5 AND IN_BULL_TRADE"
         )
         assert result.valid
+
+
+class TestDailyPnl:
+    """Test DAILY_PNL variable — resets each ET day, gates on daily realized P&L"""
+
+    def _build_store(self, candles: list[dict]) -> SessionDataStore:
+        store = SessionDataStore(session_id="session-1", agent_id="ohlc-agent", symbol="TEST", interval="5m")
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+        return store
+
+    def test_daily_pnl_gates_reentry_after_win(self):
+        """After a winning trade, DAILY_PNL > 0 should block further entries that day.
+        On the next day DAILY_PNL resets to 0 and entries are allowed again."""
+        candles = [
+            # Day 1 (2026-01-05, all times ET)
+            {"id": "c1", "ts": "2026-01-05T14:30:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},  # 9:30 ET - bearish, entry
+            {"id": "c2", "ts": "2026-01-05T14:35:00+00:00", "open": 100, "high": 104, "low": 99, "close": 103, "volume": 1000},  # 9:35 ET - bullish, exit (win)
+            {"id": "c3", "ts": "2026-01-05T14:40:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},  # 9:40 ET - bearish signal but DAILY_PNL > 0 → blocked
+            # Day 2 (2026-01-06)
+            {"id": "c4", "ts": "2026-01-06T14:30:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},  # 9:30 ET - bearish, DAILY_PNL reset → entry
+            {"id": "c5", "ts": "2026-01-06T14:35:00+00:00", "open": 100, "high": 104, "low": 99, "close": 103, "volume": 1000},  # 9:35 ET - bullish, exit (win)
+        ]
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="daily-pnl-gate",
+            long_entry_rule="CLOSE < OPEN AND !IN_BULL_TRADE AND DAILY_PNL <= 0",
+            long_exit_rules=["CLOSE > OPEN AND IN_BULL_TRADE"],
+            data_store=self._build_store(candles),
+        )
+        actions = [m["action"] for m in result["markers"]]
+        # c1 entry, c2 exit, c3 blocked (DAILY_PNL > 0), c4 entry (new day), c5 exit
+        assert actions == ["LONG_ENTRY", "LONG_EXIT", "LONG_ENTRY", "LONG_EXIT"]
+        assert result["performance"]["total_trades"] == 2
+
+    def test_daily_pnl_continues_after_loss(self):
+        """After a losing trade, DAILY_PNL < 0, so entries continue until P&L recovers."""
+        candles = [
+            # c1: bearish candle → entry at 100
+            {"id": "c1", "ts": "2026-01-05T14:30:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+            # c2: bullish candle (open=94, close=97) → exit rule fires (CLOSE>OPEN), but
+            #     close < entry_price → LOSS; DAILY_PNL < 0 after this
+            {"id": "c2", "ts": "2026-01-05T14:35:00+00:00", "open": 94,  "high": 98,  "low": 93, "close": 97,  "volume": 1000},
+            # c3: bearish → DAILY_PNL <= 0 so re-entry is allowed
+            {"id": "c3", "ts": "2026-01-05T14:40:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+            # c4: bullish above entry → exit fires (WIN)
+            {"id": "c4", "ts": "2026-01-05T14:45:00+00:00", "open": 100, "high": 105, "low": 99, "close": 104, "volume": 1000},
+        ]
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="daily-pnl-continue",
+            long_entry_rule="CLOSE < OPEN AND !IN_BULL_TRADE AND DAILY_PNL <= 0",
+            long_exit_rules=["CLOSE > OPEN AND IN_BULL_TRADE"],
+            data_store=self._build_store(candles),
+        )
+        actions = [m["action"] for m in result["markers"]]
+        assert actions == ["LONG_ENTRY", "LONG_EXIT", "LONG_ENTRY", "LONG_EXIT"]
+        assert result["performance"]["total_trades"] == 2
+
+    def test_daily_pnl_parses_and_validates(self):
+        """DAILY_PNL is a valid identifier in rules."""
+        result = validate_long_only(
+            "CLOSE < OPEN AND !IN_BULL_TRADE AND DAILY_PNL <= 0",
+            "CLOSE > OPEN AND IN_BULL_TRADE",
+        )
+        assert result.valid
+
+
+class TestLongEntriesSince:
+    """Test LONG_ENTRIES_SINCE(cond) and SHORT_ENTRIES_SINCE(cond) — per-trend entry counter"""
+
+    def _build_store(self, candles: list[dict]) -> SessionDataStore:
+        store = SessionDataStore(session_id="session-1", agent_id="ohlc-agent", symbol="TEST", interval="5m")
+        for candle in candles:
+            store.latest_by_candle_id[candle["id"]] = candle
+        return store
+
+    def test_long_entries_since_limits_to_first_entry(self):
+        """Only the first entry is taken after a condition rising edge; subsequent signals blocked."""
+        candles = [
+            # close<=100 (condition false), close>100 triggers rising edge, then stays true
+            {"id": "c1", "ts": "2026-01-05T14:30:00+00:00", "open": 99,  "high": 100, "low": 98,  "close": 99,  "volume": 1000},  # CLOSE>100=false
+            {"id": "c2", "ts": "2026-01-05T14:35:00+00:00", "open": 101, "high": 103, "low": 100, "close": 102, "volume": 1000},  # CLOSE>100=true (rising edge → entry)
+            {"id": "c3", "ts": "2026-01-05T14:40:00+00:00", "open": 102, "high": 104, "low": 101, "close": 103, "volume": 1000},  # CLOSE>100=true (no new edge → blocked)
+            {"id": "c4", "ts": "2026-01-05T14:45:00+00:00", "open": 103, "high": 104, "low": 98,  "close": 99,  "volume": 1000},  # exit (CLOSE<100)
+            {"id": "c5", "ts": "2026-01-05T14:50:00+00:00", "open": 98,  "high": 100, "low": 97,  "close": 98,  "volume": 1000},  # CLOSE>100=false
+            {"id": "c6", "ts": "2026-01-05T14:55:00+00:00", "open": 99,  "high": 104, "low": 99,  "close": 102, "volume": 1000},  # CLOSE>100=true (new rising edge → entry)
+            {"id": "c7", "ts": "2026-01-05T15:00:00+00:00", "open": 102, "high": 104, "low": 98,  "close": 99,  "volume": 1000},  # exit
+        ]
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="entries-since-first",
+            long_entry_rule="!IN_BULL_TRADE AND LONG_ENTRIES_SINCE(CLOSE > 100) == 0 AND CLOSE > 100",
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE < 100"],
+            data_store=self._build_store(candles),
+        )
+        actions = [m["action"] for m in result["markers"]]
+        # c2 entry, c3 blocked, c4 exit, c5 no signal, c6 new trigger → entry, c7 exit
+        assert actions == ["LONG_ENTRY", "LONG_EXIT", "LONG_ENTRY", "LONG_EXIT"]
+        assert result["performance"]["total_trades"] == 2
+
+    def test_long_entries_since_take_first_two(self):
+        """With < 2 threshold, two entries are taken per trend episode then blocked.
+
+        The trigger condition is TIME == 930 — it fires exactly once per day,
+        creating a single rising edge. Subsequent exits/re-entries stay within
+        the same episode so the count accumulates to 2 and then blocks further
+        entries for the rest of the session.
+        """
+        candles = [
+            # c0: 9:25 warmup — TIME=925≠930 so trigger condition is false
+            {"id": "c0", "ts": "2026-01-05T14:25:00+00:00", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000},
+            # c1: 9:30 — TIME==930 → rising edge; CLOSE<OPEN → entry #1 (ENTRIES_SINCE=0<2)
+            {"id": "c1", "ts": "2026-01-05T14:30:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+            # c2: 9:35 — CLOSE>OPEN → exit fires; CLOSE<OPEN=false so no re-entry here
+            {"id": "c2", "ts": "2026-01-05T14:35:00+00:00", "open": 100, "high": 104, "low": 99, "close": 104, "volume": 1000},
+            # c3: 9:40 — CLOSE<OPEN; ENTRIES_SINCE trigger still at c1, count=1 < 2 → entry #2
+            {"id": "c3", "ts": "2026-01-05T14:40:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+            # c4: 9:45 — CLOSE>OPEN → exit fires; count now 2
+            {"id": "c4", "ts": "2026-01-05T14:45:00+00:00", "open": 100, "high": 104, "low": 99, "close": 104, "volume": 1000},
+            # c5: 9:50 — CLOSE<OPEN; ENTRIES_SINCE count=2, 2 < 2 = false → BLOCKED
+            {"id": "c5", "ts": "2026-01-05T14:50:00+00:00", "open": 101, "high": 102, "low": 99, "close": 100, "volume": 1000},
+        ]
+        result = evaluate_strategy(
+            session_id="session-1",
+            strategy_name="entries-since-two",
+            # Trend trigger: TIME == 930 fires once (rising edge). Entry signal: CLOSE < OPEN.
+            long_entry_rule="!IN_BULL_TRADE AND LONG_ENTRIES_SINCE(TIME == 930) < 2 AND CLOSE < OPEN",
+            long_exit_rules=["IN_BULL_TRADE AND CLOSE > OPEN"],
+            data_store=self._build_store(candles),
+        )
+        actions = [m["action"] for m in result["markers"]]
+        # c1 entry #1, c2 exit, c3 entry #2, c4 exit, c5 blocked (count=2)
+        assert actions == ["LONG_ENTRY", "LONG_EXIT", "LONG_ENTRY", "LONG_EXIT"]
+        assert result["performance"]["total_trades"] == 2
+
+    def test_entries_since_parses_and_validates(self):
+        """LONG_ENTRIES_SINCE and SHORT_ENTRIES_SINCE are valid in rules."""
+        long_result = validate_long_only(
+            "!IN_BULL_TRADE AND LONG_ENTRIES_SINCE(CROSSES_ABOVE(SMA-20:SMA, SMA-50:SMA)) == 0 AND CLOSE > OPEN",
+            "IN_BULL_TRADE AND CLOSE < OPEN",
+        )
+        assert long_result.valid
+
+        short_result = validate_strategy_v2(
+            long_entry_rule="",
+            long_exit_rules=[],
+            short_entry_rule="!IN_BEAR_TRADE AND SHORT_ENTRIES_SINCE(CROSSES_BELOW(SMA-20:SMA, SMA-50:SMA)) == 0 AND CLOSE < OPEN",
+            short_exit_rules=["IN_BEAR_TRADE AND CLOSE > OPEN"],
+        )
+        assert short_result.valid
 
 
 if __name__ == "__main__":

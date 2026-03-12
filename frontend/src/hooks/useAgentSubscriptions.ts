@@ -21,6 +21,7 @@ export interface AgentSubscription {
   created_at: string;
   updated_at: string;
   config?: Record<string, any>;
+  selected_indicator_id?: string;
   candle_type?: string;
   spec_version?: string;
   agent_version?: string;
@@ -113,7 +114,6 @@ export function useAgentSubscriptions(): UseAgentSubscriptionsResult {
       setSubscriptions(agents);
       setStale(false);
       setLastSuccessfulRefreshAt(new Date().toISOString());
-      console.log(`✅ Loaded ${agents.length} agent(s) from backend`);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Unknown error";
       console.error("Failed to fetch subscriptions:", err);

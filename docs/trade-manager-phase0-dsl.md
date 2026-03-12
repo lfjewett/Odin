@@ -23,6 +23,8 @@ The DSL has been significantly enhanced from Phase 0 to support production-ready
 - `CROSSES_BELOW(a, b)` - Returns 1 when `a` crosses below `b` (current: a < b, previous: a >= b)
 - `WITHIN(condition, bars)` - Returns true if condition was true within last N bars
 - `BARS_SINCE(condition)` - Returns number of bars since condition was last true (0 if true now)
+- `LONG_ENTRIES_SINCE(condition)` - Returns count of long entries taken since the last bar where `condition` transitioned from false → true. Returns 999999 if no such transition exists in history. Use to limit trades per trend episode (e.g. `== 0` for first-only, `< 2` for first-two).
+- `SHORT_ENTRIES_SINCE(condition)` - Same as above but counts short entries.
 
 ### Lookback References
 - Array-style indexing: `CLOSE[1]` = previous bar, `CLOSE[2]` = 2 bars ago
@@ -40,6 +42,8 @@ The DSL has been significantly enhanced from Phase 0 to support production-ready
 - `IN_BEAR_TRADE` - True when in a short position (infrastructure in place)
 - `!IN_BULL_TRADE` - True when not in a long position
 - `!IN_BEAR_TRADE` - True when not in a short position
+
+Long and short state are independent. The engine does **not** force them to be mutually exclusive; a strategy can hold one long and one short at the same time unless its own DSL rules prevent that.
 
 ### Built-in Candle Variables
 - `BODY` - Absolute value of (CLOSE - OPEN)
@@ -74,6 +78,14 @@ Base variables (always available):
 ### Position State
 - `IN_BULL_TRADE` - Boolean, true when in a long position
 - `IN_BEAR_TRADE` - Boolean, true when in a short position (infrastructure in place)
+
+### Position-Aware Variables
+- `SHARES_HELD` - Current position size for the side being evaluated (`> 0` in `long_*` rules, `< 0` in `short_*` rules, `0` when flat on that side)
+- `ENTRY_PRICE` - Average entry price for the side being evaluated (`0` when flat on that side)
+- `UNREALIZED_PNL` - Mark-to-market P&L for the side being evaluated (`0` when flat on that side)
+
+### Daily Tracking Variables
+- `DAILY_PNL` - Net realized P&L from all closed trades (both sides) since midnight Eastern Time. Resets to `0` at the start of each new calendar day. Useful for gating entries based on the day's results.
 
 Indicator variables come from `/api/sessions/{session_id}/variables`.
 
@@ -239,6 +251,44 @@ long_exit_1: BARS_SINCE(CROSSES_BELOW(SMA-20:SMA, SMA-50:SMA)) < 2 AND IN_BULL_T
 
 **Explanation**: Enter within 5 bars of golden cross, exit within 2 bars of death cross
 
+### Daily P&L Gate (Strategy: Win Once and Stop)
+
+```text
+long_entry:  CLOSE < OPEN AND !IN_BULL_TRADE AND DAILY_PNL <= 0
+long_exit_1: CLOSE > OPEN AND IN_BULL_TRADE
+```
+
+**Explanation**:
+- If the day's first trade wins, `DAILY_PNL` becomes positive and the entry rule blocks any further entries that day
+- If a trade loses, `DAILY_PNL` stays negative and entries continue until cumulative P&L recovers above 0
+- `DAILY_PNL` resets to 0 at midnight ET, so each new trading day starts fresh
+
+### First Trade Per Trend (using LONG_ENTRIES_SINCE)
+
+```text
+long_entry:  CROSSES_ABOVE(SMA-20:SMA, SMA-50:SMA) OR (SMA-20:SMA > SMA-50:SMA AND !IN_BULL_TRADE AND LONG_ENTRIES_SINCE(CROSSES_ABOVE(SMA-20:SMA, SMA-50:SMA)) == 0)
+long_exit_1: CROSSES_BELOW(SMA-20:SMA, SMA-50:SMA) AND IN_BULL_TRADE
+```
+
+**Simplified form** (separate signal and gate):
+
+```text
+long_entry:  SMA-20:SMA > SMA-50:SMA AND !IN_BULL_TRADE AND LONG_ENTRIES_SINCE(CROSSES_ABOVE(SMA-20:SMA, SMA-50:SMA)) == 0
+long_exit_1: CROSSES_BELOW(SMA-20:SMA, SMA-50:SMA) AND IN_BULL_TRADE
+```
+
+**Explanation**:
+- `LONG_ENTRIES_SINCE(CROSSES_ABOVE(...))` resets to 0 each time the 20 SMA crosses back above the 50 SMA
+- `== 0` ensures only the first entry per trend episode fires; subsequent signals during the same trend are blocked
+- Use `< 2` instead of `== 0` to allow the first two entries per trend
+
+### First Two Trades Per Trend
+
+```text
+long_entry:  SMA-20:SMA > SMA-50:SMA AND !IN_BULL_TRADE AND LONG_ENTRIES_SINCE(CROSSES_ABOVE(SMA-20:SMA, SMA-50:SMA)) < 2
+long_exit_1: CROSSES_BELOW(SMA-20:SMA, SMA-50:SMA) AND IN_BULL_TRADE
+```
+
 ### Using Indicator Variables (Bollinger Bands)
 
 ```text
@@ -356,13 +406,8 @@ Phase 1 provides production-ready features for most trading strategies. Future e
 - Candle patterns: `IS_DOJI()`, `IS_HAMMER()`, `IS_ENGULFING()`
 - Bar state: `IS_FINAL` to filter by bar finalization status
 
-### Position-Aware Variables
-- `SHARES_HELD` - Current position size
-- `ENTRY_PRICE` - Average entry price for current position
-- `UNREALIZED_PNL` - Mark-to-market P&L
-
 ### Multiple Positions
-- Track multiple concurrent positions
+- Track multiple concurrent positions per side
 - Position pyramiding
 - Partial exits
 
@@ -384,7 +429,7 @@ The 8 Trade Manager chips and sparkline are computed from live/snapshot candles 
 - Position sizing: buy the **maximum affordable lots of 100 shares** on each `LONG_ENTRY`
 - Exit sizing: close the full open position on side-specific exit (`LONG_EXIT` or `SHORT_EXIT`)
 - Fill price: candle `close` at the marker timestamp
-- Strategy state: one active bull position at a time (`IN_BULL_TRADE`)
+- Strategy state: long and short positions are tracked independently; a strategy may hold one bull and one bear position at the same time
 
 ### Metric Definitions
 
@@ -399,5 +444,5 @@ The 8 Trade Manager chips and sparkline are computed from live/snapshot candles 
 
 ### Equity Sparkline
 
-- Equity is marked-to-market each candle as: `cash + shares * close`
+- Equity is marked-to-market each candle as: `cash + (long_shares * close) - (short_shares * close)`
 - Sparkline uses this real equity series; no mock values are used

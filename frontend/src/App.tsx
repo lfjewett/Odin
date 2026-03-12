@@ -26,16 +26,22 @@ import { useSyncCoordinator } from "./hooks/useSyncCoordinator";
 import AgentConfigModal from "./components/AgentConfigModal";
 import AddIndicatorAgentModal from "./components/AddIndicatorAgentModal";
 import { TradeManagerModal } from "./components/TradeManagerModal";
+import { ResearchModal, type ResearchOverlayEvaluation } from "./components/ResearchModal";
 import { TradesModal } from "./components/TradesModal";
+import ChartTimeControl from "./components/ChartTimeControl";
 import { formatEasternTime24 } from "./utils/time";
 import {
   applyTradeStrategy,
   activateWorkspace,
+  createCsvExportJob,
   deleteWorkspace,
+  getCsvExportDownloadUrl,
+  getCsvExportJobStatus,
   listTradeStrategies,
   getWorkspace,
   listWorkspaces,
   saveWorkspace,
+  type CsvExportJobStatus,
   type ApplyTradeStrategyResponse,
   type TradePerformance,
   type TradeMarker,
@@ -48,6 +54,7 @@ const DEFAULT_WORKSPACE_NAME = "Default";
 const SESSION_STORAGE_KEY = "odin.sessionId";
 const TRADE_MARKERS_STORAGE_PREFIX = "odin.tradeMarkers";
 const TRADE_PERFORMANCE_STORAGE_PREFIX = "odin.tradePerformance";
+const RESEARCH_AGENT_ID = "__research__";
 
 const STARTING_CAPITAL = 10_000;
 
@@ -67,6 +74,11 @@ const INITIAL_WIDGETS: WidgetState[] = [
 ];
 
 export default function App() {
+  const todayDateString = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const defaultExportStartDate = useMemo(() => {
+    const now = new Date();
+    return `${now.getUTCFullYear() - 2}-01-01`;
+  }, []);
   const [selectedSymbol, setSelectedSymbol] = useState("SPY");
   const [symbolSearch, setSymbolSearch] = useState("");
   const [tickerInput, setTickerInput] = useState("SPY");
@@ -92,8 +104,18 @@ export default function App() {
   const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
   const [currentWorkspaceName, setCurrentWorkspaceName] = useState<string>(DEFAULT_WORKSPACE_NAME);
   const [isWorkspaceMenuOpen, setIsWorkspaceMenuOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [exportStartDate, setExportStartDate] = useState(defaultExportStartDate);
+  const [exportEndDate, setExportEndDate] = useState(todayDateString);
+  const [exportJobId, setExportJobId] = useState<string | null>(null);
+  const [exportJobStatus, setExportJobStatus] = useState<CsvExportJobStatus | null>(null);
+  const [lastCompletedExportJobId, setLastCompletedExportJobId] = useState<string | null>(null);
+  const [isExportSubmitting, setIsExportSubmitting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const [showTradeManager, setShowTradeManager] = useState(false);
   const [showTradesModal, setShowTradesModal] = useState(false);
+  const [showResearchModal, setShowResearchModal] = useState(false);
+  const [researchDraftExpression, setResearchDraftExpression] = useState("");
   const lastSubscribeKeyRef = useRef<string | null>(null);
   const pendingSnapshotRef = useRef<SnapshotEvent | null>(null);
   const hasInitializedWorkspaceRef = useRef(false);
@@ -350,6 +372,110 @@ export default function App() {
     setIsWorkspaceMenuOpen(false);
   }, [applyWorkspaceState, currentWorkspaceName, refreshWorkspaceNames]);
 
+  const handleStartCsvExport = useCallback(async () => {
+    const sessionId = getSessionId();
+    if (!sessionId) {
+      setExportError("Session is not ready yet.");
+      return;
+    }
+
+    setIsExportSubmitting(true);
+    setExportError(null);
+    setLastCompletedExportJobId(null);
+
+    try {
+      const created = await createCsvExportJob(sessionId, {
+        start_date: exportStartDate,
+        end_date: exportEndDate,
+        interval: intervalInput,
+      });
+
+      setExportJobId(created.job_id);
+      setExportJobStatus(null);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Failed to start CSV export");
+    } finally {
+      setIsExportSubmitting(false);
+    }
+  }, [exportEndDate, exportStartDate, getSessionId, intervalInput]);
+
+  const triggerCsvDownload = useCallback((sessionId: string, jobId: string) => {
+    const url = getCsvExportDownloadUrl(sessionId, jobId);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "";
+    anchor.rel = "noopener noreferrer";
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+  }, []);
+
+  const handleDownloadCompletedExport = useCallback(() => {
+    if (!lastCompletedExportJobId) {
+      return;
+    }
+    const sessionId = getSessionId();
+    if (!sessionId) {
+      setExportError("Session is not ready yet.");
+      return;
+    }
+    triggerCsvDownload(sessionId, lastCompletedExportJobId);
+  }, [getSessionId, lastCompletedExportJobId, triggerCsvDownload]);
+
+  useEffect(() => {
+    if (!exportJobId) {
+      return;
+    }
+
+    const sessionId = getSessionId();
+    if (!sessionId) {
+      return;
+    }
+
+    let cancelled = false;
+    let intervalHandle: number | null = null;
+
+    const poll = async () => {
+      try {
+        const status = await getCsvExportJobStatus(sessionId, exportJobId);
+        if (cancelled) {
+          return;
+        }
+
+        setExportJobStatus(status);
+
+        if (status.status === "completed" && status.ready) {
+          triggerCsvDownload(sessionId, exportJobId);
+          setLastCompletedExportJobId(exportJobId);
+          setExportJobId(null);
+          return;
+        }
+
+        if (status.status === "failed") {
+          setExportError(status.error || "CSV export failed");
+          setExportJobId(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setExportError(error instanceof Error ? error.message : "Failed to poll export status");
+          setExportJobId(null);
+        }
+      }
+    };
+
+    void poll();
+    intervalHandle = window.setInterval(() => {
+      void poll();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      if (intervalHandle !== null) {
+        window.clearInterval(intervalHandle);
+      }
+    };
+  }, [exportJobId, getSessionId, triggerCsvDownload]);
+
   useEffect(() => {
     if (hasInitializedWorkspaceRef.current || subscriptionsLoading) {
       return;
@@ -397,10 +523,71 @@ export default function App() {
     []
   );
 
+  const clearResearchOverlays = useCallback(() => {
+    setOverlayData((prev) => {
+      const next = new Map(prev);
+      for (const key of Array.from(next.keys())) {
+        if (key.startsWith(`${RESEARCH_AGENT_ID}::`)) {
+          next.delete(key);
+        }
+      }
+      return next;
+    });
+    setOverlaySchemas((prev) => {
+      const next = new Map(prev);
+      for (const key of Array.from(next.keys())) {
+        if (key.startsWith(`${RESEARCH_AGENT_ID}::`)) {
+          next.delete(key);
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const applyResearchOverlay = useCallback((evaluations: ResearchOverlayEvaluation[]) => {
+    setOverlayData((prev) => {
+      const next = new Map(prev);
+      for (const key of Array.from(next.keys())) {
+        if (key.startsWith(`${RESEARCH_AGENT_ID}::`)) {
+          next.delete(key);
+        }
+      }
+      evaluations.forEach(({ outputId, result }) => {
+        const seriesKey = buildOverlaySeriesKey(RESEARCH_AGENT_ID, result.schema, outputId);
+        next.set(seriesKey, result.records as OverlayRecord[]);
+      });
+      return next;
+    });
+
+    setOverlaySchemas((prev) => {
+      const next = new Map(prev);
+      for (const key of Array.from(next.keys())) {
+        if (key.startsWith(`${RESEARCH_AGENT_ID}::`)) {
+          next.delete(key);
+        }
+      }
+      evaluations.forEach(({ outputId, result }) => {
+        const seriesKey = buildOverlaySeriesKey(RESEARCH_AGENT_ID, result.schema, outputId);
+        next.set(seriesKey, result.schema);
+      });
+      return next;
+    });
+  }, [buildOverlaySeriesKey]);
+
+  // Helper to check if an agent is visible
+  const isAgentVisible = useCallback((agentId: string): boolean => {
+    const agent = subscriptions?.find((a) => a.id === agentId);
+    return agent?.config?.visible !== false;
+  }, [subscriptions]);
+
   const overlayLineColors = useMemo(() => {
     const colors = new Map<string, string>();
     (subscriptions || []).forEach((agent) => {
       if (agent.agent_type !== "indicator") {
+        return;
+      }
+
+      if (agent.config?.visible === false) {
         return;
       }
 
@@ -409,22 +596,69 @@ export default function App() {
         colors.set(agent.id, configuredColor);
       }
     });
-    console.log("[App] Overlay colors map:", Array.from(colors.entries()));
     return colors;
   }, [subscriptions]);
 
-  useEffect(() => {
-    console.log("[App] Agent selection effect triggered:", {
-      selectedAgentId,
-      subscriptions: subscriptions?.length,
-      subscriptionsLoading,
-      subscriptionsError
+  /** agentId → true for any indicator that has force_subgraph saved in config */
+  const overlaySubgraphForced = useMemo(() => {
+    const forced = new Map<string, boolean>();
+    forced.set(RESEARCH_AGENT_ID, true);
+    (subscriptions || []).forEach((agent) => {
+      if (agent.agent_type !== "indicator") return;
+      if (agent.config?.force_subgraph === true) {
+        forced.set(agent.id, true);
+      }
     });
-    
+    return forced;
+  }, [subscriptions]);
+
+  const overlayAreaStyles = useMemo(() => {
+    const styles = new Map<
+      string,
+      {
+        fillMode: "solid" | "conditional";
+        opacityPercent: number;
+        conditionalUpColor?: string;
+        conditionalDownColor?: string;
+      }
+    >();
+    (subscriptions || []).forEach((agent) => {
+      if (agent.agent_type !== "indicator") {
+        return;
+      }
+
+      const hasAreaOutput = Array.isArray(agent.outputs)
+        && agent.outputs.some((output) => output?.schema === "area");
+      if (!hasAreaOutput) {
+        return;
+      }
+
+      const fillMode = agent.config?.area_fill_mode === "solid" ? "solid" : "conditional";
+      const rawOpacity = Number(agent.config?.area_fill_opacity);
+      const opacityPercent = Number.isFinite(rawOpacity)
+        ? Math.max(0, Math.min(100, rawOpacity))
+        : 50;
+      const conditionalUpColor = typeof agent.config?.area_conditional_up_color === "string"
+        ? agent.config.area_conditional_up_color.trim()
+        : "";
+      const conditionalDownColor = typeof agent.config?.area_conditional_down_color === "string"
+        ? agent.config.area_conditional_down_color.trim()
+        : "";
+
+      styles.set(agent.id, {
+        fillMode,
+        opacityPercent,
+        conditionalUpColor: conditionalUpColor || undefined,
+        conditionalDownColor: conditionalDownColor || undefined,
+      });
+    });
+    return styles;
+  }, [subscriptions]);
+
+  useEffect(() => {
     if (!selectedAgentId && subscriptions && subscriptions.length > 0) {
       const preferred = subscriptions.find((agent) => agent.output_schema === "ohlc");
       if (preferred) {
-        console.log("[App] Auto-selecting agent:", preferred.id);
         setSelectedAgentId(preferred.id);
       }
     }
@@ -448,7 +682,6 @@ export default function App() {
 
     // Only process snapshots that match the current chart subscription.
     if (event.agentId === expectedAgentId && isMatchingSubscription) {
-      console.log(`[App] Received snapshot for ${event.agentId}:`, event.bars.length, "bars");
       setStrategyCandlesById(() => {
         const next = new Map<string, OHLCBar>();
         event.bars.forEach((bar) => {
@@ -466,7 +699,12 @@ export default function App() {
 
   const handleOverlayHistory = useCallback((event: OverlayHistoryEvent) => {
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
-    console.log(`[App] Received overlay history for ${event.agentId} -> resolved to ${resolvedAgentId}:`, event.overlays.length, "records");
+
+    // Skip if agent is not visible
+    if (!isAgentVisible(resolvedAgentId)) {
+      return;
+    }
+    
     if (!event.overlays || event.overlays.length === 0) {
       return;
     }
@@ -485,7 +723,6 @@ export default function App() {
         const key = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
         updated.set(key, overlays);
       }
-      console.log(`[App] Overlay data now has ${updated.size} series:`, Array.from(updated.keys()));
       return updated;
     });
 
@@ -497,11 +734,16 @@ export default function App() {
       }
       return updated;
     });
-  }, [resolveOverlayAgentId, buildOverlaySeriesKey]);
+  }, [resolveOverlayAgentId, buildOverlaySeriesKey, isAgentVisible]);
 
   const handleOverlay = useCallback((event: OverlayEvent) => {
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
-    console.log(`[App] Received overlay update for ${event.agentId} -> resolved to ${resolvedAgentId}:`, event.schema);
+
+    // Skip if agent is not visible
+    if (!isAgentVisible(resolvedAgentId)) {
+      return;
+    }
+    
     const outputId = String((event.record as Record<string, unknown>).output_id ?? "default");
     const seriesKey = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
 
@@ -518,7 +760,6 @@ export default function App() {
       }
 
       updated.set(seriesKey, existing);
-      console.log(`[App] Overlay data now has ${updated.size} series:`, Array.from(updated.keys()));
       return updated;
     });
 
@@ -527,7 +768,7 @@ export default function App() {
       updated.set(seriesKey, event.schema);
       return updated;
     });
-  }, [resolveOverlayAgentId, buildOverlaySeriesKey]);
+  }, [resolveOverlayAgentId, buildOverlaySeriesKey, isAgentVisible]);
 
   const handleStateEvent = useCallback(
     (event: StateEvent) => {
@@ -719,28 +960,21 @@ export default function App() {
     }
 
     const agentId = selectedAgent?.id ?? selectedAgentId;
-    console.log("[App] Subscribe effect triggered:", {
-      agentId,
-      selectedSymbol,
-      intervalInput,
-      selectedTimeframe,
-      lastSubscribeKey: lastSubscribeKeyRef.current
-    });
-    
     if (!agentId || !selectedSymbol) {
-      console.log("[App] Subscribe skipped: missing agentId or symbol");
       return;
     }
 
     const subscribeKey = `${agentId}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`;
     if (lastSubscribeKeyRef.current === subscribeKey) {
-      console.log("[App] Subscribe skipped: same key as last subscribe");
       return;
     }
 
     setOverlayData(new Map());
     setOverlaySchemas(new Map());
     setStrategyCandlesById(new Map());
+    setTradeMarkers([]);
+    setTradePerformance(null);
+    markTradeSyncing();
 
     const sent = sendSubscribeRequest({
       sessionId: getSessionId(),
@@ -763,6 +997,7 @@ export default function App() {
     intervalInput,
     selectedTimeframe,
     sendSubscribeRequest,
+    markTradeSyncing,
   ]);
 
   useEffect(() => {
@@ -841,17 +1076,6 @@ export default function App() {
         return;
       }
 
-      if (appliedStrategyName && tradeMarkers.length > 0 && Boolean(tradePerformance)) {
-        console.log("[TradeManager] Auto-apply skipped (using hydrated strategy state)", {
-          applyKey,
-          appliedStrategyName,
-          markerCount: tradeMarkers.length,
-          hasPerformance: Boolean(tradePerformance),
-        });
-        lastAutoApplyKeyRef.current = applyKey;
-        return;
-      }
-
       try {
         console.log("[TradeManager] Auto-apply checking saved strategies", { sessionId, applyKey });
         const listed = await listTradeStrategies(sessionId);
@@ -861,7 +1085,12 @@ export default function App() {
           return;
         }
 
-        const strategyName = listed.strategies[0].name;
+        const hasAppliedNamedStrategy =
+          typeof appliedStrategyName === "string" &&
+          appliedStrategyName.trim().length > 0;
+        const strategyName = hasAppliedNamedStrategy
+          ? appliedStrategyName!.trim()
+          : listed.strategies[0].name;
         console.log("[TradeManager] Auto-applying strategy", { strategyName, sessionId, applyKey });
         const applied = await applyTradeStrategy(sessionId, { strategy_name: strategyName });
         setTradeMarkers(applied.markers || []);
@@ -887,8 +1116,6 @@ export default function App() {
     strategyCandlesById.size,
     isConnected,
     appliedStrategyName,
-    tradeMarkers.length,
-    tradePerformance,
   ]);
 
   useEffect(() => {
@@ -899,6 +1126,56 @@ export default function App() {
       candleCount: strategyCandlesById.size,
     });
   }, [appliedStrategyName, tradeMarkers.length, tradePerformance, strategyCandlesById.size]);
+
+  // Clean up overlay data for hidden agents
+  useEffect(() => {
+    const visibleAgentIds = new Set(
+      (subscriptions || [])
+        .filter((agent) => agent.config?.visible !== false)
+        .map((agent) => agent.id)
+    );
+
+    setOverlayData((prev) => {
+      const updated = new Map(prev);
+      let changed = false;
+      
+      for (const key of Array.from(updated.keys())) {
+        if (key.startsWith(`${RESEARCH_AGENT_ID}::`)) {
+          continue;
+        }
+        // Extract agent ID from overlay series key (format: agentId::schema::outputId)
+        const agentId = key.split("::")[0];
+        if (!visibleAgentIds.has(agentId)) {
+          updated.delete(key);
+          changed = true;
+        }
+      }
+      
+      if (changed) {
+        console.log(`[App] Removed overlay data for hidden agents. Remaining: ${updated.size} series`);
+      }
+      return changed ? updated : prev;
+    });
+
+    setOverlaySchemas((prev) => {
+      const updated = new Map(prev);
+      let changed = false;
+      
+      for (const key of Array.from(updated.keys())) {
+        if (key.startsWith(`${RESEARCH_AGENT_ID}::`)) {
+          continue;
+        }
+        // Extract agent ID from schema key (format: agentId::schema::outputId)
+        const agentId = key.split("::")[0];
+        if (!visibleAgentIds.has(agentId)) {
+          updated.delete(key);
+          changed = true;
+        }
+      }
+      
+      return changed ? updated : prev;
+    });
+  }, [subscriptions]);
 
   const statusColor = isConnected ? "#22c55e" : "#ef4444";
   const statusText = isConnected ? "Connected" : "Disconnected";
@@ -984,11 +1261,6 @@ export default function App() {
   // Extract candle type from agent config if available, default to "candlestick"
   const candleType: "candlestick" | "bar" | "line" | "area" = 
     (selectedAgent?.config?.candle_type as any || "candlestick");
-  
-  if (selectedAgentId) {
-    console.log(`[App] selectedAgent (${selectedAgentId}):`, selectedAgent);
-    console.log(`[App] candleType being used:`, candleType);
-  }
 
   const handleRunTest = async () => {
     try {
@@ -1295,6 +1567,27 @@ export default function App() {
               </div>
             ))}
           </div>
+
+          {isLeftTradeManager && (
+            <div className="trade-manager-actions-bottom">
+              <button
+                type="button"
+                className="widget-config-button"
+                onClick={() => setShowTradesModal(true)}
+                title="Show trade history"
+              >
+                Trades
+              </button>
+              <button
+                type="button"
+                className="widget-config-button"
+                onClick={() => setShowResearchModal(true)}
+                title="Open research strategy"
+              >
+                Research
+              </button>
+            </div>
+          )}
         </>
       );
     },
@@ -1346,15 +1639,6 @@ export default function App() {
                   <div className="widget-header-actions">
                     <button
                       type="button"
-                      className="widget-config-button"
-                      onMouseDown={(event) => event.stopPropagation()}
-                      onClick={() => setShowTradesModal(true)}
-                      title="Show trade history"
-                    >
-                      Trades
-                    </button>
-                    <button
-                      type="button"
                       className="widget-debug-button"
                       onMouseDown={(event) => event.stopPropagation()}
                       onClick={handleRunTest}
@@ -1400,7 +1684,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v0.84</h1>
+          <h1 className="app-title">ODIN Market Workspace v1.32</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
@@ -1454,6 +1738,17 @@ export default function App() {
                 </div>
               )}
             </div>
+            <button
+              type="button"
+              className="tool-button"
+              onClick={() => {
+                setExportError(null);
+                setIsExportModalOpen(true);
+              }}
+              title="Export candles + overlays CSV"
+            >
+              Export CSV
+            </button>
             <div className="status-pill">
               <span
                 className="status-dot"
@@ -1521,36 +1816,13 @@ export default function App() {
                     placeholder="SPY"
                     maxLength={5}
                   />
-                  <select 
-                    className="interval-select"
-                    value={intervalInput}
-                    onChange={(e) => setIntervalInput(e.target.value)}
-                  >
-                    <option value="1m">1m</option>
-                    <option value="5m">5m</option>
-                    <option value="15m">15m</option>
-                    <option value="1h">1h</option>
-                    <option value="1d">1d</option>
-                  </select>
                 </div>
-                <div className="chart-timeframe-control">
-                  {[
-                    { label: "1D", days: 1 },
-                    { label: "1W", days: 7 },
-                    { label: "1M", days: 30 },
-                    { label: "3M", days: 90 },
-                    { label: "6M", days: 180 },
-                    { label: "1Y", days: 365 },
-                  ].map((option) => (
-                    <button
-                      key={option.days}
-                      onClick={() => setSelectedTimeframe(option.days)}
-                      className={`timeframe-button ${selectedTimeframe === option.days ? "active" : ""}`}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
+                <ChartTimeControl
+                  selectedInterval={intervalInput}
+                  selectedTimeframe={selectedTimeframe}
+                  onIntervalChange={setIntervalInput}
+                  onTimeframeChange={setSelectedTimeframe}
+                />
               </div>
               <div className="chart-kpis-inline">
                 <span className="kpi-item">Last <strong>{formattedPrice}</strong></span>
@@ -1564,6 +1836,8 @@ export default function App() {
                 overlayData={overlayData}
                 overlaySchemas={overlaySchemas}
                 overlayLineColors={overlayLineColors}
+                overlaySubgraphForced={overlaySubgraphForced}
+                overlayAreaStyles={overlayAreaStyles}
                 tradeMarkers={tradeMarkers}
                 selectedSymbol={selectedSymbol}
                 selectedInterval={intervalInput}
@@ -1603,9 +1877,73 @@ export default function App() {
         <span>Selected: {selectedSymbol}</span>
       </footer>
 
+      {isExportModalOpen && (
+        <div className="export-modal-overlay" role="presentation">
+          <div className="export-modal" role="dialog" aria-modal="true" aria-label="Export CSV">
+            <h3>Export CSV</h3>
+            <p className="export-modal-subtitle">Export candles and agent overlays for a date range.</p>
+            <div className="export-modal-grid">
+              <label>
+                <span>Start date</span>
+                <input
+                  type="date"
+                  value={exportStartDate}
+                  onChange={(event) => setExportStartDate(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>End date</span>
+                <input
+                  type="date"
+                  value={exportEndDate}
+                  max={todayDateString}
+                  onChange={(event) => setExportEndDate(event.target.value)}
+                />
+              </label>
+            </div>
+            {exportJobStatus && (
+              <p className="export-modal-status">
+                {exportJobStatus.status.toUpperCase()} · Chunks {exportJobStatus.completed_chunks}/
+                {Math.max(1, exportJobStatus.total_chunks || 0)}
+              </p>
+            )}
+            {lastCompletedExportJobId && !exportJobId && (
+              <p className="export-modal-status">Export complete. Your download should have started automatically.</p>
+            )}
+            {exportError && <p className="export-modal-error">{exportError}</p>}
+            <div className="export-modal-actions">
+              <button
+                type="button"
+                className="tool-button"
+                onClick={() => {
+                  setIsExportModalOpen(false);
+                  setExportError(null);
+                }}
+              >
+                Close
+              </button>
+              {lastCompletedExportJobId && !exportJobId && (
+                <button type="button" className="tool-button" onClick={handleDownloadCompletedExport}>
+                  Download Again
+                </button>
+              )}
+              <button
+                type="button"
+                className="tool-button"
+                onClick={() => void handleStartCsvExport()}
+                disabled={isExportSubmitting || Boolean(exportJobId) || !exportStartDate || !exportEndDate}
+              >
+                {isExportSubmitting ? "Starting…" : exportJobId ? "Running…" : "Start Export"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <AgentConfigModal
         isOpen={isAgentModalOpen}
         subscription={modalAgent}
+        sourceInterval={intervalInput}
         onUpdate={async (id, update) => {
           // Update the subscription with new config
           await updateSubscription(id, { name: update.name, config: update.config });
@@ -1702,6 +2040,20 @@ export default function App() {
             setAppliedStrategyName(result.strategy_name || null);
           }}
           onClose={() => setShowTradeManager(false)}
+        />
+      )}
+
+      {showResearchModal && (
+        <ResearchModal
+          sessionId={getSessionId()}
+          onEvaluated={applyResearchOverlay}
+          onClear={clearResearchOverlays}
+          initialExpression={researchDraftExpression}
+          onExpressionChange={setResearchDraftExpression}
+          initialOutputSchema={"line"}
+          onClose={() => {
+            setShowResearchModal(false);
+          }}
         />
       )}
     </div>
