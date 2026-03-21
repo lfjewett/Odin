@@ -1,9 +1,14 @@
 """
-Per-session canonical data container for ACP v0.4.x.
+Per-session canonical data container for ACP v0.5.x.
 
 Stores canonical OHLC records with proper deduplication (by agent_id, id, rev
 for OHLC; by agent_id plus canonical overlay identity for non-OHLC). Maintains
 rolling window of finalized candles for historical queries.
+
+Note: ACP-0.5.0 introduced the Market-Time Aggregation Standard (ET bucket
+boundaries, RTH-only daily candles). The Odin backend does not perform candle
+aggregation — it routes source candles from price agents to indicator agents
+which must each implement the 0.5.0 aggregation policy themselves.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ class SessionDataStore:
     """
     Holds canonical market data for a single session.
     
-    Per ACP v0.4.x:
+    Per ACP v0.5.x:
     - OHLC deduplication: (agent_id, id, rev) — upsert on higher rev
     - Non-OHLC canonical identity: (agent_id, output_id, ts|id) with upsert semantics
     """
@@ -176,8 +181,23 @@ class SessionDataStore:
             self.last_event_ts = last_event_ts
 
     def get_canonical_candles(self) -> list[dict[str, Any]]:
-        """Get all canonical candles, sorted by id"""
-        return sorted(self.latest_by_candle_id.values(), key=lambda x: x.get("id", ""))
+        """Get all canonical candles, sorted by timestamp then revision/id."""
+        def _sort_key(record: dict[str, Any]) -> tuple[float, int, str]:
+            raw_ts = str(record.get("ts") or "")
+            if not raw_ts:
+                parsed_ts = float("inf")
+            else:
+                try:
+                    parsed_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    parsed_ts = float("inf")
+            return (
+                parsed_ts,
+                int(record.get("rev") or 0),
+                str(record.get("id") or ""),
+            )
+
+        return sorted(self.latest_by_candle_id.values(), key=_sort_key)
 
     def get_finalized_candles(self) -> list[dict[str, Any]]:
         """Get finalized candles in order"""

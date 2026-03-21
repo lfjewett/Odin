@@ -1,11 +1,11 @@
 /**
- * ACP v0.4.2 Protocol Types
+ * ACP v0.5.0 Protocol Types
  * 
- * Defines TypeScript types for ACP (Agent Communication Protocol) v0.4.2
+ * Defines TypeScript types for ACP (Agent Communication Protocol) v0.5.0
  * with session isolation, sequence tracking, and bidirectional communication.
  */
 
-export type ACPSpecVersion = "ACP-0.4.0" | "ACP-0.4.1" | "ACP-0.4.2";
+export type ACPSpecVersion = "ACP-0.4.0" | "ACP-0.4.1" | "ACP-0.4.2" | "ACP-0.4.3" | "ACP-0.5.0";
 export type OverlaySchema = "line" | "event" | "band" | "area" | "histogram" | "forecast";
 
 export type BarState = "partial" | "provisional_close" | "session_reconciled" | "final";
@@ -74,6 +74,7 @@ export interface SubscribeRequestMessage {
   symbol: string; // Trade symbol (e.g., "SPY")
   interval: string; // Candle interval (e.g., "1m")
   timeframe_days?: number; // Historical backfill duration
+  viewport_days?: number; // Optional UI viewport window when backend retains larger timeframe
 }
 
 /**
@@ -99,6 +100,16 @@ export interface SnapshotMessage {
   interval: string;
   bars: ACPOhlcRecord[];
   count: number;
+  total_bars?: number;
+  range_start_ts?: string | null;
+  range_end_ts?: string | null;
+  viewport_from_ts?: string | null;
+  viewport_to_ts?: string | null;
+  viewport_days?: number;
+  is_viewported?: boolean;
+  is_latest?: boolean;
+  follow_live?: boolean;
+  slider_value?: number;
   acp_version: ACPSpecVersion;
   timestamp: string;
 }

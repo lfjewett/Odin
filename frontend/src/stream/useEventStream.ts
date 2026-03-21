@@ -40,6 +40,16 @@ export interface SnapshotEvent {
   symbol: string;
   interval: string;
   bars: OHLCBar[];
+  totalBars?: number;
+  rangeStartTs?: string | null;
+  rangeEndTs?: string | null;
+  viewportFromTs?: string | null;
+  viewportToTs?: string | null;
+  viewportDays?: number;
+  isViewported?: boolean;
+  isLatest?: boolean;
+  followLive?: boolean;
+  sliderValue?: number;
 }
 
 export interface SubscribeRequest {
@@ -48,6 +58,7 @@ export interface SubscribeRequest {
   symbol: string;
   interval: string;
   timeframeDays: number;
+  viewportDays?: number;
 }
 
 export interface StateEvent {
@@ -147,6 +158,7 @@ export function useEventStream(
       symbol: request.symbol,
       interval: request.interval,
       timeframe_days: request.timeframeDays,
+      viewport_days: request.viewportDays,
     };
 
     ws.send(JSON.stringify(payload));
@@ -235,6 +247,28 @@ export function useEventStream(
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
+          const messageSessionId = typeof message.session_id === "string" ? message.session_id : null;
+          const messageSeq = typeof message.seq === "number" ? message.seq : null;
+
+          // Session stream sequence numbers are shared across all replay-buffered live messages,
+          // not just OHLC `data`. Advance tracking on every sequenced session message so overlay
+          // updates do not look like false gaps between candles.
+          if (
+            messageSessionId &&
+            messageSeq !== null &&
+            (message.type === "data" ||
+              message.type === "candle_correction" ||
+              message.type === "overlay_update" ||
+              message.type === "overlay_marker" ||
+              message.type === "history_response")
+          ) {
+            const lastSeq = lastSeqBySessionRef.current.get(messageSessionId) ?? -1;
+            if (messageSeq > lastSeq + 1) {
+              console.warn(`[WebSocket] Gap detected for session ${messageSessionId}: expected ${lastSeq + 1}, got ${messageSeq}`);
+              sendResyncRequest(messageSessionId, lastSeq);
+            }
+            lastSeqBySessionRef.current.set(messageSessionId, messageSeq);
+          }
           
           // Handle different message types from backend (ACP v0.4.x)
           switch (message.type) {
@@ -290,6 +324,16 @@ export function useEventStream(
                   symbol: message.symbol,
                   interval: message.interval,
                   bars: message.bars,
+                  totalBars: message.total_bars,
+                  rangeStartTs: message.range_start_ts,
+                  rangeEndTs: message.range_end_ts,
+                  viewportFromTs: message.viewport_from_ts,
+                  viewportToTs: message.viewport_to_ts,
+                  viewportDays: message.viewport_days,
+                  isViewported: message.is_viewported,
+                  isLatest: message.is_latest,
+                  followLive: message.follow_live,
+                  sliderValue: message.slider_value,
                 });
                 
                 // Initialize sequence tracking for this session
@@ -299,19 +343,6 @@ export function useEventStream(
             
             case "data":
               // ACP data message (live updates)
-              // Track sequence for gap detection
-              const sessionId = message.session_id;
-              if (message.seq !== undefined) {
-                const lastSeq = lastSeqBySessionRef.current.get(sessionId) ?? -1;
-                if (message.seq > lastSeq + 1) {
-                  // Gap detected!
-                  console.warn(`[WebSocket] Gap detected for session ${sessionId}: expected ${lastSeq + 1}, got ${message.seq}`);
-                  // Request resync from backend
-                  sendResyncRequest(sessionId, lastSeq);
-                }
-                lastSeqBySessionRef.current.set(sessionId, message.seq);
-              }
-              
               if (message.schema === "ohlc" && message.record) {
                 // Forward OHLC candle to callback
                 onEventRef.current({

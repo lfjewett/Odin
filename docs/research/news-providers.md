@@ -9,3 +9,16 @@ https://news.google.com/rss/search?q=site%3Areuters.com&hl=en-US&gl=US&ceid=US%3
  - https://newsdata.io/pricing
  - https://finlight.me/pricing
  
+ To check if a stock symbol has recent news, I'm currently using the TradingView headlines endpoint below:
+
+url = (
+
+"https://news-headlines.tradingview.com/headlines/"
+
+"?category=stock"
+
+"&lang=en"
+
+f"&symbol={symbol_param}"
+
+)

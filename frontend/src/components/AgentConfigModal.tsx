@@ -18,6 +18,7 @@ export interface AgentConfigModalProps {
 
 type StatusColor = "online" | "offline" | "error" | "connecting";
 type EditableFieldType = "integer" | "number" | "boolean" | "string";
+type OverlayLineStyleName = "solid" | "dotted" | "dashed" | "large_dashed" | "sparse_dotted";
 
 type IndicatorDefinition = NonNullable<AgentSubscription["indicators"]>[number];
 
@@ -30,6 +31,45 @@ interface EditableConfigField {
   max?: number;
   enumOptions?: string[];
 }
+
+const UI_MANAGED_CONFIG_KEYS = new Set([
+  "line_color",
+  "vwap_line_color",
+  "vwap_upper_band_color",
+  "vwap_lower_band_color",
+  "vwap_line_style",
+  "vwap_upper_band_style",
+  "vwap_lower_band_style",
+  "visible",
+  "aggregation_interval",
+  "force_subgraph",
+  "area_fill_mode",
+  "area_fill_opacity",
+  "area_conditional_up_color",
+  "area_conditional_down_color",
+  "area_use_source_style",
+  "area_show_labels",
+]);
+
+const VWAP_LINE_STYLE_OPTIONS: Array<{ value: OverlayLineStyleName; label: string }> = [
+  { value: "solid", label: "Solid" },
+  { value: "dotted", label: "Dotted" },
+  { value: "dashed", label: "Dashed" },
+  { value: "large_dashed", label: "Large Dashed" },
+  { value: "sparse_dotted", label: "Sparse Dotted" },
+];
+
+const normalizeOverlayLineStyle = (value: unknown): OverlayLineStyleName => {
+  switch (value) {
+    case "dotted":
+    case "dashed":
+    case "large_dashed":
+    case "sparse_dotted":
+      return value;
+    default:
+      return "solid";
+  }
+};
 
 const CANONICAL_INTERVALS = [
   "1m",
@@ -73,6 +113,21 @@ const parseInterval = (interval?: string): { value: number; unit: string } | nul
   return { value, unit: match[2] };
 };
 
+const intervalToMinutes = (parsed: { value: number; unit: string }): number | null => {
+  switch (parsed.unit) {
+    case "m":
+      return parsed.value;
+    case "h":
+      return parsed.value * 60;
+    case "d":
+      return parsed.value * 60 * 24;
+    case "w":
+      return parsed.value * 60 * 24 * 7;
+    default:
+      return null;
+  }
+};
+
 const validateAggregationInterval = (
   sourceInterval: string | undefined,
   aggregationInterval: string
@@ -97,15 +152,28 @@ const validateAggregationInterval = (
     return null;
   }
 
-  if (source.unit !== target.unit) {
-    return `Aggregation interval must use the same unit as source interval ${sourceInterval}.`;
+  const sourceMinutes = intervalToMinutes(source);
+  const targetMinutes = intervalToMinutes(target);
+
+  if (sourceMinutes !== null && targetMinutes !== null) {
+    if (targetMinutes < sourceMinutes) {
+      return `Aggregation interval must be greater than or equal to source interval ${sourceInterval}.`;
+    }
+    if (targetMinutes % sourceMinutes !== 0) {
+      return `Aggregation interval must be an integer multiple of source interval ${sourceInterval}.`;
+    }
+    return null;
   }
 
-  if (target.value < source.value) {
+  if (target.unit !== "M" && source.unit !== "M") {
+    return `Aggregation interval format is invalid.`;
+  }
+
+  if (target.unit !== "M") {
     return `Aggregation interval must be greater than or equal to source interval ${sourceInterval}.`;
   }
 
-  if (target.value % source.value !== 0) {
+  if (source.unit === "M" && target.value % source.value !== 0) {
     return `Aggregation interval must be an integer multiple of source interval ${sourceInterval}.`;
   }
 
@@ -176,13 +244,13 @@ const inferIndicatorDefinition = (subscription?: AgentSubscription | null): Indi
   }
 
   const configuredKeys = new Set(
-    Object.keys(subscription?.config || {}).filter((key) => key !== "line_color")
+    Object.keys(subscription?.config || {}).filter((key) => !UI_MANAGED_CONFIG_KEYS.has(key))
   );
 
   let bestMatch: { indicator: IndicatorDefinition; score: number } | null = null;
   indicators.forEach((indicator) => {
     const schema = indicator.params_schema || {};
-    const schemaKeys = Object.keys(schema).filter((key) => key !== "line_color");
+    const schemaKeys = Object.keys(schema).filter((key) => !UI_MANAGED_CONFIG_KEYS.has(key));
     if (!schemaKeys.length) {
       return;
     }
@@ -239,6 +307,12 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   const [paramInputs, setParamInputs] = useState<Record<string, string>>({});
   const [aggregationIntervalInput, setAggregationIntervalInput] = useState<string>("");
   const [lineColorInput, setLineColorInput] = useState<string>("#cbd5e1");
+  const [vwapLineColorInput, setVwapLineColorInput] = useState<string>("#f59e0b");
+  const [vwapUpperBandColorInput, setVwapUpperBandColorInput] = useState<string>("#22c55e");
+  const [vwapLowerBandColorInput, setVwapLowerBandColorInput] = useState<string>("#ef4444");
+  const [vwapLineStyleInput, setVwapLineStyleInput] = useState<OverlayLineStyleName>("solid");
+  const [vwapUpperBandStyleInput, setVwapUpperBandStyleInput] = useState<OverlayLineStyleName>("dashed");
+  const [vwapLowerBandStyleInput, setVwapLowerBandStyleInput] = useState<OverlayLineStyleName>("dashed");
   const [areaFillModeInput, setAreaFillModeInput] = useState<"solid" | "conditional">("conditional");
   const [areaFillOpacityInput, setAreaFillOpacityInput] = useState<number>(50);
   const [areaConditionalUpColorInput, setAreaConditionalUpColorInput] = useState<string>("#22c55e");
@@ -259,24 +333,10 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
 
     const schema = inferredIndicator?.params_schema || {};
     const config = subscription.config || {};
-    const schemaKeys = Object.keys(schema).filter(
-      (key) => key !== "line_color" && key !== "aggregation_interval"
-    );
+    const schemaKeys = Object.keys(schema).filter((key) => !UI_MANAGED_CONFIG_KEYS.has(key));
     const orderedKeys: string[] = schemaKeys.length
       ? schemaKeys
-      : Object.keys(config).filter(
-          (key) =>
-            key !== "line_color" &&
-            key !== "aggregation_interval" &&
-            key !== "visible" &&
-            key !== "force_subgraph" &&
-            key !== "area_fill_mode" &&
-            key !== "area_fill_opacity" &&
-            key !== "area_conditional_up_color" &&
-            key !== "area_conditional_down_color" &&
-            key !== "area_use_source_style" &&
-            key !== "area_show_labels"
-        );
+      : Object.keys(config).filter((key) => !UI_MANAGED_CONFIG_KEYS.has(key));
 
     return orderedKeys.map((key) => {
       const definition = schema[key] as Record<string, unknown> | undefined;
@@ -343,6 +403,12 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     const nextConditionalDownColor = subscription.config?.area_conditional_down_color;
     const nextUseSourceStyle = subscription.config?.area_use_source_style;
     const nextShowLabels = subscription.config?.area_show_labels;
+    const nextVwapLineColor = subscription.config?.vwap_line_color;
+    const nextVwapUpperBandColor = subscription.config?.vwap_upper_band_color;
+    const nextVwapLowerBandColor = subscription.config?.vwap_lower_band_color;
+    const nextVwapLineStyle = subscription.config?.vwap_line_style;
+    const nextVwapUpperBandStyle = subscription.config?.vwap_upper_band_style;
+    const nextVwapLowerBandStyle = subscription.config?.vwap_lower_band_style;
     const nextAggregationInterval = subscription.config?.aggregation_interval;
     const nextParamInputs: Record<string, string> = {};
 
@@ -369,6 +435,24 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     setSavedVisibleInput(nextVisible);
     setVisibleInput(nextVisible);
     setLineColorInput(typeof nextColor === "string" && nextColor.length > 0 ? nextColor : "#cbd5e1");
+    setVwapLineColorInput(
+      typeof nextVwapLineColor === "string" && nextVwapLineColor.trim().length > 0
+        ? nextVwapLineColor
+        : "#f59e0b"
+    );
+    setVwapUpperBandColorInput(
+      typeof nextVwapUpperBandColor === "string" && nextVwapUpperBandColor.trim().length > 0
+        ? nextVwapUpperBandColor
+        : "#22c55e"
+    );
+    setVwapLowerBandColorInput(
+      typeof nextVwapLowerBandColor === "string" && nextVwapLowerBandColor.trim().length > 0
+        ? nextVwapLowerBandColor
+        : "#ef4444"
+    );
+    setVwapLineStyleInput(normalizeOverlayLineStyle(nextVwapLineStyle));
+    setVwapUpperBandStyleInput(normalizeOverlayLineStyle(nextVwapUpperBandStyle));
+    setVwapLowerBandStyleInput(normalizeOverlayLineStyle(nextVwapLowerBandStyle));
     setAreaFillModeInput(nextFillMode === "solid" ? "solid" : "conditional");
     setAreaFillOpacityInput(Number.isFinite(nextFillOpacity) ? Math.max(0, Math.min(100, nextFillOpacity)) : 50);
     setAreaConditionalUpColorInput(
@@ -404,6 +488,7 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
   const statusEmoji = getStatusEmoji(subscription.status);
   const statusColor = getStatusColor(subscription.status);
   const isIndicator = subscription.agent_type === "indicator";
+  const isVwapIndicator = inferredIndicator?.indicator_id === "vwap";
   const hasAreaOutput = Boolean(subscription.outputs?.some((output) => output?.schema === "area"));
   const resolvedSourceInterval = sourceInterval || subscription.interval;
 
@@ -500,6 +585,14 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
     nextConfig.force_subgraph = forceSubgraphInput;
     try {
       nextConfig.line_color = lineColorInput;
+      if (isVwapIndicator) {
+        nextConfig.vwap_line_color = vwapLineColorInput;
+        nextConfig.vwap_upper_band_color = vwapUpperBandColorInput;
+        nextConfig.vwap_lower_band_color = vwapLowerBandColorInput;
+        nextConfig.vwap_line_style = vwapLineStyleInput;
+        nextConfig.vwap_upper_band_style = vwapUpperBandStyleInput;
+        nextConfig.vwap_lower_band_style = vwapLowerBandStyleInput;
+      }
       if (hasAreaOutput) {
         nextConfig.area_fill_mode = areaFillModeInput;
         nextConfig.area_fill_opacity = Math.max(0, Math.min(100, areaFillOpacityInput));
@@ -778,6 +871,91 @@ export const AgentConfigModal: React.FC<AgentConfigModalProps> = ({
                     disabled={saving || deleting}
                   />
                 </div>
+                {isVwapIndicator && (
+                  <>
+                    <div className="config-item">
+                      <span className="config-label">VWAP Line Color</span>
+                      <input
+                        className="agent-input agent-input-color"
+                        type="color"
+                        value={vwapLineColorInput}
+                        onChange={(event) => setVwapLineColorInput(event.target.value)}
+                        disabled={saving || deleting}
+                      />
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">VWAP Line Type</span>
+                      <select
+                        className="agent-input"
+                        value={vwapLineStyleInput}
+                        onChange={(event) =>
+                          setVwapLineStyleInput(normalizeOverlayLineStyle(event.target.value))
+                        }
+                        disabled={saving || deleting}
+                      >
+                        {VWAP_LINE_STYLE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">VWAP Upper Band Color</span>
+                      <input
+                        className="agent-input agent-input-color"
+                        type="color"
+                        value={vwapUpperBandColorInput}
+                        onChange={(event) => setVwapUpperBandColorInput(event.target.value)}
+                        disabled={saving || deleting}
+                      />
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">VWAP Upper Band Type</span>
+                      <select
+                        className="agent-input"
+                        value={vwapUpperBandStyleInput}
+                        onChange={(event) =>
+                          setVwapUpperBandStyleInput(normalizeOverlayLineStyle(event.target.value))
+                        }
+                        disabled={saving || deleting}
+                      >
+                        {VWAP_LINE_STYLE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">VWAP Lower Band Color</span>
+                      <input
+                        className="agent-input agent-input-color"
+                        type="color"
+                        value={vwapLowerBandColorInput}
+                        onChange={(event) => setVwapLowerBandColorInput(event.target.value)}
+                        disabled={saving || deleting}
+                      />
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">VWAP Lower Band Type</span>
+                      <select
+                        className="agent-input"
+                        value={vwapLowerBandStyleInput}
+                        onChange={(event) =>
+                          setVwapLowerBandStyleInput(normalizeOverlayLineStyle(event.target.value))
+                        }
+                        disabled={saving || deleting}
+                      >
+                        {VWAP_LINE_STYLE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </>
+                )}
                 {hasAreaOutput && (
                   <>
                     <div className="config-item">

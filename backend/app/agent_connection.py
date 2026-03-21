@@ -24,8 +24,8 @@ from app.models import Agent
 logger = logging.getLogger(__name__)
 
 
-ACP_SPEC_VERSION = "ACP-0.4.3"
-COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3"}
+ACP_SPEC_VERSION = "ACP-0.5.0"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3", "ACP-0.5.0"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_RECORDS_PER_CHUNK = 5000
 DEFAULT_MAX_WEBSOCKET_MESSAGE_BYTES = 10 * 1024 * 1024
@@ -652,7 +652,7 @@ class AgentConnection:
                         sub_info["params"],
                         force=True,
                     )
-                    if subscribe_ok and self.on_rebootstrap:
+                    if subscribe_ok and self.on_rebootstrap and self.agent.config.agent_type == "indicator":
                         try:
                             result = self.on_rebootstrap(self.agent_id, session_id)
                             if inspect.isawaitable(result):

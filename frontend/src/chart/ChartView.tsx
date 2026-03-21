@@ -12,6 +12,7 @@ import {
   ISeriesPrimitive,
   IPrimitivePaneRenderer,
   IPrimitivePaneView,
+  LineStyle,
   LineSeries,
   SeriesMarker,
   Time,
@@ -22,12 +23,15 @@ import type { OHLCBar } from "../history/fetchHistory";
 import { formatEasternChartTime, formatEasternDateTime } from "../utils/time";
 import type { TradeMarker } from "../workspace/workspaceApi";
 
+type OverlayLineStyleName = "solid" | "dotted" | "dashed" | "large_dashed" | "sparse_dotted";
+
 interface ChartViewProps {
   onCandleReceived: (handler: (candle: MarketCandle) => void) => void;
   onSnapshotRequested: (handler: (bars: OHLCBar[]) => void) => void;
   overlayData: Map<string, OverlayRecord[]>;
   overlaySchemas?: Map<string, OverlaySchema>;
   overlayLineColors?: Map<string, string>;
+  overlaySeriesLineSettings?: Map<string, { color?: string; lineStyle?: OverlayLineStyleName }>;
   overlayAreaStyles?: Map<
     string,
     {
@@ -50,6 +54,18 @@ interface ChartViewProps {
   selectedInterval?: string;
   selectedTimeframe?: number;
   onTimeframeChange?: (days: number) => void;
+  viewportNavigator?: {
+    sliderValue: number;
+    canPageBackward: boolean;
+    canPageForward: boolean;
+    isLatest: boolean;
+    isLoading: boolean;
+    label: string;
+    onPageBackward: (anchorTs?: string) => void;
+    onPageForward: (anchorTs?: string) => void;
+    onSliderChange: (sliderValue: number) => void;
+    onJumpLatest: () => void;
+  } | null;
   isLeftCollapsed?: boolean;
   isRightCollapsed?: boolean;
   candleType?: "candlestick" | "bar" | "line" | "area";
@@ -351,11 +367,62 @@ class AreaBetweenRenderer implements IPrimitivePaneRenderer {
     }
 
     const timeScale = this.chart.timeScale();
+    const visible = timeScale.getVisibleRange();
+
+    let startIndex = 1;
+    let endIndex = this.points.length - 1;
+
+    if (visible && typeof visible.from === "number" && typeof visible.to === "number") {
+      const from = visible.from;
+      const to = visible.to;
+
+      const lowerBound = (value: number) => {
+        let left = 0;
+        let right = this.points.length;
+        while (left < right) {
+          const mid = (left + right) >> 1;
+          if (this.points[mid].time < value) {
+            left = mid + 1;
+          } else {
+            right = mid;
+          }
+        }
+        return left;
+      };
+
+      const upperBound = (value: number) => {
+        let left = 0;
+        let right = this.points.length;
+        while (left < right) {
+          const mid = (left + right) >> 1;
+          if (this.points[mid].time <= value) {
+            left = mid + 1;
+          } else {
+            right = mid;
+          }
+        }
+        return left;
+      };
+
+      const firstVisible = lowerBound(from);
+      const afterLastVisible = upperBound(to);
+
+      startIndex = Math.max(1, firstVisible);
+      endIndex = Math.min(this.points.length - 1, Math.max(startIndex, afterLastVisible));
+
+      // Include one segment before and after viewport boundaries for continuity.
+      startIndex = Math.max(1, startIndex - 1);
+      endIndex = Math.min(this.points.length - 1, endIndex + 1);
+
+      if (endIndex < startIndex) {
+        return;
+      }
+    }
 
     target.useBitmapCoordinateSpace((scope) => {
       const ctx = scope.context;
 
-      for (let index = 1; index < this.points.length; index += 1) {
+      for (let index = startIndex; index <= endIndex; index += 1) {
         const left = this.points[index - 1];
         const right = this.points[index];
 
@@ -684,6 +751,116 @@ class ExtendedHoursShade implements ISeriesPrimitive<Time> {
   }
 }
 
+interface ViewportEdgeCueState {
+  showLeft: boolean;
+  showRight: boolean;
+  leftLabel: string;
+  rightLabel: string;
+  fillColor: string;
+  textColor: string;
+}
+
+class ViewportEdgeCueRenderer implements IPrimitivePaneRenderer {
+  private state: ViewportEdgeCueState = {
+    showLeft: false,
+    showRight: false,
+    leftLabel: "",
+    rightLabel: "",
+    fillColor: "rgba(34, 211, 238, 0.22)",
+    textColor: "rgba(103, 232, 249, 0.95)",
+  };
+
+  update(state: ViewportEdgeCueState) {
+    this.state = state;
+  }
+
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.state.showLeft && !this.state.showRight) {
+      return;
+    }
+
+    target.useBitmapCoordinateSpace((scope) => {
+      const ctx = scope.context;
+      const width = scope.bitmapSize.width;
+      const height = scope.bitmapSize.height;
+      const cueWidth = Math.round(Math.min(width * 0.18, 120 * scope.horizontalPixelRatio));
+      const padding = 14 * scope.horizontalPixelRatio;
+
+      const drawCue = (side: "left" | "right", label: string) => {
+        const gradient = side === "left"
+          ? ctx.createLinearGradient(0, 0, cueWidth, 0)
+          : ctx.createLinearGradient(width - cueWidth, 0, width, 0);
+
+        if (side === "left") {
+          gradient.addColorStop(0, this.state.fillColor);
+          gradient.addColorStop(1, "rgba(34, 211, 238, 0)");
+        } else {
+          gradient.addColorStop(0, "rgba(34, 211, 238, 0)");
+          gradient.addColorStop(1, this.state.fillColor);
+        }
+
+        ctx.save();
+        ctx.fillStyle = gradient;
+        ctx.fillRect(side === "left" ? 0 : width - cueWidth, 0, cueWidth, height);
+
+        ctx.fillStyle = this.state.textColor;
+        ctx.font = `${Math.max(12, Math.round(12 * scope.verticalPixelRatio))}px Inter, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        const centerX = side === "left"
+          ? padding + (cueWidth - padding * 2) / 2
+          : width - padding - (cueWidth - padding * 2) / 2;
+        const centerY = height * 0.72;
+
+        ctx.translate(centerX, centerY);
+        ctx.rotate(side === "left" ? -Math.PI / 2 : Math.PI / 2);
+        ctx.fillText(label, 0, 0, Math.max(height * 0.3, 140 * scope.verticalPixelRatio));
+        ctx.restore();
+      };
+
+      if (this.state.showLeft) {
+        drawCue("left", this.state.leftLabel);
+      }
+      if (this.state.showRight) {
+        drawCue("right", this.state.rightLabel);
+      }
+    });
+  }
+}
+
+class ViewportEdgeCuePaneView implements IPrimitivePaneView {
+  private rendererInstance = new ViewportEdgeCueRenderer();
+
+  update(state: ViewportEdgeCueState) {
+    this.rendererInstance.update(state);
+  }
+
+  renderer() {
+    return this.rendererInstance;
+  }
+}
+
+class ViewportEdgeCuePrimitive implements ISeriesPrimitive<Time> {
+  private paneView = new ViewportEdgeCuePaneView();
+
+  update(state: ViewportEdgeCueState) {
+    this.paneView.update(state);
+  }
+
+  updateAllViews() {
+    // no-op
+  }
+
+  paneViews() {
+    return [this.paneView];
+  }
+
+  timeAxisViews() {
+    return [];
+  }
+}
+
 function normalizeHistoryBars(bars: OHLCBar[]): OHLCBar[] {
   const latestById = new Map<string, OHLCBar>();
 
@@ -743,6 +920,22 @@ function readOverlayColor(record: OverlayRecord | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function toChartLineStyle(style: OverlayLineStyleName | undefined): LineStyle {
+  switch (style) {
+    case "dotted":
+      return LineStyle.Dotted;
+    case "dashed":
+      return LineStyle.Dashed;
+    case "large_dashed":
+      return LineStyle.LargeDashed;
+    case "sparse_dotted":
+      return LineStyle.SparseDotted;
+    case "solid":
+    default:
+      return LineStyle.Solid;
+  }
+}
+
 function hasTrendColorMode(records: OverlayRecord[]): boolean {
   const metadata = records[0]?.metadata as Record<string, unknown> | undefined;
   return metadata?.color_mode === "trend";
@@ -777,6 +970,7 @@ export function ChartView({
   overlayData,
   overlaySchemas,
   overlayLineColors,
+  overlaySeriesLineSettings,
   overlayAreaStyles,
   overlaySubgraphForced,
   tradeMarkers = [],
@@ -784,6 +978,7 @@ export function ChartView({
   selectedInterval = "1m",
   selectedTimeframe = 1,
   onTimeframeChange,
+  viewportNavigator,
   isLeftCollapsed, 
   isRightCollapsed,
   candleType = "candlestick"
@@ -795,6 +990,7 @@ export function ChartView({
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<any> | null>(null);
+  const viewportEdgeCuePrimitiveRef = useRef<ViewportEdgeCuePrimitive | null>(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [selectedCandleDetails, setSelectedCandleDetails] = useState<MarketCandle | null>(null);
@@ -867,6 +1063,7 @@ export function ChartView({
   
   // Store candle data by timestamp for lookup
   const candleDataRef = useRef<Map<number, MarketCandle>>(new Map());
+  const mainSeriesLastTimeRef = useRef<number | null>(null);
   const overlayLineSeriesRef = useRef<Map<string, ISeriesApi<any>>>(new Map());
   const overlayAreaSeriesRef = useRef<
     Map<
@@ -917,8 +1114,12 @@ export function ChartView({
   // every 5s subscription poll when only Map references change but content is the same.
   const overlayLineColorsRef = useRef(overlayLineColors);
   overlayLineColorsRef.current = overlayLineColors;
+  const overlaySeriesLineSettingsRef = useRef(overlaySeriesLineSettings);
+  overlaySeriesLineSettingsRef.current = overlaySeriesLineSettings;
   const overlayAreaStylesRef = useRef(overlayAreaStyles);
   overlayAreaStylesRef.current = overlayAreaStyles;
+  const viewportNavigatorRef = useRef(viewportNavigator);
+  viewportNavigatorRef.current = viewportNavigator;
 
   const updateVisibleLogicalRange = useCallback((range: { from: number; to: number } | null) => {
     setVisibleLogicalRange(normalizeLogicalRange(range));
@@ -962,6 +1163,10 @@ export function ChartView({
       maxStart,
     };
   }, [historyBarCount, visibleLogicalRange]);
+  const navigatorMetricsRef = useRef(navigatorMetrics);
+  navigatorMetricsRef.current = navigatorMetrics;
+  const visibleLogicalRangeRef = useRef(visibleLogicalRange);
+  visibleLogicalRangeRef.current = visibleLogicalRange;
 
   const handleNavigatorChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const metrics = navigatorMetrics;
@@ -977,6 +1182,54 @@ export function ChartView({
     const ratio = clamp(rawValue / 1000, 0, 1);
     moveViewportToStart(metrics.maxStart * ratio);
   }, [moveViewportToStart, navigatorMetrics]);
+
+  useEffect(() => {
+    const primitive = viewportEdgeCuePrimitiveRef.current;
+    if (!primitive) {
+      return;
+    }
+
+    const metrics = navigatorMetrics;
+    const logicalRange = visibleLogicalRange;
+    const maxStart = metrics?.maxStart ?? 0;
+    const effectiveStart = logicalRange ? clamp(logicalRange.from, 0, maxStart) : 0;
+    const atLeftEdge = Boolean(viewportNavigator?.canPageBackward) && effectiveStart <= 1;
+    const atRightEdge = Boolean(viewportNavigator?.canPageForward) && maxStart > 0 && effectiveStart >= maxStart - 1;
+
+    primitive.update({
+      showLeft: atLeftEdge,
+      showRight: atRightEdge,
+      leftLabel: "",
+      rightLabel: "",
+      fillColor: "rgba(34, 211, 238, 0.24)",
+      textColor: "rgba(165, 243, 252, 0.96)",
+    });
+  }, [navigatorMetrics, viewportNavigator, visibleLogicalRange]);
+
+  const getVisibleEdgeTimestamps = useCallback((): { leftTs?: string; rightTs?: string } => {
+    const logicalRange = visibleLogicalRangeRef.current;
+    if (!logicalRange || candleDataRef.current.size === 0) {
+      return {};
+    }
+
+    const orderedTimes = Array.from(candleDataRef.current.keys()).sort((a, b) => a - b);
+    if (orderedTimes.length === 0) {
+      return {};
+    }
+
+    const lastIndex = orderedTimes.length - 1;
+    const leftIndex = clamp(Math.floor(logicalRange.from), 0, lastIndex);
+    const rightIndex = clamp(Math.ceil(logicalRange.to) - 1, 0, lastIndex);
+    const leftTime = orderedTimes[leftIndex];
+    const rightTime = orderedTimes[rightIndex];
+    const leftCandle = candleDataRef.current.get(leftTime);
+    const rightCandle = candleDataRef.current.get(rightTime);
+
+    return {
+      leftTs: leftCandle?.ts || new Date(leftTime * 1000).toISOString(),
+      rightTs: rightCandle?.ts || new Date(rightTime * 1000).toISOString(),
+    };
+  }, []);
 
   useEffect(() => {
     if (!isScrubberActive) {
@@ -1025,14 +1278,15 @@ export function ChartView({
         chartData = normalizedBars
           .map((bar) => {
             const time = toUnixSeconds(bar.ts);
-            if (time === null) return null;
+            const close = Number(bar.close);
+            if (time === null || !Number.isFinite(close)) return null;
             
             // Store full candle data
             candleDataRef.current.set(time, bar);
             
             return {
               time,
-              value: bar.close,
+              value: close,
             };
           })
           .filter((bar): bar is { time: number; value: number } => bar !== null);
@@ -1041,17 +1295,27 @@ export function ChartView({
         chartData = normalizedBars
           .map((bar) => {
             const time = toUnixSeconds(bar.ts);
-            if (time === null) return null;
+            const open = Number(bar.open);
+            const high = Number(bar.high);
+            const low = Number(bar.low);
+            const close = Number(bar.close);
+            if (
+              time === null ||
+              !Number.isFinite(open) ||
+              !Number.isFinite(high) ||
+              !Number.isFinite(low) ||
+              !Number.isFinite(close)
+            ) return null;
             
             // Store full candle data
             candleDataRef.current.set(time, bar);
             
             return {
               time,
-              open: bar.open,
-              high: bar.high,
-              low: bar.low,
-              close: bar.close,
+              open,
+              high,
+              low,
+              close,
             };
           })
           .filter(
@@ -1077,6 +1341,7 @@ export function ChartView({
       chartData = Array.from(uniqueByTime.values()).sort((a, b) => a.time - b.time);
       
       seriesRef.current.setData(chartData);
+      mainSeriesLastTimeRef.current = chartData.length > 0 ? chartData[chartData.length - 1].time : null;
       setHistoryBarCount(chartData.length);
       
       if (chartRef.current) {
@@ -1216,9 +1481,80 @@ export function ChartView({
     // Attach extended hours shading primitive
     const extendedHoursShade = new ExtendedHoursShade(chart);
     series.attachPrimitive(extendedHoursShade);
+    const viewportEdgeCuePrimitive = new ViewportEdgeCuePrimitive();
+    series.attachPrimitive(viewportEdgeCuePrimitive);
 
     chartRef.current = chart;
     seriesRef.current = series;
+    viewportEdgeCuePrimitiveRef.current = viewportEdgeCuePrimitive;
+
+    const rebuildMainSeriesFromCache = () => {
+      if (!seriesRef.current) return;
+
+      const orderedCandles = Array.from(candleDataRef.current.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([, bar]) => bar);
+
+      if (candleType === 'line' || candleType === 'area') {
+        const rebuilt = orderedCandles
+          .map((bar) => {
+            const time = toUnixSeconds(bar.ts);
+            const value = Number(bar.close);
+            if (time === null || !Number.isFinite(value)) {
+              return null;
+            }
+
+            return {
+              time,
+              value,
+            };
+          })
+          .filter((point): point is { time: number; value: number } => point !== null);
+        seriesRef.current.setData(rebuilt);
+        mainSeriesLastTimeRef.current = rebuilt.length > 0 ? rebuilt[rebuilt.length - 1].time : null;
+        return;
+      }
+
+      const rebuilt = orderedCandles
+        .map((bar) => {
+          const time = toUnixSeconds(bar.ts);
+          const open = Number(bar.open);
+          const high = Number(bar.high);
+          const low = Number(bar.low);
+          const close = Number(bar.close);
+
+          if (
+            time === null ||
+            !Number.isFinite(open) ||
+            !Number.isFinite(high) ||
+            !Number.isFinite(low) ||
+            !Number.isFinite(close)
+          ) {
+            return null;
+          }
+
+          return {
+            time,
+            open,
+            high,
+            low,
+            close,
+          };
+        })
+        .filter(
+          (
+            point
+          ): point is {
+            time: number;
+            open: number;
+            high: number;
+            low: number;
+            close: number;
+          } => point !== null
+        );
+      seriesRef.current.setData(rebuilt);
+      mainSeriesLastTimeRef.current = rebuilt.length > 0 ? rebuilt[rebuilt.length - 1].time : null;
+    };
 
     const handleCandle = (candle: MarketCandle) => {
       if (!seriesRef.current) return;
@@ -1226,27 +1562,58 @@ export function ChartView({
       const time = toUnixSeconds(candle.ts);
       if (time === null) return;
 
+      const close = Number(candle.close);
+      const open = Number(candle.open);
+      const high = Number(candle.high);
+      const low = Number(candle.low);
+
+      if (candleType === 'line' || candleType === 'area') {
+        if (!Number.isFinite(close)) {
+          return;
+        }
+      } else if (
+        !Number.isFinite(open) ||
+        !Number.isFinite(high) ||
+        !Number.isFinite(low) ||
+        !Number.isFinite(close)
+      ) {
+        return;
+      }
+
       const hadNoCandles = candleDataRef.current.size === 0;
+      const previousLastTime = mainSeriesLastTimeRef.current;
       
       // Store the candle data
       candleDataRef.current.set(time, candle);
       setHistoryBarCount(candleDataRef.current.size);
+
+      // Lightweight Charts `update()` only supports updating the current last bar or appending
+      // a newer one. When a correction/backfill arrives for an older candle, rebuild the main
+      // series from the canonical in-memory map instead of throwing.
+      if (previousLastTime !== null && time < previousLastTime) {
+        rebuildMainSeriesFromCache();
+        if (hadNoCandles && chartRef.current) {
+          chartRef.current.timeScale().fitContent();
+        }
+        return;
+      }
       
       // Format data based on chart type
       if (candleType === 'line' || candleType === 'area') {
         seriesRef.current.update({
           time,
-          value: candle.close,
+          value: close,
         });
       } else {
         seriesRef.current.update({
           time,
-          open: candle.open,
-          high: candle.high,
-          low: candle.low,
-          close: candle.close,
+          open,
+          high,
+          low,
+          close,
         });
       }
+      mainSeriesLastTimeRef.current = previousLastTime === null ? time : Math.max(previousLastTime, time);
 
       if (hadNoCandles && chartRef.current) {
         chartRef.current.timeScale().fitContent();
@@ -1429,6 +1796,8 @@ export function ChartView({
       // Null out refs so history loading knows the chart was destroyed
       chartRef.current = null;
       seriesRef.current = null;
+      viewportEdgeCuePrimitiveRef.current = null;
+      mainSeriesLastTimeRef.current = null;
       setVisibleLogicalRange(null);
       setHistoryBarCount(0);
       // Reset sub-graph pane tracking so fresh pane indices are assigned after chart recreation
@@ -1574,6 +1943,7 @@ export function ChartView({
           // listed as a dep on overlayLineColors/overlayAreaStyles. A separate lightweight
           // effect below handles color-only applyOptions without triggering setData.
           const seriesColor = overlayLineColorsRef.current?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
+          const seriesLineSetting = overlaySeriesLineSettingsRef.current?.get(seriesKey);
           const areaStyleOverride = overlayAreaStylesRef.current?.get(agentId);
           const upColor = cssVar("--chart-up", "#22c55e");
           const downColor = cssVar("--chart-down", "#ef4444");
@@ -1934,6 +2304,8 @@ export function ChartView({
           }
           const explicitLineColor = readOverlayColor(records[records.length - 1]);
           const trendMode = hasTrendColorMode(records);
+          const configuredSeriesColor = seriesLineSetting?.color;
+          const configuredLineStyle = toChartLineStyle(seriesLineSetting?.lineStyle);
 
           let overlaySeries = existingLineSeries.get(seriesKey);
 
@@ -1950,8 +2322,8 @@ export function ChartView({
           }
 
           if (!overlaySeries) {
-            let resolvedLineColor = explicitLineColor || seriesColor;
-            if (!explicitLineColor && trendMode && records.length > 1) {
+            let resolvedLineColor = explicitLineColor || configuredSeriesColor || seriesColor;
+            if (!explicitLineColor && !configuredSeriesColor && trendMode && records.length > 1) {
               const firstValue = Number(records[0]?.value);
               const lastValue = Number(records[records.length - 1]?.value);
               if (Number.isFinite(firstValue) && Number.isFinite(lastValue)) {
@@ -1961,6 +2333,7 @@ export function ChartView({
             overlaySeries = addLineSeriesCompat(chart as ChartCompatApi, {
               color: resolvedLineColor,
               lineWidth: 2,
+              lineStyle: configuredLineStyle,
               priceLineVisible: false,
               lastValueVisible: wantsSubgraph, // show last value label on sub-pane
               pane: linePane,
@@ -1983,15 +2356,15 @@ export function ChartView({
               areaPointsCacheRef.current.delete(seriesKey);
             }
           } else {
-            let resolvedLineColor = explicitLineColor || seriesColor;
-            if (!explicitLineColor && trendMode && records.length > 1) {
+            let resolvedLineColor = explicitLineColor || configuredSeriesColor || seriesColor;
+            if (!explicitLineColor && !configuredSeriesColor && trendMode && records.length > 1) {
               const firstValue = Number(records[0]?.value);
               const lastValue = Number(records[records.length - 1]?.value);
               if (Number.isFinite(firstValue) && Number.isFinite(lastValue)) {
                 resolvedLineColor = lastValue >= firstValue ? upColor : downColor;
               }
             }
-            overlaySeries.applyOptions({ color: resolvedLineColor });
+            overlaySeries.applyOptions({ color: resolvedLineColor, lineStyle: configuredLineStyle });
           }
 
           const lineData = records
@@ -2076,8 +2449,8 @@ export function ChartView({
         overlayRenderLastLogAtRef.current = now;
       }
     }
-  // overlayLineColors and overlayAreaStyles intentionally omitted from deps: they are accessed
-  // via overlayLineColorsRef / overlayAreaStylesRef to avoid re-running the costly setData
+  // overlayLineColors, overlaySeriesLineSettings, and overlayAreaStyles intentionally omitted from deps: they are accessed
+  // via refs to avoid re-running the costly setData
   // pipeline on every 5s subscription poll. The lightweight effect below handles color-only
   // updates on existing series without touching data.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2089,12 +2462,31 @@ export function ChartView({
   // with the updated colors (area colors are baked into primitive points).
   useEffect(() => {
     if (!chartRef.current) return;
-    for (const [seriesKey] of overlayData.entries()) {
+    for (const [seriesKey, records] of overlayData.entries()) {
       const agentId = overlayAgentId(seriesKey);
       const seriesColor = overlayLineColors?.get(agentId) || cssVar("--chart-text", "#cbd5e1");
+      const seriesLineSetting = overlaySeriesLineSettings?.get(seriesKey);
+      const explicitLineColor = readOverlayColor(records[records.length - 1]);
+      const trendMode = hasTrendColorMode(records);
+      const configuredSeriesColor = seriesLineSetting?.color;
+
+      let resolvedLineColor = explicitLineColor || configuredSeriesColor || seriesColor;
+      if (!explicitLineColor && !configuredSeriesColor && trendMode && records.length > 1) {
+        const firstValue = Number(records[0]?.value);
+        const lastValue = Number(records[records.length - 1]?.value);
+        if (Number.isFinite(firstValue) && Number.isFinite(lastValue)) {
+          const upColor = cssVar("--chart-up", "#22c55e");
+          const downColor = cssVar("--chart-down", "#ef4444");
+          resolvedLineColor = lastValue >= firstValue ? upColor : downColor;
+        }
+      }
+
       const existingLine = overlayLineSeriesRef.current.get(seriesKey);
       if (existingLine) {
-        existingLine.applyOptions({ color: seriesColor });
+        existingLine.applyOptions({
+          color: resolvedLineColor,
+          lineStyle: toChartLineStyle(seriesLineSetting?.lineStyle),
+        });
       }
       // Area colors are embedded in point-level style data — invalidate cache so that the
       // next data arrival (overlay_update / timeframe change) triggers a proper re-render.
@@ -2103,7 +2495,7 @@ export function ChartView({
         areaPointsCacheRef.current.delete(seriesKey);
       }
     }
-  }, [overlayLineColors, overlayAreaStyles, overlayData]);
+  }, [overlayLineColors, overlaySeriesLineSettings, overlayAreaStyles, overlayData]);
 
   useEffect(() => {
     if (!seriesRef.current) {
@@ -2445,7 +2837,54 @@ export function ChartView({
 
       <div ref={containerRef} className="chart-canvas" />
 
-      {navigatorMetrics && historyBarCount > navigatorMetrics.visibleBars + 3 && (
+      {viewportNavigator ? (
+        <div className="chart-scrubber-dock chart-scrubber-dock-paged" role="group" aria-label="Paged timeline navigator">
+          <button
+            type="button"
+            className="chart-scrubber-button"
+            onClick={() => viewportNavigator.onPageBackward(getVisibleEdgeTimestamps().leftTs)}
+            disabled={!viewportNavigator.canPageBackward || viewportNavigator.isLoading}
+            aria-label="Page backward in time"
+          >
+            ←
+          </button>
+          <input
+            id="chart-timeline-scrubber"
+            type="range"
+            min="0"
+            max="1000"
+            step="1"
+            value={navigatorMetrics?.sliderValue ?? 1000}
+            onChange={handleNavigatorChange}
+            onPointerDown={() => setIsScrubberActive(true)}
+            disabled={!navigatorMetrics || historyBarCount <= (navigatorMetrics.visibleBars + 1)}
+            className={`chart-nav-slider ${isScrubberActive ? "is-active" : ""}`}
+            aria-label="Scrub full retained timeline"
+          />
+          <div className="chart-scrubber-readout">
+            <span>{viewportNavigator.label}</span>
+            {!viewportNavigator.isLatest && (
+              <button
+                type="button"
+                className="chart-scrubber-latest"
+                onClick={viewportNavigator.onJumpLatest}
+                disabled={viewportNavigator.isLoading}
+              >
+                Latest
+              </button>
+            )}
+          </div>
+          <button
+            type="button"
+            className="chart-scrubber-button"
+            onClick={() => viewportNavigator.onPageForward(getVisibleEdgeTimestamps().rightTs)}
+            disabled={!viewportNavigator.canPageForward || viewportNavigator.isLoading}
+            aria-label="Page forward in time"
+          >
+            →
+          </button>
+        </div>
+      ) : navigatorMetrics && historyBarCount > navigatorMetrics.visibleBars + 3 ? (
         <div className="chart-scrubber-dock" role="group" aria-label="Timeline scrubber">
           <input
             id="chart-timeline-scrubber"
@@ -2460,7 +2899,7 @@ export function ChartView({
             aria-label="Scrub chart timeline"
           />
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

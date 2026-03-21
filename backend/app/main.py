@@ -1,9 +1,9 @@
 """
-Odin Backend - FastAPI WebSocket Server (ACP v0.4.3)
+Odin Backend - FastAPI WebSocket Server (ACP v0.5.0)
 
 Manages WebSocket connections from the frontend and routes them to ACP agents:
 - Accepts WebSocket connections from the frontend (each is a client_id)
-- Loads agent configurations from overlay_agents.yaml (ACP v0.4.3)
+- Loads agent configurations from overlay_agents.yaml (ACP v0.5.0)
 - Connects to ACP agents via WebSocket
 - Routes ACP messages to specific sessions (not broadcast-all)
 - Maintains canonical candle store per session with deduplication
@@ -51,9 +51,9 @@ from app.trade_engine import evaluate_research_expression, evaluate_strategy, va
 from app.trade_strategy_store import TradeStrategyStore
 from app.workspace_store import WorkspaceStore
 
-ACP_SPEC_VERSION = "ACP-0.4.3"
-ACP_API_VERSION = "0.4.3"
-COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3"}
+ACP_SPEC_VERSION = "ACP-0.5.0"
+ACP_API_VERSION = "0.5.0"
+COMPATIBLE_ACP_SPEC_VERSIONS = {"ACP-0.4.0", "ACP-0.4.1", "ACP-0.4.2", "ACP-0.4.3", "ACP-0.5.0"}
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 30
 SUBSCRIBE_PROPAGATION_DELAY_SECONDS = 0.2
 EXPORT_CHUNK_MONTHS = 6
@@ -82,7 +82,8 @@ def to_indicator_ohlc(candle: dict) -> dict:
 
 
 def requires_overlay_output_id(spec_version: Any) -> bool:
-    return str(spec_version or "").strip() == "ACP-0.4.3"
+    # output_id enforcement was introduced in ACP-0.4.3 and carries forward
+    return str(spec_version or "").strip() in {"ACP-0.4.3", "ACP-0.5.0"}
 
 
 def missing_overlay_output_id(record: Any) -> bool:
@@ -318,6 +319,10 @@ session_data_stores: dict[str, SessionDataStore] = {}
 # Track backend-assigned stream sequence numbers: session_id -> latest_seq
 session_seq_counters: dict[str, int] = {}
 
+# Track frontend viewport state per session. Backend retains full timeframe data but
+# only forwards/slices the current viewport window for UI responsiveness.
+session_viewport_states: dict[str, dict[str, Any]] = {}
+
 # Track latest subscribe request epoch for each session to prevent stale
 # long-running subscribe flows from applying after a newer interval/symbol switch.
 session_subscribe_epochs: dict[str, int] = {}
@@ -355,6 +360,7 @@ indicator_recovery_last_attempt: dict[tuple[str, str], datetime] = {}
 # CSV export job tracking (in-memory, per backend process).
 csv_export_jobs: dict[str, dict[str, Any]] = {}
 csv_export_tasks: dict[str, asyncio.Task] = {}
+export_history_response_state: dict[str, dict[str, Any]] = {}
 csv_export_root = Path(__file__).parent.parent / "data" / "exports"
 
 # Runtime telemetry (Phase 0 baseline).
@@ -386,7 +392,6 @@ def _percentile_from_sorted(values: list[float], percentile: float) -> float:
     index = int(math.ceil((percentile / 100.0) * len(values))) - 1
     index = max(0, min(index, len(values) - 1))
     return float(values[index])
-
 
 def _latency_summary(values: deque[float]) -> dict[str, float]:
     if not values:
@@ -538,11 +543,173 @@ def _record_in_range(record: dict[str, Any], start_at: datetime, end_at: datetim
     return start_at <= parsed <= end_at
 
 
+def _default_viewport_days_for_timeframe(timeframe_days: int) -> int | None:
+    if int(timeframe_days or 0) >= 90:
+        return 30
+    return None
+
+
+def _viewport_interval_tolerance(interval: str) -> timedelta:
+    minutes = SessionDataStore._parse_interval_to_minutes(interval)
+    return timedelta(minutes=max(1, minutes) * 2)
+
+
+def _build_session_viewport_response(
+    session_id: str,
+    data_store: SessionDataStore,
+    *,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    window_days: int | None = None,
+) -> dict[str, Any]:
+    candles = data_store.get_canonical_candles()
+    overlays = data_store.get_non_ohlc_records()
+    total_bars = len(candles)
+
+    if not candles:
+        state = {
+            "enabled": bool(window_days and window_days > 0),
+            "viewport_days": int(window_days or 0),
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "follow_live": True,
+        }
+        session_viewport_states[session_id] = state
+        return {
+            "session_id": session_id,
+            "bars": [],
+            "overlays": [],
+            "trade_markers": [],
+            "count": 0,
+            "overlay_count": 0,
+            "trade_marker_count": 0,
+            "range_start_ts": None,
+            "range_end_ts": None,
+            "viewport_from_ts": from_ts,
+            "viewport_to_ts": to_ts,
+            "total_bars": 0,
+            "viewport_days": int(window_days or 0),
+            "is_viewported": bool(window_days and window_days > 0),
+            "is_latest": True,
+            "follow_live": True,
+            "has_previous": False,
+            "has_next": False,
+            "slider_value": 1000,
+        }
+
+    full_start_at = _parse_record_ts(candles[0].get("ts")) or datetime.now(timezone.utc)
+    full_end_at = _parse_record_ts(candles[-1].get("ts")) or full_start_at
+
+    requested_from = _parse_record_ts(from_ts) if from_ts else None
+    requested_to = _parse_record_ts(to_ts) if to_ts else None
+    viewport_days = int(window_days or 0)
+
+    if requested_from and requested_to:
+        start_at = requested_from
+        end_at = requested_to
+    else:
+        effective_window_days = viewport_days if viewport_days > 0 else 0
+        if effective_window_days > 0:
+            end_at = requested_to or full_end_at
+            start_at = requested_from or (end_at - timedelta(days=effective_window_days))
+        else:
+            start_at = full_start_at
+            end_at = full_end_at
+
+    start_at = max(start_at, full_start_at)
+    end_at = min(end_at, full_end_at)
+    if end_at < start_at:
+        end_at = start_at
+
+    sliced_candles = [candle for candle in candles if _record_in_range(candle, start_at, end_at)]
+    sliced_overlays = [overlay for overlay in overlays if _record_in_range(overlay, start_at, end_at)]
+
+    trade_result = latest_trade_results_by_session.get(session_id) or {}
+    raw_trade_markers = trade_result.get("markers") if isinstance(trade_result, dict) else []
+    trade_markers = [marker for marker in raw_trade_markers or [] if isinstance(marker, dict) and _record_in_range(marker, start_at, end_at)]
+
+    actual_from_ts = sliced_candles[0].get("ts") if sliced_candles else candles[0].get("ts")
+    actual_to_ts = sliced_candles[-1].get("ts") if sliced_candles else candles[-1].get("ts")
+    actual_from_at = _parse_record_ts(actual_from_ts) or start_at
+    actual_to_at = _parse_record_ts(actual_to_ts) or end_at
+
+    tolerance = _viewport_interval_tolerance(data_store.interval)
+    is_latest = actual_to_at >= (full_end_at - tolerance)
+    follow_live = is_latest
+
+    full_span_seconds = max((full_end_at - full_start_at).total_seconds(), 1.0)
+    window_span_seconds = max((actual_to_at - actual_from_at).total_seconds(), 1.0)
+    max_offset_seconds = max(full_span_seconds - window_span_seconds, 0.0)
+    current_offset_seconds = max((actual_from_at - full_start_at).total_seconds(), 0.0)
+    slider_value = 1000 if max_offset_seconds <= 0 else int(round((current_offset_seconds / max_offset_seconds) * 1000))
+
+    session_viewport_states[session_id] = {
+        "enabled": viewport_days > 0,
+        "viewport_days": viewport_days,
+        "from_ts": str(actual_from_ts or ""),
+        "to_ts": str(actual_to_ts or ""),
+        "follow_live": follow_live,
+    }
+
+    return {
+        "session_id": session_id,
+        "bars": sliced_candles,
+        "overlays": sliced_overlays,
+        "trade_markers": trade_markers,
+        "count": len(sliced_candles),
+        "overlay_count": len(sliced_overlays),
+        "trade_marker_count": len(trade_markers),
+        "range_start_ts": candles[0].get("ts"),
+        "range_end_ts": candles[-1].get("ts"),
+        "viewport_from_ts": actual_from_ts,
+        "viewport_to_ts": actual_to_ts,
+        "total_bars": total_bars,
+        "viewport_days": viewport_days,
+        "is_viewported": viewport_days > 0,
+        "is_latest": is_latest,
+        "follow_live": follow_live,
+        "has_previous": actual_from_at > (full_start_at + tolerance),
+        "has_next": actual_to_at < (full_end_at - tolerance),
+        "slider_value": max(0, min(1000, slider_value)),
+    }
+
+
+def _slice_overlays_to_current_viewport(session_id: str, overlays: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    state = session_viewport_states.get(session_id) or {}
+    if not state.get("enabled"):
+        return overlays
+
+    start_at = _parse_record_ts(state.get("from_ts"))
+    end_at = _parse_record_ts(state.get("to_ts"))
+    if not start_at or not end_at:
+        return overlays
+
+    return [overlay for overlay in overlays if _record_in_range(overlay, start_at, end_at)]
+
+
+def _should_forward_live_record(session_id: str, record: dict[str, Any] | None, *, interval: str | None = None) -> bool:
+    state = session_viewport_states.get(session_id) or {}
+    if not state.get("enabled"):
+        return True
+    if state.get("follow_live"):
+        return True
+    if not isinstance(record, dict):
+        return True
+
+    start_at = _parse_record_ts(state.get("from_ts"))
+    end_at = _parse_record_ts(state.get("to_ts"))
+    if not start_at or not end_at:
+        return True
+
+    return _record_in_range(record, start_at, end_at)
+
+
 async def _wait_for_export_settle(
     data_store: SessionDataStore,
     min_delay_seconds: float,
     poll_seconds: float,
     timeout_seconds: float,
+    session_id: str | None = None,
 ) -> None:
     await asyncio.sleep(min_delay_seconds)
     deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
@@ -550,24 +717,79 @@ async def _wait_for_export_settle(
     last_signature: tuple[int, int, str] | None = None
 
     while datetime.now(timezone.utc) < deadline:
+        pending_history_agents = _pending_export_history_agents(session_id)
+        history_complete = not pending_history_agents
         signature = (
             len(data_store.latest_by_candle_id),
             len(data_store.latest_non_ohlc_by_key),
             str(data_store.last_event_ts or ""),
         )
 
-        if signature == last_signature:
+        if history_complete and signature == last_signature:
             stable_ticks += 1
         else:
             stable_ticks = 0
 
-        if stable_ticks >= 2:
+        if history_complete and stable_ticks >= 2:
             return
 
         last_signature = signature
         await asyncio.sleep(poll_seconds)
 
+    if session_id:
+        pending_history_agents = _pending_export_history_agents(session_id)
+        if pending_history_agents:
+            missing = ", ".join(sorted(pending_history_agents))
+            raise TimeoutError(
+                f"Export settle timeout: waiting for history_response from agent(s): {missing}"
+            )
+
     raise TimeoutError("Export settle timeout: data did not stabilize before timeout")
+
+
+def _begin_export_history_tracking(session_id: str, expected_agent_ids: set[str]) -> None:
+    export_history_response_state[session_id] = {
+        "expected_agent_ids": set(expected_agent_ids),
+        "responded_agent_ids": set(),
+        "responses": {},
+    }
+
+
+def _mark_export_history_response(
+    session_id: str,
+    agent_id: str,
+    subscription_id: str,
+    overlay_count: int,
+) -> None:
+    state = export_history_response_state.get(session_id)
+    if not state:
+        return
+
+    responded_agent_ids = state.setdefault("responded_agent_ids", set())
+    responded_agent_ids.add(agent_id)
+    responses = state.setdefault("responses", {})
+    responses[agent_id] = {
+        "subscription_id": subscription_id,
+        "overlay_count": overlay_count,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _pending_export_history_agents(session_id: str | None) -> set[str]:
+    if not session_id:
+        return set()
+
+    state = export_history_response_state.get(session_id)
+    if not state:
+        return set()
+
+    expected = state.get("expected_agent_ids") or set()
+    responded = state.get("responded_agent_ids") or set()
+    if not isinstance(expected, set):
+        expected = set(expected)
+    if not isinstance(responded, set):
+        responded = set(responded)
+    return set(expected) - set(responded)
 
 
 def _sorted_candles_for_push(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -803,14 +1025,19 @@ async def _run_csv_export_job(job_id: str) -> None:
             to_ts = source_connection._format_history_timestamp(window_end)
             history_bars = await source_connection.fetch_history(symbol, from_ts, to_ts, interval)
 
-            ingested_chunk: list[dict[str, Any]] = []
             for bar in history_bars:
-                normalized = export_store.ingest_ohlc(bar)
-                if normalized:
-                    ingested_chunk.append(normalized)
+                export_store.ingest_ohlc(bar)
 
-            if ingested_chunk and indicator_connections:
-                candles_for_push = [to_indicator_ohlc(candle) for candle in _sorted_candles_for_push(ingested_chunk)]
+            job["completed_chunks"] = index
+
+        if indicator_connections:
+            canonical_candles_for_export = _sorted_candles_for_push(export_store.get_canonical_candles())
+            if canonical_candles_for_export:
+                _begin_export_history_tracking(
+                    export_session_id,
+                    {indicator_id for indicator_id, _indicator_connection in indicator_connections},
+                )
+                candles_for_push = [to_indicator_ohlc(candle) for candle in canonical_candles_for_export]
                 await asyncio.sleep(SUBSCRIBE_PROPAGATION_DELAY_SECONDS)
                 for _indicator_id, indicator_connection in indicator_connections:
                     await indicator_connection.send_history_push(
@@ -820,14 +1047,13 @@ async def _run_csv_export_job(job_id: str) -> None:
                         candles=candles_for_push,
                     )
 
-            await _wait_for_export_settle(
-                export_store,
-                min_delay_seconds=float(job["settle_min_delay_seconds"]),
-                poll_seconds=float(job["settle_poll_seconds"]),
-                timeout_seconds=float(job["settle_timeout_seconds"]),
-            )
-
-            job["completed_chunks"] = index
+                await _wait_for_export_settle(
+                    export_store,
+                    min_delay_seconds=float(job["settle_min_delay_seconds"]),
+                    poll_seconds=float(job["settle_poll_seconds"]),
+                    timeout_seconds=float(job["settle_timeout_seconds"]),
+                    session_id=export_session_id,
+                )
 
         candles_for_export = [
             candle for candle in export_store.get_canonical_candles() if _record_in_range(candle, start_at, end_at)
@@ -868,6 +1094,7 @@ async def _run_csv_export_job(job_id: str) -> None:
             session_manager.delete_session(export_session_id)
             session_data_stores.pop(export_session_id, None)
             session_seq_counters.pop(export_session_id, None)
+            session_viewport_states.pop(export_session_id, None)
             session_subscribe_epochs.pop(export_session_id, None)
             session_trade_revisions.pop(export_session_id, None)
             latest_trade_results_by_session.pop(export_session_id, None)
@@ -1153,6 +1380,7 @@ def clear_history_response_state_for_session(session_id: str) -> None:
     keys_to_remove = [key for key in history_response_chunks.keys() if key[1] == session_id]
     for key in keys_to_remove:
         history_response_chunks.pop(key, None)
+    export_history_response_state.pop(session_id, None)
 
 
 async def send_protocol_error_to_agent(
@@ -1182,6 +1410,10 @@ async def send_protocol_error_to_agent(
 
 async def rebootstrap_indicator_subscription(indicator_agent_id: str, session_id: str) -> None:
     """ACP-0.4.0 reconnect contract: subscribe + full chunked history_push."""
+    indicator_agent = agent_manager.get_agent(indicator_agent_id)
+    if not indicator_agent or indicator_agent.config.agent_type != "indicator":
+        return
+
     indicator_connection = agent_manager.get_connection(indicator_agent_id)
     if not indicator_connection:
         return
@@ -1884,6 +2116,30 @@ async def get_session_variables(session_id: str):
     }
 
 
+@app.get("/api/sessions/{session_id}/viewport")
+async def get_session_viewport(
+    session_id: str,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    window_days: int | None = None,
+):
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    data_store = session_data_stores.get(session_id)
+    if not data_store:
+        raise HTTPException(status_code=404, detail="Session data store not found")
+
+    return _build_session_viewport_response(
+        session_id,
+        data_store,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        window_days=window_days,
+    )
+
+
 @app.post("/api/sessions/{session_id}/exports/csv")
 async def create_csv_export_job(session_id: str, request: CreateCsvExportRequest):
     session = session_manager.get_session(session_id)
@@ -2295,6 +2551,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if session_id in session_data_stores:
                 del session_data_stores[session_id]
             session_seq_counters.pop(session_id, None)
+            session_viewport_states.pop(session_id, None)
             session_subscribe_epochs.pop(session_id, None)
             session_trade_revisions.pop(session_id, None)
             latest_trade_results_by_session.pop(session_id, None)
@@ -2320,6 +2577,8 @@ async def handle_subscribe_request(
     symbol = str(payload.get("symbol") or "").strip().upper()
     interval = str(payload.get("interval") or "").strip()
     timeframe_days = int(payload.get("timeframe_days") or 7)
+    viewport_days_raw = payload.get("viewport_days")
+    viewport_days = int(viewport_days_raw) if viewport_days_raw is not None else (_default_viewport_days_for_timeframe(timeframe_days) or 0)
     
     if not session_id or not agent_id or not symbol or not interval:
         await websocket.send_json({
@@ -2425,7 +2684,12 @@ async def handle_subscribe_request(
     # Always send a snapshot so frontend can complete history-loading state.
     # Use canonical candles (all latest revisions) rather than finalized-only to include
     # in-flight bars like "session_reconciled" that haven't yet reached "final" state
-    snapshot_bars = data_store.get_canonical_candles()
+    viewport_response = _build_session_viewport_response(
+        session_id,
+        data_store,
+        window_days=viewport_days,
+    )
+    snapshot_bars = viewport_response.get("bars") or []
     snapshot_message = {
         "type": "snapshot",
         "session_id": session_id,
@@ -2434,6 +2698,16 @@ async def handle_subscribe_request(
         "interval": interval,
         "bars": snapshot_bars,
         "count": len(snapshot_bars),
+        "total_bars": int(viewport_response.get("total_bars") or len(snapshot_bars)),
+        "range_start_ts": viewport_response.get("range_start_ts"),
+        "range_end_ts": viewport_response.get("range_end_ts"),
+        "viewport_from_ts": viewport_response.get("viewport_from_ts"),
+        "viewport_to_ts": viewport_response.get("viewport_to_ts"),
+        "viewport_days": int(viewport_response.get("viewport_days") or 0),
+        "is_viewported": bool(viewport_response.get("is_viewported")),
+        "is_latest": bool(viewport_response.get("is_latest", True)),
+        "follow_live": bool(viewport_response.get("follow_live", True)),
+        "slider_value": int(viewport_response.get("slider_value") or 1000),
         "acp_version": ACP_API_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -2556,6 +2830,7 @@ async def handle_unsubscribe_request(
     if session_id in session_data_stores:
         del session_data_stores[session_id]
     session_seq_counters.pop(session_id, None)
+    session_viewport_states.pop(session_id, None)
     session_subscribe_epochs.pop(session_id, None)
     session_trade_revisions.pop(session_id, None)
     latest_trade_results_by_session.pop(session_id, None)
@@ -2770,6 +3045,9 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
         # Ensure agent_id is set to the runtime instance ID
         message["agent_id"] = agent_id
 
+        if not _should_forward_live_record(session_id, message.get("record"), interval=session.interval):
+            return
+
         try:
             replay_message = buffer_replay_message(session, message)
             await websocket.send_json(replay_message)
@@ -2815,6 +3093,9 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             else:
                 logger.debug(f"⏭️  Candle correction skipped for session {session_id} (lower rev)")
                 return
+
+        if not _should_forward_live_record(session_id, message.get("record"), interval=session.interval):
+            return
 
         try:
             replay_message = buffer_replay_message(session, message)
@@ -3065,16 +3346,25 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             if ingested_count > 0:
                 _record_overlay_ingest(ingested_count)
             _increment_telemetry_counter("overlay_ingest_history_messages_total")
+
+        _mark_export_history_response(
+            session_id,
+            agent_id,
+            subscription_id,
+            len(merged_overlays),
+        )
         
+        forward_overlays = _slice_overlays_to_current_viewport(session_id, merged_overlays)
+
         # Ensure agent_id is set to the runtime instance ID
         message["agent_id"] = agent_id
-        message["overlays"] = merged_overlays
+        message["overlays"] = forward_overlays
         
         # Forward to frontend
         try:
             replay_message = buffer_replay_message(session, message)
             await websocket.send_json(replay_message)
-            logger.info(f"📤 Forwarded history_response with {len(merged_overlays)} overlays to {client_id}")
+            logger.info(f"📤 Forwarded history_response with {len(forward_overlays)} overlays to {client_id}")
         except Exception as e:
             logger.debug(f"Failed to forward history_response to {client_id}: {e}")
 
@@ -3086,7 +3376,7 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             payload={
                 "session_id": session_id,
                 "agent_id": agent_id,
-                "count": len(merged_overlays),
+                "count": len(forward_overlays),
             },
         )
     
@@ -3124,9 +3414,15 @@ async def route_agent_message(agent_id: str, session_id: str, message: dict) -> 
             else:
                 return
         
+        if not _should_forward_live_record(session_id, message.get("record"), interval=session.interval):
+            return
+
         # Ensure agent_id is set to the runtime instance ID
         message["agent_id"] = agent_id
         
+        if not _should_forward_live_record(session_id, message.get("record"), interval=session.interval):
+            return
+
         # Forward to frontend
         try:
             replay_message = buffer_replay_message(session, message)

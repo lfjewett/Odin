@@ -44,7 +44,7 @@ export async function fetchHistory(
   );
 
   return {
-    spec_version: "ACP-0.1.0",
+    spec_version: "ACP-0.5.0",
     agent_id: "price_agent",
     schema: "ohlc",
     symbol,

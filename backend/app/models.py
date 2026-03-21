@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 # is forwarded into the stored config (search for "_ui_keys" in main.py).
 UI_MANAGED_INDICATOR_CONFIG_KEYS = {
     "line_color",
+    "vwap_line_color",
+    "vwap_upper_band_color",
+    "vwap_lower_band_color",
+    "vwap_line_style",
+    "vwap_upper_band_style",
+    "vwap_lower_band_style",
     "visible",
     "aggregation_interval",
     "force_subgraph",

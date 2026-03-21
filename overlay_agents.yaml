@@ -36,8 +36,8 @@ agents:
     lookback_sessions: 20
     chunk_minutes: 30
     line_color: '#22c55e'
-    visible: false
     force_subgraph: true
+    visible: false
   outputs:
   - &id001
     output_id: atr.line
@@ -636,8 +636,8 @@ agents:
   agent_type: indicator
   config_schema:
     length: 14
-    force_subgraph: true
     line_color: '#9241be'
+    force_subgraph: true
     visible: false
   outputs:
   - &id004
@@ -886,3 +886,1232 @@ agents:
       label: Gungnir
       is_primary: true
   selected_indicator_id: rsi
+- spec_version: ACP-0.4.3
+  agent_url: http://localhost:8020
+  agent_id: odin_indicator_agent__sr
+  agent_name: SR
+  agent_version: 0.1.0
+  description: Daily fixed support/resistance zones computed from multi-timeframe
+    SDS history snapshot at 09:25 ET
+  agent_type: indicator
+  config_schema:
+    max_zones: 6
+    bin_count: 80
+    dbscan_epsilon_pct: 0.15
+    confluence_tolerance_pct: 0.2
+    wick_ratio: 0.6
+    min_samples: 1
+    area_conditional_down_color: '#ef4444'
+    force_subgraph: false
+    area_fill_opacity: 50
+    line_color: '#22c55e'
+    visible: true
+    area_conditional_up_color: '#22c55e'
+    area_fill_mode: conditional
+    area_use_source_style: true
+    area_show_labels: false
+  outputs:
+  - &id005
+    output_id: sr_0
+    schema: area
+    label: SR Zone 1
+    is_primary: true
+  - &id006
+    output_id: sr_1
+    schema: area
+    label: SR Zone 2
+    is_primary: false
+  - &id007
+    output_id: sr_2
+    schema: area
+    label: SR Zone 3
+    is_primary: false
+  - &id008
+    output_id: sr_3
+    schema: area
+    label: SR Zone 4
+    is_primary: false
+  - &id009
+    output_id: sr_4
+    schema: area
+    label: SR Zone 5
+    is_primary: false
+  - &id010
+    output_id: sr_5
+    schema: area
+    label: SR Zone 6
+    is_primary: false
+  - &id011
+    output_id: sr_6
+    schema: area
+    label: SR Zone 7
+    is_primary: false
+  - &id012
+    output_id: sr_7
+    schema: area
+    label: SR Zone 8
+    is_primary: false
+  - &id013
+    output_id: sr_8
+    schema: area
+    label: SR Zone 9
+    is_primary: false
+  - &id014
+    output_id: sr_9
+    schema: area
+    label: SR Zone 10
+    is_primary: false
+  - &id015
+    output_id: sr_10
+    schema: area
+    label: SR Zone 11
+    is_primary: false
+  - &id016
+    output_id: sr_11
+    schema: area
+    label: SR Zone 12
+    is_primary: false
+  transport_limits:
+    max_records_per_chunk: 5000
+    max_websocket_message_bytes: 10485760
+    chunk_timeout_seconds: 30
+  indicators:
+  - indicator_id: sma
+    name: Simple Moving Average
+    description: Simple moving average over close price
+    params_schema:
+      period:
+        type: integer
+        description: Simple moving average period
+        required: false
+        default: 20
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval (for example 2m from 1m)
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: sma.line
+      schema: line
+      label: SMA
+      is_primary: true
+  - indicator_id: kama
+    name: Kaufman's Adaptive Moving Average
+    description: Adaptive moving average over close price using efficiency ratio and
+      fast/slow smoothing constants
+    params_schema:
+      efficiency_ratio_length:
+        type: integer
+        description: Periods used to compute the efficiency ratio
+        required: false
+        default: 10
+        min: 1
+        max: 500
+      fast_length:
+        type: integer
+        description: Fast EMA-equivalent period used in the KAMA smoothing constant
+        required: false
+        default: 2
+        min: 1
+        max: 500
+      slow_length:
+        type: integer
+        description: Slow EMA-equivalent period used in the KAMA smoothing constant
+        required: false
+        default: 30
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval (for example 2m from 1m)
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: kama.line
+      schema: line
+      label: KAMA
+      is_primary: true
+  - indicator_id: atr
+    name: Average True Range
+    description: Wilder-smoothed Average True Range. Supports traditional (all candles),
+      rth_only (US equity regular trading hours only), and hybrid_chunked (blends
+      current-session RTH ATR with historical per-chunk expected volatility).
+    params_schema:
+      length:
+        type: integer
+        description: ATR period (number of True Range values in the Wilder seed window)
+        required: false
+        default: 14
+        min: 1
+        max: 500
+      mode:
+        type: string
+        description: 'Computation mode: ''traditional'' uses all candles; ''rth_only''
+          uses US equity RTH candles only (Mon-Fri 09:30-16:00 ET); ''hybrid_chunked''
+          blends RTH ATR with historical per-30-minute-chunk expected volatility.'
+        required: false
+        default: traditional
+        enum:
+        - traditional
+        - rth_only
+        - hybrid_chunked
+      lookback_sessions:
+        type: integer
+        description: 'For hybrid_chunked mode: number of prior RTH sessions used to
+          compute each 30-minute chunk''s expected volatility.'
+        required: false
+        default: 20
+        min: 1
+        max: 500
+      chunk_minutes:
+        type: integer
+        description: RTH chunk size in minutes (fixed at 30 for this release).
+        required: false
+        default: 30
+        enum:
+        - 30
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: atr.line
+      schema: line
+      label: ATR
+      is_primary: true
+  - indicator_id: rsi
+    name: Relative Strength Index
+    description: Wilder-smoothed RSI over close-to-close momentum
+    params_schema:
+      length:
+        type: integer
+        description: RSI period used for Wilder average gain/loss smoothing
+        required: false
+        default: 14
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: rsi.line
+      schema: line
+      label: RSI
+      is_primary: true
+  - indicator_id: gungnir
+    name: Gungnir Strategy Cloud
+    description: Dual-KAMA strategy cloud. KAMA bounds are computed on 2x source interval
+      and expanded to source bars; metadata fields are evaluated per source bar.
+    params_schema:
+      cross:
+        type: integer
+        description: 'Metadata output: 1 on trend cross bar, else 0'
+        required: false
+        default: 0
+        enum:
+        - 0
+        - 1
+      tit:
+        type: integer
+        description: 'Metadata output: bars elapsed since last cross'
+        required: false
+        default: 0
+        min: 0
+      dist:
+        type: number
+        description: 'Metadata output: signed midpoint distance from last cross midpoint'
+        required: false
+        default: 0
+      tc:
+        type: integer
+        description: 'Metadata output: trend touch count since last cross'
+        required: false
+        default: 0
+        min: 0
+    outputs:
+    - output_id: gungnir.area
+      schema: area
+      label: Gungnir
+      is_primary: true
+  - indicator_id: sr
+    name: Support/Resistance Zones
+    description: Daily fixed support/resistance zones computed from multi-timeframe
+      SDS history snapshot at 09:25 ET
+    params_schema:
+      max_zones:
+        type: integer
+        description: Maximum number of zones emitted
+        required: false
+        default: 6
+        min: 1
+        max: 12
+      bin_count:
+        type: integer
+        description: Volume profile bin count
+        required: false
+        default: 80
+        min: 10
+        max: 300
+      dbscan_epsilon_pct:
+        type: number
+        description: Clustering epsilon as percent of reference price
+        required: false
+        default: 0.15
+        min: 0.01
+        max: 2.0
+      confluence_tolerance_pct:
+        type: number
+        description: Cross-timeframe merge tolerance as percent of reference price
+        required: false
+        default: 0.2
+        min: 0.01
+        max: 3.0
+      wick_ratio:
+        type: number
+        description: Minimum wick-to-range ratio for wick rejection levels
+        required: false
+        default: 0.6
+        min: 0.1
+        max: 0.95
+      min_samples:
+        type: integer
+        description: Minimum members per dense cluster before singleton fallback
+        required: false
+        default: 1
+        min: 1
+        max: 20
+    outputs:
+    - *id005
+    - *id006
+    - *id007
+    - *id008
+    - *id009
+    - *id010
+    - *id011
+    - *id012
+    - *id013
+    - *id014
+    - *id015
+    - *id016
+  selected_indicator_id: sr
+- spec_version: ACP-0.4.3
+  agent_url: http://localhost:8020
+  agent_id: odin_indicator_agent__vwap
+  agent_name: VWAP
+  agent_version: 0.1.0
+  description: Session VWAP using HLC3 price and volume, reset by America/New_York
+    local date with configurable standard deviation bands
+  agent_type: indicator
+  config_schema:
+    session_timezone: America/New_York
+    stddev_multiplier: 2.0
+    force_subgraph: false
+    vwap_lower_band_color: '#fcfcfc'
+    vwap_line_color: '#a545bf'
+    line_color: '#22c55e'
+    vwap_upper_band_style: dashed
+    vwap_line_style: solid
+    visible: true
+    vwap_lower_band_style: dashed
+    vwap_upper_band_color: '#ffffff'
+  outputs:
+  - &id017
+    output_id: vwap.line
+    schema: line
+    label: VWAP
+    is_primary: true
+  - &id018
+    output_id: vwap.upper_band
+    schema: line
+    label: VWAP Upper Band
+    is_primary: false
+  - &id019
+    output_id: vwap.lower_band
+    schema: line
+    label: VWAP Lower Band
+    is_primary: false
+  transport_limits:
+    max_records_per_chunk: 5000
+    max_websocket_message_bytes: 10485760
+    chunk_timeout_seconds: 30
+  indicators:
+  - indicator_id: sma
+    name: Simple Moving Average
+    description: Simple moving average over close price
+    params_schema:
+      period:
+        type: integer
+        description: Simple moving average period
+        required: false
+        default: 20
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval (for example 2m from 1m)
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: sma.line
+      schema: line
+      label: SMA
+      is_primary: true
+  - indicator_id: kama
+    name: Kaufman's Adaptive Moving Average
+    description: Adaptive moving average over close price using efficiency ratio and
+      fast/slow smoothing constants
+    params_schema:
+      efficiency_ratio_length:
+        type: integer
+        description: Periods used to compute the efficiency ratio
+        required: false
+        default: 10
+        min: 1
+        max: 500
+      fast_length:
+        type: integer
+        description: Fast EMA-equivalent period used in the KAMA smoothing constant
+        required: false
+        default: 2
+        min: 1
+        max: 500
+      slow_length:
+        type: integer
+        description: Slow EMA-equivalent period used in the KAMA smoothing constant
+        required: false
+        default: 30
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval (for example 2m from 1m)
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: kama.line
+      schema: line
+      label: KAMA
+      is_primary: true
+  - indicator_id: atr
+    name: Average True Range
+    description: Wilder-smoothed Average True Range. Supports traditional (all candles),
+      rth_only (US equity regular trading hours only), and hybrid_chunked (blends
+      current-session RTH ATR with historical per-chunk expected volatility).
+    params_schema:
+      length:
+        type: integer
+        description: ATR period (number of True Range values in the Wilder seed window)
+        required: false
+        default: 14
+        min: 1
+        max: 500
+      mode:
+        type: string
+        description: 'Computation mode: ''traditional'' uses all candles; ''rth_only''
+          uses US equity RTH candles only (Mon-Fri 09:30-16:00 ET); ''hybrid_chunked''
+          blends RTH ATR with historical per-30-minute-chunk expected volatility.'
+        required: false
+        default: traditional
+        enum:
+        - traditional
+        - rth_only
+        - hybrid_chunked
+      lookback_sessions:
+        type: integer
+        description: 'For hybrid_chunked mode: number of prior RTH sessions used to
+          compute each 30-minute chunk''s expected volatility.'
+        required: false
+        default: 20
+        min: 1
+        max: 500
+      chunk_minutes:
+        type: integer
+        description: RTH chunk size in minutes (fixed at 30 for this release).
+        required: false
+        default: 30
+        enum:
+        - 30
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: atr.line
+      schema: line
+      label: ATR
+      is_primary: true
+  - indicator_id: rsi
+    name: Relative Strength Index
+    description: Wilder-smoothed RSI over close-to-close momentum
+    params_schema:
+      length:
+        type: integer
+        description: RSI period used for Wilder average gain/loss smoothing
+        required: false
+        default: 14
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: rsi.line
+      schema: line
+      label: RSI
+      is_primary: true
+  - indicator_id: vwap
+    name: Volume Weighted Average Price
+    description: Session VWAP using HLC3 price and volume, reset by America/New_York
+      local date with configurable standard deviation bands
+    params_schema:
+      session_timezone:
+        type: string
+        description: IANA timezone used for session reset boundaries
+        required: false
+        default: America/New_York
+        enum:
+        - America/New_York
+      stddev_multiplier:
+        type: number
+        description: Number of standard deviations used for upper/lower VWAP bands
+        required: false
+        default: 2.0
+        min: 1.0e-06
+        max: 10.0
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - *id017
+    - *id018
+    - *id019
+  - indicator_id: gungnir
+    name: Gungnir Strategy Cloud
+    description: Dual-KAMA strategy cloud. KAMA bounds are computed on 2x source interval
+      and expanded to source bars; metadata fields are evaluated per source bar.
+    params_schema:
+      cross:
+        type: integer
+        description: 'Metadata output: 1 on trend cross bar, else 0'
+        required: false
+        default: 0
+        enum:
+        - 0
+        - 1
+      tit:
+        type: integer
+        description: 'Metadata output: bars elapsed since last cross'
+        required: false
+        default: 0
+        min: 0
+      dist:
+        type: number
+        description: 'Metadata output: signed midpoint distance from last cross midpoint'
+        required: false
+        default: 0
+      tc:
+        type: integer
+        description: 'Metadata output: trend touch count since last cross'
+        required: false
+        default: 0
+        min: 0
+    outputs:
+    - output_id: gungnir.area
+      schema: area
+      label: Gungnir
+      is_primary: true
+  - indicator_id: sr
+    name: Support/Resistance Zones
+    description: Daily fixed support/resistance zones computed from multi-timeframe
+      SDS history snapshot at 09:25 ET
+    params_schema:
+      max_zones:
+        type: integer
+        description: Maximum number of zones emitted
+        required: false
+        default: 6
+        min: 1
+        max: 12
+      bin_count:
+        type: integer
+        description: Volume profile bin count
+        required: false
+        default: 80
+        min: 10
+        max: 300
+      dbscan_epsilon_pct:
+        type: number
+        description: Clustering epsilon as percent of reference price
+        required: false
+        default: 0.15
+        min: 0.01
+        max: 2.0
+      confluence_tolerance_pct:
+        type: number
+        description: Cross-timeframe merge tolerance as percent of reference price
+        required: false
+        default: 0.2
+        min: 0.01
+        max: 3.0
+      wick_ratio:
+        type: number
+        description: Minimum wick-to-range ratio for wick rejection levels
+        required: false
+        default: 0.6
+        min: 0.1
+        max: 0.95
+      min_samples:
+        type: integer
+        description: Minimum members per dense cluster before singleton fallback
+        required: false
+        default: 1
+        min: 1
+        max: 20
+    outputs:
+    - output_id: sr_0
+      schema: area
+      label: SR Zone 1
+      is_primary: true
+    - output_id: sr_1
+      schema: area
+      label: SR Zone 2
+      is_primary: false
+    - output_id: sr_2
+      schema: area
+      label: SR Zone 3
+      is_primary: false
+    - output_id: sr_3
+      schema: area
+      label: SR Zone 4
+      is_primary: false
+    - output_id: sr_4
+      schema: area
+      label: SR Zone 5
+      is_primary: false
+    - output_id: sr_5
+      schema: area
+      label: SR Zone 6
+      is_primary: false
+    - output_id: sr_6
+      schema: area
+      label: SR Zone 7
+      is_primary: false
+    - output_id: sr_7
+      schema: area
+      label: SR Zone 8
+      is_primary: false
+    - output_id: sr_8
+      schema: area
+      label: SR Zone 9
+      is_primary: false
+    - output_id: sr_9
+      schema: area
+      label: SR Zone 10
+      is_primary: false
+    - output_id: sr_10
+      schema: area
+      label: SR Zone 11
+      is_primary: false
+    - output_id: sr_11
+      schema: area
+      label: SR Zone 12
+      is_primary: false
+  selected_indicator_id: vwap
+- spec_version: ACP-0.4.3
+  agent_url: http://localhost:8030
+  agent_id: odin_indicator_agent__atr__2
+  agent_name: dATR
+  agent_version: 0.1.0
+  description: Wilder-smoothed Average True Range. Supports traditional (all candles),
+    rth_only (US equity regular trading hours only), and hybrid_chunked (blends current-session
+    RTH ATR with historical per-chunk expected volatility).
+  agent_type: indicator
+  config_schema:
+    aggregation_interval: 1d
+    length: 14
+    mode: rth_only
+    lookback_sessions: 20
+    chunk_minutes: 30
+    line_color: '#9921c4'
+    force_subgraph: true
+    visible: false
+  outputs:
+  - &id020
+    output_id: atr.line
+    schema: line
+    label: ATR
+    is_primary: true
+  transport_limits:
+    max_records_per_chunk: 5000
+    max_websocket_message_bytes: 10485760
+    chunk_timeout_seconds: 30
+  indicators:
+  - indicator_id: sma
+    name: Simple Moving Average
+    description: Simple moving average over close price
+    params_schema:
+      period:
+        type: integer
+        description: Simple moving average period
+        required: false
+        default: 20
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval (for example 2m from 1m)
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: sma.line
+      schema: line
+      label: SMA
+      is_primary: true
+  - indicator_id: kama
+    name: Kaufman's Adaptive Moving Average
+    description: Adaptive moving average over close price using efficiency ratio and
+      fast/slow smoothing constants
+    params_schema:
+      efficiency_ratio_length:
+        type: integer
+        description: Periods used to compute the efficiency ratio
+        required: false
+        default: 10
+        min: 1
+        max: 500
+      fast_length:
+        type: integer
+        description: Fast EMA-equivalent period used in the KAMA smoothing constant
+        required: false
+        default: 2
+        min: 1
+        max: 500
+      slow_length:
+        type: integer
+        description: Slow EMA-equivalent period used in the KAMA smoothing constant
+        required: false
+        default: 30
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval (for example 2m from 1m)
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: kama.line
+      schema: line
+      label: KAMA
+      is_primary: true
+  - indicator_id: atr
+    name: Average True Range
+    description: Wilder-smoothed Average True Range. Supports traditional (all candles),
+      rth_only (US equity regular trading hours only), and hybrid_chunked (blends
+      current-session RTH ATR with historical per-chunk expected volatility).
+    params_schema:
+      length:
+        type: integer
+        description: ATR period (number of True Range values in the Wilder seed window)
+        required: false
+        default: 14
+        min: 1
+        max: 500
+      mode:
+        type: string
+        description: 'Computation mode: ''traditional'' uses all candles; ''rth_only''
+          uses US equity RTH candles only (Mon-Fri 09:30-16:00 ET); ''hybrid_chunked''
+          blends RTH ATR with historical per-30-minute-chunk expected volatility.'
+        required: false
+        default: traditional
+        enum:
+        - traditional
+        - rth_only
+        - hybrid_chunked
+      lookback_sessions:
+        type: integer
+        description: 'For hybrid_chunked mode: number of prior RTH sessions used to
+          compute each 30-minute chunk''s expected volatility.'
+        required: false
+        default: 20
+        min: 1
+        max: 500
+      chunk_minutes:
+        type: integer
+        description: RTH chunk size in minutes (fixed at 30 for this release).
+        required: false
+        default: 30
+        enum:
+        - 30
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - *id020
+  - indicator_id: rsi
+    name: Relative Strength Index
+    description: Wilder-smoothed RSI over close-to-close momentum
+    params_schema:
+      length:
+        type: integer
+        description: RSI period used for Wilder average gain/loss smoothing
+        required: false
+        default: 14
+        min: 1
+        max: 500
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: rsi.line
+      schema: line
+      label: RSI
+      is_primary: true
+  - indicator_id: vwap
+    name: Volume Weighted Average Price
+    description: Session VWAP using HLC3 price and volume, reset by America/New_York
+      local date with configurable standard deviation bands
+    params_schema:
+      session_timezone:
+        type: string
+        description: IANA timezone used for session reset boundaries
+        required: false
+        default: America/New_York
+        enum:
+        - America/New_York
+      stddev_multiplier:
+        type: number
+        description: Number of standard deviations used for upper/lower VWAP bands
+        required: false
+        default: 2.0
+        min: 1.0e-06
+        max: 10.0
+      aggregation_interval:
+        type: string
+        description: Optional higher timeframe for indicator computation derived from
+          source interval
+        required: false
+        enum:
+        - 10m
+        - 12h
+        - 15m
+        - 1M
+        - 1d
+        - 1h
+        - 1m
+        - 1w
+        - 20m
+        - 2d
+        - 2h
+        - 2m
+        - 30m
+        - 3m
+        - 4h
+        - 4m
+        - 5m
+        - 8h
+    outputs:
+    - output_id: vwap.line
+      schema: line
+      label: VWAP
+      is_primary: true
+    - output_id: vwap.upper_band
+      schema: line
+      label: VWAP Upper Band
+      is_primary: false
+    - output_id: vwap.lower_band
+      schema: line
+      label: VWAP Lower Band
+      is_primary: false
+  - indicator_id: gungnir
+    name: Gungnir Strategy Cloud
+    description: Dual-KAMA strategy cloud. KAMA bounds are computed on 2x source interval
+      and expanded to source bars; metadata fields are evaluated per source bar.
+    params_schema:
+      cross:
+        type: integer
+        description: 'Metadata output: 1 on trend cross bar, else 0'
+        required: false
+        default: 0
+        enum:
+        - 0
+        - 1
+      tit:
+        type: integer
+        description: 'Metadata output: bars elapsed since last cross'
+        required: false
+        default: 0
+        min: 0
+      dist:
+        type: number
+        description: 'Metadata output: signed midpoint distance from last cross midpoint'
+        required: false
+        default: 0
+      tc:
+        type: integer
+        description: 'Metadata output: trend touch count since last cross'
+        required: false
+        default: 0
+        min: 0
+    outputs:
+    - output_id: gungnir.area
+      schema: area
+      label: Gungnir
+      is_primary: true
+  - indicator_id: sr
+    name: Support/Resistance Zones
+    description: Daily fixed support/resistance zones computed from multi-timeframe
+      SDS history snapshot at 09:25 ET
+    params_schema:
+      max_zones:
+        type: integer
+        description: Maximum number of zones emitted
+        required: false
+        default: 6
+        min: 1
+        max: 12
+      bin_count:
+        type: integer
+        description: Volume profile bin count
+        required: false
+        default: 80
+        min: 10
+        max: 300
+      dbscan_epsilon_pct:
+        type: number
+        description: Clustering epsilon as percent of reference price
+        required: false
+        default: 0.15
+        min: 0.01
+        max: 2.0
+      confluence_tolerance_pct:
+        type: number
+        description: Cross-timeframe merge tolerance as percent of reference price
+        required: false
+        default: 0.2
+        min: 0.01
+        max: 3.0
+      wick_ratio:
+        type: number
+        description: Minimum wick-to-range ratio for wick rejection levels
+        required: false
+        default: 0.6
+        min: 0.1
+        max: 0.95
+      min_samples:
+        type: integer
+        description: Minimum members per dense cluster before singleton fallback
+        required: false
+        default: 1
+        min: 1
+        max: 20
+    outputs:
+    - output_id: sr_0
+      schema: area
+      label: SR Zone 1
+      is_primary: true
+    - output_id: sr_1
+      schema: area
+      label: SR Zone 2
+      is_primary: false
+    - output_id: sr_2
+      schema: area
+      label: SR Zone 3
+      is_primary: false
+    - output_id: sr_3
+      schema: area
+      label: SR Zone 4
+      is_primary: false
+    - output_id: sr_4
+      schema: area
+      label: SR Zone 5
+      is_primary: false
+    - output_id: sr_5
+      schema: area
+      label: SR Zone 6
+      is_primary: false
+    - output_id: sr_6
+      schema: area
+      label: SR Zone 7
+      is_primary: false
+    - output_id: sr_7
+      schema: area
+      label: SR Zone 8
+      is_primary: false
+    - output_id: sr_8
+      schema: area
+      label: SR Zone 9
+      is_primary: false
+    - output_id: sr_9
+      schema: area
+      label: SR Zone 10
+      is_primary: false
+    - output_id: sr_10
+      schema: area
+      label: SR Zone 11
+      is_primary: false
+    - output_id: sr_11
+      schema: area
+      label: SR Zone 12
+      is_primary: false
+  selected_indicator_id: atr

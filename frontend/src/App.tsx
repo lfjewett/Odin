@@ -35,6 +35,7 @@ import {
   activateWorkspace,
   createCsvExportJob,
   deleteWorkspace,
+  fetchSessionViewport,
   getCsvExportDownloadUrl,
   getCsvExportJobStatus,
   listTradeStrategies,
@@ -43,6 +44,7 @@ import {
   saveWorkspace,
   type CsvExportJobStatus,
   type ApplyTradeStrategyResponse,
+  type SessionViewportResponse,
   type TradePerformance,
   type TradeMarker,
   type WorkspaceState,
@@ -57,6 +59,8 @@ const TRADE_PERFORMANCE_STORAGE_PREFIX = "odin.tradePerformance";
 const RESEARCH_AGENT_ID = "__research__";
 
 const STARTING_CAPITAL = 10_000;
+const INDICATOR_LOAD_TIMEOUT_MS = 30_000;
+const INDICATOR_DELAY_NOTICE_MS = 5_000;
 
 type PanelSide = "left" | "right";
 type WidgetId = "watchlist" | "overlayAgents" | "tradingBots2";
@@ -72,6 +76,250 @@ const INITIAL_WIDGETS: WidgetState[] = [
   { id: "overlayAgents", side: "right", height: 240 },
   { id: "tradingBots2", side: "right", height: 420 },
 ];
+
+interface ChartViewportState {
+  enabled: boolean;
+  viewportDays: number;
+  rangeStartTs: string | null;
+  rangeEndTs: string | null;
+  currentFromTs: string | null;
+  currentToTs: string | null;
+  totalBars: number;
+  isLatest: boolean;
+  hasPrevious: boolean;
+  hasNext: boolean;
+  sliderValue: number;
+}
+
+type OverlayLineStyleName = "solid" | "dotted" | "dashed" | "large_dashed" | "sparse_dotted";
+
+function defaultViewportDaysForTimeframe(timeframeDays: number, interval?: string): number | undefined {
+  const normalizedInterval = (interval || "").trim().toLowerCase();
+  if (normalizedInterval === "1m" && timeframeDays >= 30) {
+    return 7;
+  }
+  return timeframeDays >= 90 ? 7 : undefined;
+}
+
+function parseIsoMillis(ts?: string | null): number | null {
+  if (!ts) return null;
+  const millis = Date.parse(ts);
+  return Number.isFinite(millis) ? millis : null;
+}
+
+function toIsoUtc(millis: number): string {
+  return new Date(millis).toISOString();
+}
+
+interface MonthViewportPage {
+  index: number;
+  label: string;
+  fromTs: string;
+  toTs: string;
+}
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+const EASTERN_TIME_ZONE = "America/New_York";
+const easternPartsFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: EASTERN_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
+function easternDateParts(millis: number): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const parts = easternPartsFormatter.formatToParts(new Date(millis));
+  const map = new Map<string, string>();
+  parts.forEach((part) => {
+    if (part.type !== "literal") {
+      map.set(part.type, part.value);
+    }
+  });
+
+  return {
+    year: Number(map.get("year") || "0"),
+    month: Number(map.get("month") || "1"),
+    day: Number(map.get("day") || "1"),
+    hour: Number(map.get("hour") || "0"),
+    minute: Number(map.get("minute") || "0"),
+    second: Number(map.get("second") || "0"),
+  };
+}
+
+function easternDateTimeToUtcMillis(
+  year: number,
+  month: number,
+  day: number,
+  hour = 0,
+  minute = 0,
+  second = 0
+): number {
+  let guess = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+  for (let i = 0; i < 4; i += 1) {
+    const parts = easternDateParts(guess);
+    const desiredAsUtc = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+    const currentAsUtc = Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      parts.second,
+      0
+    );
+    const delta = desiredAsUtc - currentAsUtc;
+    if (delta === 0) {
+      break;
+    }
+    guess += delta;
+  }
+  return guess;
+}
+
+function startOfEasternDay(millis: number): number {
+  const parts = easternDateParts(millis);
+  return easternDateTimeToUtcMillis(parts.year, parts.month, parts.day, 0, 0, 0);
+}
+
+function endOfEasternDay(millis: number): number {
+  return startOfEasternDay(millis) + ONE_DAY_MS - 1;
+}
+
+function startOfEasternMonth(millis: number): number {
+  const parts = easternDateParts(millis);
+  return easternDateTimeToUtcMillis(parts.year, parts.month, 1, 0, 0, 0);
+}
+
+function endOfEasternMonth(millis: number): number {
+  const parts = easternDateParts(millis);
+  let year = parts.year;
+  let month = parts.month + 1;
+  if (month > 12) {
+    month = 1;
+    year += 1;
+  }
+  return easternDateTimeToUtcMillis(year, month, 1, 0, 0, 0) - 1;
+}
+
+function previousEasternMonthStart(millis: number): number {
+  const parts = easternDateParts(millis);
+  let year = parts.year;
+  let month = parts.month - 1;
+  if (month < 1) {
+    month = 12;
+    year -= 1;
+  }
+  return easternDateTimeToUtcMillis(year, month, 1, 0, 0, 0);
+}
+
+function monthLabelEastern(millis: number): string {
+  return new Date(millis).toLocaleDateString(undefined, {
+    month: "short",
+    year: "numeric",
+    timeZone: EASTERN_TIME_ZONE,
+  });
+}
+
+function buildMonthViewportPages(rangeStartTs?: string | null, rangeEndTs?: string | null): MonthViewportPage[] {
+  const rangeStartMs = parseIsoMillis(rangeStartTs);
+  const rangeEndMs = parseIsoMillis(rangeEndTs);
+  if (rangeStartMs === null || rangeEndMs === null || rangeEndMs < rangeStartMs) {
+    return [];
+  }
+
+  const fullStartMs = startOfEasternDay(rangeStartMs);
+  const fullEndMs = endOfEasternDay(rangeEndMs);
+
+  const pages: MonthViewportPage[] = [];
+  const WEEK_MS = 7 * ONE_DAY_MS;
+  let pageEndMs = fullEndMs;
+  let guard = 0;
+
+  while (pageEndMs >= fullStartMs && guard < 600) {
+    const pageStartMs = Math.max(fullStartMs, pageEndMs - WEEK_MS + 1);
+    const weekNumber = pages.length + 1;
+    pages.push({
+      index: pages.length,
+      label: `Week ${weekNumber}`,
+      fromTs: toIsoUtc(pageStartMs),
+      toTs: toIsoUtc(pageEndMs),
+    });
+
+    pageEndMs = pageStartMs - 1;
+    guard += 1;
+  }
+
+  return pages;
+}
+
+function overlayRecordKey(record: OverlayRecord, fallbackSuffix = ""): string {
+  const recordId = String(record.id || "").trim();
+  if (recordId) {
+    return recordId;
+  }
+  return `${String(record.ts || "")}${fallbackSuffix ? `::${fallbackSuffix}` : ""}`;
+}
+
+function overlayRecordTsMillis(record: OverlayRecord): number {
+  const ts = Date.parse(String(record.ts || ""));
+  return Number.isFinite(ts) ? ts : Number.NaN;
+}
+
+function mergeOverlayRecords(existing: OverlayRecord[] = [], incoming: OverlayRecord[] = []): OverlayRecord[] {
+  if (incoming.length === 0) {
+    return existing;
+  }
+
+  if (existing.length === 0) {
+    return incoming.slice();
+  }
+
+  const existingFirstTs = overlayRecordTsMillis(existing[0]);
+  const existingLastTs = overlayRecordTsMillis(existing[existing.length - 1]);
+  const incomingFirstTs = overlayRecordTsMillis(incoming[0]);
+  const incomingLastTs = overlayRecordTsMillis(incoming[incoming.length - 1]);
+
+  if (
+    Number.isFinite(existingFirstTs) &&
+    Number.isFinite(existingLastTs) &&
+    Number.isFinite(incomingFirstTs) &&
+    Number.isFinite(incomingLastTs) &&
+    incomingFirstTs <= existingFirstTs &&
+    incomingLastTs >= existingLastTs
+  ) {
+    return incoming.slice();
+  }
+
+  const mergedById = new Map<string, OverlayRecord>();
+  for (const record of existing) {
+    mergedById.set(overlayRecordKey(record), record);
+  }
+  for (const record of incoming) {
+    mergedById.set(overlayRecordKey(record), record);
+  }
+
+  return Array.from(mergedById.values()).sort((a, b) => {
+    const aTs = overlayRecordTsMillis(a);
+    const bTs = overlayRecordTsMillis(b);
+    if (!Number.isFinite(aTs) && !Number.isFinite(bTs)) return 0;
+    if (!Number.isFinite(aTs)) return 1;
+    if (!Number.isFinite(bTs)) return -1;
+    if (aTs !== bTs) return aTs - bTs;
+    return overlayRecordKey(a).localeCompare(overlayRecordKey(b));
+  });
+}
 
 export default function App() {
   const todayDateString = useMemo(() => new Date().toISOString().slice(0, 10), []);
@@ -116,14 +364,29 @@ export default function App() {
   const [showTradesModal, setShowTradesModal] = useState(false);
   const [showResearchModal, setShowResearchModal] = useState(false);
   const [researchDraftExpression, setResearchDraftExpression] = useState("");
+  const [chartViewport, setChartViewport] = useState<ChartViewportState | null>(null);
+  const [isViewportLoading, setIsViewportLoading] = useState(false);
+  const [viewportSliderDraft, setViewportSliderDraft] = useState<number | null>(null);
   const lastSubscribeKeyRef = useRef<string | null>(null);
   const pendingSnapshotRef = useRef<SnapshotEvent | null>(null);
+  const viewportCacheRef = useRef<Map<string, SessionViewportResponse>>(new Map());
+  const viewportRequestSeqRef = useRef(0);
+  const viewportScrubTimerRef = useRef<number | null>(null);
+  const viewportOverlayRefreshTimerRef = useRef<number | null>(null);
+  const lastAppliedMonthPageKeyRef = useRef<string | null>(null);
+  // Explicit state for month pager current page — updated immediately on click.
+  // Do NOT derive from backend chartViewport match (unreliable due to timestamp normalization).
+  const [currentMonthPageIndex, setCurrentMonthPageIndex] = useState<number>(0);
   const hasInitializedWorkspaceRef = useRef(false);
   const isApplyingWorkspaceRef = useRef(false);
   
   // Overlay data state for rendering overlays on chart
   const [overlayData, setOverlayData] = useState<Map<string, OverlayRecord[]>>(new Map());
   const [overlaySchemas, setOverlaySchemas] = useState<Map<string, OverlaySchema>>(new Map());
+  const [indicatorLoadOverlayVisible, setIndicatorLoadOverlayVisible] = useState(false);
+  const [indicatorLoadLoadedCount, setIndicatorLoadLoadedCount] = useState(0);
+  const [indicatorLoadTotalCount, setIndicatorLoadTotalCount] = useState(0);
+  const [showIndicatorDelayNotice, setShowIndicatorDelayNotice] = useState(false);
   const [tradeMarkers, setTradeMarkers] = useState<TradeMarker[]>([]);
   const [tradePerformance, setTradePerformance] = useState<TradePerformance | null>(null);
 
@@ -134,6 +397,11 @@ export default function App() {
   >(new Map());
   // Stable ref mirror of selectedTimeframe for use inside flush callback (avoids dep churn)
   const selectedTimeframeForFlushRef = useRef<number>(7);
+  const indicatorLoadExpectedIdsRef = useRef<Set<string>>(new Set());
+  const indicatorLoadRespondedIdsRef = useRef<Set<string>>(new Set());
+  const indicatorLoadSnapshotReadyRef = useRef(false);
+  const indicatorLoadTimeoutRef = useRef<number | null>(null);
+  const indicatorDelayNoticeTimeoutRef = useRef<number | null>(null);
   const [appliedStrategyName, setAppliedStrategyName] = useState<string | null>(null);
   const [strategyCandlesById, setStrategyCandlesById] = useState<Map<string, OHLCBar>>(new Map());
   const markersHydratedKeyRef = useRef<string | null>(null);
@@ -205,6 +473,109 @@ export default function App() {
 
   const selectedAgent = subscriptions?.find((a) => a.id === selectedAgentId) || null;
   const modalAgent = subscriptions?.find((a) => a.id === modalAgentId) || null;
+
+  const clearIndicatorLoadTimers = useCallback(() => {
+    if (indicatorLoadTimeoutRef.current !== null) {
+      window.clearTimeout(indicatorLoadTimeoutRef.current);
+      indicatorLoadTimeoutRef.current = null;
+    }
+    if (indicatorDelayNoticeTimeoutRef.current !== null) {
+      window.clearTimeout(indicatorDelayNoticeTimeoutRef.current);
+      indicatorDelayNoticeTimeoutRef.current = null;
+    }
+  }, []);
+
+  const completeIndicatorLoadCycle = useCallback((showDelayNotice: boolean) => {
+    if (indicatorLoadTimeoutRef.current !== null) {
+      window.clearTimeout(indicatorLoadTimeoutRef.current);
+      indicatorLoadTimeoutRef.current = null;
+    }
+
+    setIndicatorLoadOverlayVisible(false);
+
+    if (showDelayNotice) {
+      setShowIndicatorDelayNotice(true);
+      if (indicatorDelayNoticeTimeoutRef.current !== null) {
+        window.clearTimeout(indicatorDelayNoticeTimeoutRef.current);
+      }
+      indicatorDelayNoticeTimeoutRef.current = window.setTimeout(() => {
+        setShowIndicatorDelayNotice(false);
+        indicatorDelayNoticeTimeoutRef.current = null;
+      }, INDICATOR_DELAY_NOTICE_MS);
+    }
+  }, []);
+
+  const maybeCompleteIndicatorLoadCycle = useCallback(() => {
+    if (!indicatorLoadSnapshotReadyRef.current) {
+      return;
+    }
+
+    const expectedCount = indicatorLoadExpectedIdsRef.current.size;
+    if (expectedCount === 0) {
+      return;
+    }
+
+    if (indicatorLoadRespondedIdsRef.current.size >= expectedCount) {
+      completeIndicatorLoadCycle(false);
+    }
+  }, [completeIndicatorLoadCycle]);
+
+  const startIndicatorLoadCycle = useCallback(() => {
+    clearIndicatorLoadTimers();
+    setShowIndicatorDelayNotice(false);
+
+    const expectedIndicatorIds = new Set(
+      (subscriptions || [])
+        .filter((agent) => agent.agent_type === "indicator")
+        .map((agent) => agent.id)
+    );
+
+    indicatorLoadExpectedIdsRef.current = expectedIndicatorIds;
+    indicatorLoadRespondedIdsRef.current = new Set();
+    indicatorLoadSnapshotReadyRef.current = false;
+
+    setIndicatorLoadLoadedCount(0);
+    setIndicatorLoadTotalCount(expectedIndicatorIds.size);
+    setIndicatorLoadOverlayVisible(expectedIndicatorIds.size > 0);
+  }, [clearIndicatorLoadTimers, subscriptions]);
+
+  const markIndicatorHistoryResponded = useCallback((agentId: string) => {
+    const expected = indicatorLoadExpectedIdsRef.current;
+    if (expected.size === 0 || !expected.has(agentId)) {
+      return;
+    }
+
+    const responded = indicatorLoadRespondedIdsRef.current;
+    if (responded.has(agentId)) {
+      return;
+    }
+
+    responded.add(agentId);
+    setIndicatorLoadLoadedCount(responded.size);
+    maybeCompleteIndicatorLoadCycle();
+  }, [maybeCompleteIndicatorLoadCycle]);
+
+  const markIndicatorSnapshotReady = useCallback(() => {
+    const expectedCount = indicatorLoadExpectedIdsRef.current.size;
+    if (expectedCount === 0 || !indicatorLoadOverlayVisible) {
+      return;
+    }
+
+    indicatorLoadSnapshotReadyRef.current = true;
+    maybeCompleteIndicatorLoadCycle();
+
+    if (indicatorLoadTimeoutRef.current === null) {
+      indicatorLoadTimeoutRef.current = window.setTimeout(() => {
+        completeIndicatorLoadCycle(true);
+      }, INDICATOR_LOAD_TIMEOUT_MS);
+    }
+  }, [completeIndicatorLoadCycle, indicatorLoadOverlayVisible, maybeCompleteIndicatorLoadCycle]);
+
+  useEffect(() => {
+    return () => {
+      clearIndicatorLoadTimers();
+    };
+  }, [clearIndicatorLoadTimers]);
 
   const captureWorkspaceState = useCallback((): WorkspaceState => {
     const subscriptionSnapshot = (subscriptions || []).map((agent) => ({
@@ -531,6 +902,225 @@ export default function App() {
     []
   );
 
+  const buildViewportCacheKey = useCallback((sessionId: string, fromTs?: string, toTs?: string, windowDays?: number) => {
+    return `${sessionId}:${fromTs || "latest"}:${toTs || "latest"}:${windowDays || 0}`;
+  }, []);
+
+  // Helper to check if an agent is visible
+  const isAgentVisible = useCallback((agentId: string): boolean => {
+    const agent = subscriptions?.find((a) => a.id === agentId);
+    return agent?.config?.visible !== false;
+  }, [subscriptions]);
+
+  const applyViewportResponse = useCallback((response: SessionViewportResponse) => {
+    const sameViewport = Boolean(
+      chartViewport?.enabled &&
+      chartViewport.currentFromTs === (response.viewport_from_ts || null) &&
+      chartViewport.currentToTs === (response.viewport_to_ts || null)
+    );
+
+    if (!sameViewport) {
+      pendingLiveOverlayRef.current.clear();
+    }
+    setViewportSliderDraft(null);
+
+    setChartViewport({
+      enabled: response.is_viewported,
+      viewportDays: response.viewport_days,
+      rangeStartTs: response.range_start_ts,
+      rangeEndTs: response.range_end_ts,
+      currentFromTs: response.viewport_from_ts,
+      currentToTs: response.viewport_to_ts,
+      totalBars: response.total_bars,
+      isLatest: response.is_latest,
+      hasPrevious: response.has_previous,
+      hasNext: response.has_next,
+      sliderValue: response.slider_value,
+    });
+
+    const bars = (response.bars || []) as OHLCBar[];
+    setStrategyCandlesById(() => {
+      const next = new Map<string, OHLCBar>();
+      bars.forEach((bar) => next.set(bar.id, bar));
+      return next;
+    });
+
+    if (bars.length > 0) {
+      const latestBar = bars[bars.length - 1];
+      setLastPrice(latestBar.close);
+      setLastEventTime(latestBar.ts);
+    }
+
+    const pendingEvent: SnapshotEvent = {
+      sessionId: response.session_id,
+      agentId: selectedAgent?.id ?? selectedAgentId ?? "",
+      symbol: selectedSymbol,
+      interval: intervalInput,
+      bars,
+      totalBars: response.total_bars,
+      rangeStartTs: response.range_start_ts,
+      rangeEndTs: response.range_end_ts,
+      viewportFromTs: response.viewport_from_ts,
+      viewportToTs: response.viewport_to_ts,
+      viewportDays: response.viewport_days,
+      isViewported: response.is_viewported,
+      isLatest: response.is_latest,
+      followLive: response.follow_live,
+      sliderValue: response.slider_value,
+    };
+
+    if (snapshotHandler) {
+      snapshotHandler(bars);
+    } else {
+      pendingSnapshotRef.current = pendingEvent;
+    }
+
+    const nextOverlayData = new Map<string, OverlayRecord[]>();
+    const nextOverlaySchemas = new Map<string, OverlaySchema>();
+    for (const overlay of response.overlays || []) {
+      const overlayRecord = overlay as OverlayRecord & Record<string, unknown>;
+      const schema = String((overlayRecord as Record<string, unknown>).schema || "line") as OverlaySchema;
+      const rawAgentId = String((overlayRecord as Record<string, unknown>).agent_id || "");
+      const resolvedAgentId = resolveOverlayAgentId(rawAgentId);
+      if (!resolvedAgentId || !isAgentVisible(resolvedAgentId)) {
+        continue;
+      }
+      const outputId = String((overlayRecord as Record<string, unknown>).output_id ?? "default");
+      const key = buildOverlaySeriesKey(resolvedAgentId, schema, outputId);
+      const existing = nextOverlayData.get(key) || [];
+      existing.push(overlayRecord);
+      nextOverlayData.set(key, existing);
+      nextOverlaySchemas.set(key, schema);
+    }
+
+    if (sameViewport) {
+      setOverlayData((prev) => {
+        const merged = new Map(prev);
+        for (const [key, records] of nextOverlayData.entries()) {
+          merged.set(key, mergeOverlayRecords(merged.get(key) || [], records));
+        }
+        return merged;
+      });
+      setOverlaySchemas((prev) => {
+        const merged = new Map(prev);
+        for (const [key, schema] of nextOverlaySchemas.entries()) {
+          merged.set(key, schema);
+        }
+        return merged;
+      });
+    } else {
+      setOverlayData(nextOverlayData);
+      setOverlaySchemas(nextOverlaySchemas);
+    }
+    setTradeMarkers(response.trade_markers || []);
+  }, [
+    chartViewport,
+    buildOverlaySeriesKey,
+    intervalInput,
+    isAgentVisible,
+    resolveOverlayAgentId,
+    selectedAgent,
+    selectedAgentId,
+    selectedSymbol,
+    snapshotHandler,
+  ]);
+
+  const prefetchAdjacentViewportSlices = useCallback(async (response: SessionViewportResponse) => {
+    if (!response.is_viewported || !response.viewport_from_ts || !response.viewport_to_ts) {
+      return;
+    }
+
+    const sessionId = response.session_id;
+    const startMs = parseIsoMillis(response.viewport_from_ts);
+    const endMs = parseIsoMillis(response.viewport_to_ts);
+    const fullStartMs = parseIsoMillis(response.range_start_ts);
+    const fullEndMs = parseIsoMillis(response.range_end_ts);
+    if (startMs === null || endMs === null || fullStartMs === null || fullEndMs === null) {
+      return;
+    }
+
+    const spanMs = Math.max(endMs - startMs, 60_000);
+    const stepMs = Math.max(Math.round(spanMs / 2), 60_000);
+    const candidates: Array<{ fromTs: string; toTs: string }> = [];
+
+    if (response.has_previous) {
+      const prevFromMs = Math.max(fullStartMs, startMs - stepMs);
+      const prevToMs = Math.min(fullEndMs, prevFromMs + spanMs);
+      candidates.push({ fromTs: toIsoUtc(prevFromMs), toTs: toIsoUtc(prevToMs) });
+    }
+
+    if (response.has_next) {
+      const nextToMs = Math.min(fullEndMs, endMs + stepMs);
+      const nextFromMs = Math.max(fullStartMs, nextToMs - spanMs);
+      candidates.push({ fromTs: toIsoUtc(nextFromMs), toTs: toIsoUtc(nextToMs) });
+    }
+
+    await Promise.all(candidates.map(async ({ fromTs, toTs }) => {
+      const cacheKey = buildViewportCacheKey(sessionId, fromTs, toTs, response.viewport_days);
+      if (viewportCacheRef.current.has(cacheKey)) {
+        return;
+      }
+      try {
+        const prefetched = await fetchSessionViewport(sessionId, {
+          fromTs,
+          toTs,
+          windowDays: response.viewport_days,
+        });
+        viewportCacheRef.current.set(cacheKey, prefetched);
+      } catch (error) {
+        console.debug("[Viewport] Prefetch skipped", error);
+      }
+    }));
+  }, [buildViewportCacheKey]);
+
+  const loadViewport = useCallback(async (
+    params: { fromTs?: string; toTs?: string; windowDays?: number },
+    options?: { prefetch?: boolean; forceRefresh?: boolean }
+  ) => {
+    const shouldPrefetch = options?.prefetch !== false;
+    const shouldForceRefresh = options?.forceRefresh === true;
+    const sessionId = getSessionId();
+    const cacheKey = buildViewportCacheKey(sessionId, params.fromTs, params.toTs, params.windowDays);
+    const requestSeq = ++viewportRequestSeqRef.current;
+    setIsViewportLoading(true);
+    try {
+      const cached = shouldForceRefresh ? undefined : viewportCacheRef.current.get(cacheKey);
+      const response = cached || await fetchSessionViewport(sessionId, params);
+      viewportCacheRef.current.set(cacheKey, response);
+      if (requestSeq !== viewportRequestSeqRef.current) {
+        return;
+      }
+      applyViewportResponse(response);
+      if (shouldPrefetch) {
+        void prefetchAdjacentViewportSlices(response);
+      }
+    } catch (error) {
+      console.warn("[Viewport] Failed to load viewport", error);
+    } finally {
+      if (requestSeq === viewportRequestSeqRef.current) {
+        setIsViewportLoading(false);
+      }
+    }
+  }, [applyViewportResponse, buildViewportCacheKey, getSessionId, prefetchAdjacentViewportSlices]);
+
+  const clearViewportScrubDebounce = useCallback(() => {
+    if (viewportScrubTimerRef.current !== null) {
+      window.clearTimeout(viewportScrubTimerRef.current);
+      viewportScrubTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (viewportScrubTimerRef.current !== null) {
+        window.clearTimeout(viewportScrubTimerRef.current);
+      }
+      if (viewportOverlayRefreshTimerRef.current !== null) {
+        window.clearTimeout(viewportOverlayRefreshTimerRef.current);
+      }
+    };
+  }, []);
+
   const clearResearchOverlays = useCallback(() => {
     setOverlayData((prev) => {
       const next = new Map(prev);
@@ -582,12 +1172,6 @@ export default function App() {
     });
   }, [buildOverlaySeriesKey]);
 
-  // Helper to check if an agent is visible
-  const isAgentVisible = useCallback((agentId: string): boolean => {
-    const agent = subscriptions?.find((a) => a.id === agentId);
-    return agent?.config?.visible !== false;
-  }, [subscriptions]);
-
   // Return the same Map reference when line-color settings are unchanged (common during the
   // 5s subscription background poll). This prevents ChartView's heavy overlay useEffect from
   // re-running setData on all series when nothing visually changed.
@@ -615,6 +1199,92 @@ export default function App() {
     stableOverlayLineColorsRef.current = colors;
     return colors;
   }, [subscriptions]);
+
+  const stableOverlaySeriesLineSettingsRef = useRef<
+    Map<string, { color?: string; lineStyle?: OverlayLineStyleName }>
+  >(new Map());
+  const overlaySeriesLineSettings = useMemo(() => {
+    const settings = new Map<string, { color?: string; lineStyle?: OverlayLineStyleName }>();
+    const normalizeLineStyle = (value: unknown): OverlayLineStyleName | undefined => {
+      switch (value) {
+        case "solid":
+        case "dotted":
+        case "dashed":
+        case "large_dashed":
+        case "sparse_dotted":
+          return value;
+        default:
+          return undefined;
+      }
+    };
+
+    (subscriptions || []).forEach((agent) => {
+      if (agent.agent_type !== "indicator") {
+        return;
+      }
+
+      if (agent.config?.visible === false) {
+        return;
+      }
+
+      if (agent.selected_indicator_id !== "vwap") {
+        return;
+      }
+
+      const vwapSeriesConfigs = [
+        {
+          outputId: "vwap.line",
+          colorKey: "vwap_line_color",
+          styleKey: "vwap_line_style",
+        },
+        {
+          outputId: "vwap.upper_band",
+          colorKey: "vwap_upper_band_color",
+          styleKey: "vwap_upper_band_style",
+        },
+        {
+          outputId: "vwap.lower_band",
+          colorKey: "vwap_lower_band_color",
+          styleKey: "vwap_lower_band_style",
+        },
+      ] as const;
+
+      vwapSeriesConfigs.forEach(({ outputId, colorKey, styleKey }) => {
+        const outputSchema =
+          agent.outputs?.find((output) => output.output_id === outputId)?.schema || "line";
+        const seriesKey = buildOverlaySeriesKey(agent.id, outputSchema as OverlaySchema, outputId);
+        const colorCandidate = agent.config?.[colorKey];
+        const style = normalizeLineStyle(agent.config?.[styleKey]);
+        const color =
+          typeof colorCandidate === "string" && colorCandidate.trim().length > 0
+            ? colorCandidate
+            : undefined;
+
+        if (!color && !style) {
+          return;
+        }
+
+        settings.set(seriesKey, {
+          ...(color ? { color } : {}),
+          ...(style ? { lineStyle: style } : {}),
+        });
+      });
+    });
+
+    const prev = stableOverlaySeriesLineSettingsRef.current;
+    if (
+      prev.size === settings.size &&
+      [...settings.entries()].every(([seriesKey, nextValue]) => {
+        const prevValue = prev.get(seriesKey);
+        return prevValue?.color === nextValue.color && prevValue?.lineStyle === nextValue.lineStyle;
+      })
+    ) {
+      return prev;
+    }
+
+    stableOverlaySeriesLineSettingsRef.current = settings;
+    return settings;
+  }, [subscriptions, buildOverlaySeriesKey]);
 
   /** agentId → true for any indicator that has force_subgraph saved in config */
   const stableOverlaySubgraphForcedRef = useRef<Map<string, boolean>>(new Map());
@@ -749,6 +1419,26 @@ export default function App() {
 
     // Only process snapshots that match the current chart subscription.
     if (event.agentId === expectedAgentId && isMatchingSubscription) {
+      markIndicatorSnapshotReady();
+
+      if (event.isViewported) {
+        setChartViewport({
+          enabled: true,
+          viewportDays: event.viewportDays || 0,
+          rangeStartTs: event.rangeStartTs || null,
+          rangeEndTs: event.rangeEndTs || null,
+          currentFromTs: event.viewportFromTs || null,
+          currentToTs: event.viewportToTs || null,
+          totalBars: event.totalBars || event.bars.length,
+          isLatest: event.isLatest !== false,
+          hasPrevious: event.sliderValue !== undefined ? event.sliderValue > 0 : true,
+          hasNext: event.sliderValue !== undefined ? event.sliderValue < 1000 : false,
+          sliderValue: event.sliderValue ?? 1000,
+        });
+      } else {
+        setChartViewport(null);
+      }
+
       setStrategyCandlesById(() => {
         const next = new Map<string, OHLCBar>();
         event.bars.forEach((bar) => {
@@ -761,8 +1451,40 @@ export default function App() {
       } else {
         pendingSnapshotRef.current = event;
       }
+
+      if (event.isViewported) {
+        void prefetchAdjacentViewportSlices({
+          session_id: event.sessionId,
+          bars: event.bars,
+          overlays: [],
+          trade_markers: [],
+          count: event.bars.length,
+          overlay_count: 0,
+          trade_marker_count: 0,
+          range_start_ts: event.rangeStartTs || null,
+          range_end_ts: event.rangeEndTs || null,
+          viewport_from_ts: event.viewportFromTs || null,
+          viewport_to_ts: event.viewportToTs || null,
+          total_bars: event.totalBars || event.bars.length,
+          viewport_days: event.viewportDays || 0,
+          is_viewported: Boolean(event.isViewported),
+          is_latest: event.isLatest !== false,
+          follow_live: event.followLive !== false,
+          has_previous: event.sliderValue !== undefined ? event.sliderValue > 0 : true,
+          has_next: event.sliderValue !== undefined ? event.sliderValue < 1000 : false,
+          slider_value: event.sliderValue ?? 1000,
+        });
+      }
     }
-  }, [selectedAgent, selectedAgentId, selectedSymbol, intervalInput, snapshotHandler]);
+  }, [
+    intervalInput,
+    markIndicatorSnapshotReady,
+    prefetchAdjacentViewportSlices,
+    selectedAgent,
+    selectedAgentId,
+    selectedSymbol,
+    snapshotHandler,
+  ]);
 
   // Keep the timeframe ref current on every render pass so the flush callback reads
   // the latest value without needing it in its dependency array.
@@ -789,20 +1511,26 @@ export default function App() {
     setOverlayData((prev) => {
       const updated = new Map(prev);
       for (const [seriesKey, { records: newRecords }] of snapshot.entries()) {
-        const existing = [...(updated.get(seriesKey) || [])];
+        const existing = updated.get(seriesKey) || [];
+        const next = existing.slice();
+        const existingIndexById = new Map<string, number>();
+        for (let index = 0; index < next.length; index += 1) {
+          existingIndexById.set(overlayRecordKey(next[index]), index);
+        }
         for (const [recordId, record] of newRecords.entries()) {
-          const idx = existing.findIndex((r) => r.id === recordId);
-          if (idx >= 0) {
-            existing[idx] = record;
+          const idx = existingIndexById.get(recordId);
+          if (idx !== undefined) {
+            next[idx] = record;
           } else {
-            existing.push(record);
+            existingIndexById.set(recordId, next.length);
+            next.push(record);
           }
         }
         // Trim oldest records when the series exceeds the bounded window
-        if (existing.length > maxRecordsPerSeries) {
-          existing.splice(0, existing.length - maxRecordsPerSeries);
+        if (next.length > maxRecordsPerSeries) {
+          next.splice(0, next.length - maxRecordsPerSeries);
         }
-        updated.set(seriesKey, existing);
+        updated.set(seriesKey, next);
       }
       return updated;
     });
@@ -823,6 +1551,8 @@ export default function App() {
   }, [flushLiveOverlayBatch]);
 
   const handleOverlayHistory = useCallback((event: OverlayHistoryEvent) => {
+    markIndicatorHistoryResponded(event.agentId);
+
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
 
     // Skip if agent is not visible
@@ -846,7 +1576,8 @@ export default function App() {
       const updated = new Map(prev);
       for (const [outputId, overlays] of groupedByOutputId.entries()) {
         const key = buildOverlaySeriesKey(resolvedAgentId, event.schema, outputId);
-        updated.set(key, overlays);
+        const existing = updated.get(key) || [];
+        updated.set(key, mergeOverlayRecords(existing, overlays));
       }
       return updated;
     });
@@ -859,7 +1590,36 @@ export default function App() {
       }
       return updated;
     });
-  }, [resolveOverlayAgentId, buildOverlaySeriesKey, isAgentVisible]);
+
+    if (
+      chartViewport?.enabled &&
+      chartViewport.currentFromTs &&
+      chartViewport.currentToTs
+    ) {
+      if (viewportOverlayRefreshTimerRef.current !== null) {
+        window.clearTimeout(viewportOverlayRefreshTimerRef.current);
+      }
+
+      viewportOverlayRefreshTimerRef.current = window.setTimeout(() => {
+        viewportOverlayRefreshTimerRef.current = null;
+        void loadViewport(
+          {
+            fromTs: chartViewport.currentFromTs || undefined,
+            toTs: chartViewport.currentToTs || undefined,
+            windowDays: chartViewport.viewportDays,
+          },
+          { prefetch: false }
+        );
+      }, 220);
+    }
+  }, [
+    buildOverlaySeriesKey,
+    chartViewport,
+    isAgentVisible,
+    loadViewport,
+    markIndicatorHistoryResponded,
+    resolveOverlayAgentId,
+  ]);
 
   const handleOverlay = useCallback((event: OverlayEvent) => {
     const resolvedAgentId = resolveOverlayAgentId(event.agentId);
@@ -874,12 +1634,13 @@ export default function App() {
 
       // Accumulate into the live-overlay batch; the 150ms flush interval applies state updates.
       const record = event.record as OverlayRecord;
+      const liveRecordKey = overlayRecordKey(record, outputId);
       let bucket = pendingLiveOverlayRef.current.get(seriesKey);
       if (!bucket) {
         bucket = { records: new Map<string, OverlayRecord>(), schema: event.schema };
         pendingLiveOverlayRef.current.set(seriesKey, bucket);
       }
-      bucket.records.set(record.id, record);
+      bucket.records.set(liveRecordKey, record);
       bucket.schema = event.schema;
   }, [resolveOverlayAgentId, buildOverlaySeriesKey, isAgentVisible]);
 
@@ -1082,9 +1843,16 @@ export default function App() {
       return;
     }
 
+    const viewportDays = defaultViewportDaysForTimeframe(selectedTimeframe, intervalInput);
+
+    startIndicatorLoadCycle();
+
     setOverlayData(new Map());
     setOverlaySchemas(new Map());
     setStrategyCandlesById(new Map());
+    setChartViewport(null);
+    setIsViewportLoading(false);
+    viewportCacheRef.current.clear();
       // Clear any pending live-overlay events that belong to the previous subscription
       pendingLiveOverlayRef.current.clear();
     setTradeMarkers([]);
@@ -1097,6 +1865,7 @@ export default function App() {
       symbol: selectedSymbol,
       interval: intervalInput,
       timeframeDays: selectedTimeframe,
+      viewportDays,
     });
 
     if (sent) {
@@ -1113,6 +1882,7 @@ export default function App() {
     selectedTimeframe,
     sendSubscribeRequest,
     markTradeSyncing,
+    startIndicatorLoadCycle,
   ]);
 
   useEffect(() => {
@@ -1294,6 +2064,7 @@ export default function App() {
 
   const statusColor = isConnected ? "#22c55e" : "#ef4444";
   const statusText = isConnected ? "Connected" : "Disconnected";
+  const shouldShowIndicatorLoadOverlay = indicatorLoadOverlayVisible && indicatorLoadTotalCount > 0;
 
   const filteredWatchlist = useMemo(() => {
     const query = symbolSearch.trim().toLowerCase();
@@ -1373,9 +2144,204 @@ export default function App() {
     : "—";
   const topbarClock = formatEasternTime24(clockNow);
 
+  const monthPagingEligible = intervalInput === "1m" && (selectedTimeframe === 30 || selectedTimeframe === 90 || selectedTimeframe === 180);
+  const monthPagingEnabled = Boolean(chartViewport?.enabled) && monthPagingEligible;
+  const monthViewportPages = useMemo(
+    () => {
+      if (!monthPagingEligible) {
+        return [];
+      }
+      const rangeStartTs = chartViewport?.rangeStartTs ?? chartViewport?.currentFromTs ?? null;
+      const rangeEndTs = chartViewport?.rangeEndTs ?? chartViewport?.currentToTs ?? null;
+      return buildMonthViewportPages(rangeStartTs, rangeEndTs);
+    },
+    [monthPagingEligible, chartViewport?.rangeStartTs, chartViewport?.rangeEndTs, chartViewport?.currentFromTs, chartViewport?.currentToTs]
+  );
+  // Month pager label and navigation use currentMonthPageIndex (explicit state) — NOT derived
+  // from backend viewport match, which is fragile and causes label/button state to lag or never update.
+  const monthPagerLabel = useMemo(() => {
+    if (!monthPagingEligible || monthViewportPages.length === 0) {
+      return null;
+    }
+    const safeIndex = Math.min(currentMonthPageIndex, monthViewportPages.length - 1);
+    const currentPage = monthViewportPages[safeIndex];
+    return `Week ${safeIndex + 1} of ${monthViewportPages.length}`;
+  }, [currentMonthPageIndex, monthPagingEligible, monthViewportPages]);
+
+  const canPageMonthOlder = monthPagingEligible && monthViewportPages.length > 0 && currentMonthPageIndex < monthViewportPages.length - 1;
+  const canPageMonthNewer = monthPagingEligible && currentMonthPageIndex > 0;
+
+  const handleMonthPageShift = useCallback((direction: -1 | 1) => {
+    if (!monthPagingEligible || monthViewportPages.length === 0) {
+      return;
+    }
+
+    const nextIndex = direction < 0 ? currentMonthPageIndex + 1 : currentMonthPageIndex - 1;
+    if (nextIndex < 0 || nextIndex >= monthViewportPages.length) {
+      return;
+    }
+
+    // Update state immediately so label and button states reflect the new page before the
+    // backend round-trip completes. Do NOT wait for backend confirmation.
+    setCurrentMonthPageIndex(nextIndex);
+
+    const page = monthViewportPages[nextIndex];
+    void loadViewport({
+      fromTs: page.fromTs,
+      toTs: page.toTs,
+      windowDays: chartViewport?.viewportDays ?? 7,
+    }, { forceRefresh: true });
+  }, [chartViewport?.viewportDays, currentMonthPageIndex, loadViewport, monthPagingEligible, monthViewportPages]);
+
+  // Reset page index when session changes (symbol/interval/timeframe) so we always start at page 0.
+  useEffect(() => {
+    if (!monthPagingEligible) {
+      setCurrentMonthPageIndex(0);
+      lastAppliedMonthPageKeyRef.current = null;
+    }
+  }, [monthPagingEligible, selectedSymbol, intervalInput, selectedTimeframe]);
+
+  // Auto-init: when month paging becomes eligible and pages are available, load page 0.
+  // Guard via lastAppliedMonthPageKeyRef to prevent double-fire.
+  useEffect(() => {
+    if (!monthPagingEligible || monthViewportPages.length === 0) {
+      lastAppliedMonthPageKeyRef.current = null;
+      return;
+    }
+
+    const initialPage = monthViewportPages[0];
+    const initKey = `${initialPage.fromTs}:${initialPage.toTs}:${selectedSymbol}:${intervalInput}:${selectedTimeframe}`;
+    if (lastAppliedMonthPageKeyRef.current === initKey) {
+      return;
+    }
+
+    lastAppliedMonthPageKeyRef.current = initKey;
+    setCurrentMonthPageIndex(0);
+    void loadViewport({
+      fromTs: initialPage.fromTs,
+      toTs: initialPage.toTs,
+      windowDays: chartViewport?.viewportDays ?? 7,
+    }, { forceRefresh: true });
+  }, [
+    chartViewport?.viewportDays,
+    intervalInput,
+    loadViewport,
+    monthPagingEligible,
+    monthViewportPages,
+    selectedSymbol,
+    selectedTimeframe,
+  ]);
+
   // Extract candle type from agent config if available, default to "candlestick"
   const candleType: "candlestick" | "bar" | "line" | "area" = 
     (selectedAgent?.config?.candle_type as any || "candlestick");
+
+  const handleViewportPage = useCallback((direction: -1 | 1, anchorTs?: string) => {
+    clearViewportScrubDebounce();
+    setViewportSliderDraft(null);
+    if (!chartViewport?.enabled || !chartViewport.currentFromTs || !chartViewport.currentToTs) {
+      return;
+    }
+    const startMs = parseIsoMillis(chartViewport.currentFromTs);
+    const endMs = parseIsoMillis(chartViewport.currentToTs);
+    const fullStartMs = parseIsoMillis(chartViewport.rangeStartTs);
+    const fullEndMs = parseIsoMillis(chartViewport.rangeEndTs);
+    if (startMs === null || endMs === null || fullStartMs === null || fullEndMs === null) {
+      return;
+    }
+
+    const spanMs = Math.max(endMs - startMs, 60_000);
+    const anchorMs = parseIsoMillis(anchorTs) ?? (direction < 0 ? startMs : endMs);
+
+    if (direction > 0 && chartViewport.hasNext === false) {
+      void loadViewport({ windowDays: chartViewport.viewportDays });
+      return;
+    }
+
+    let nextStartMs = startMs;
+    let nextEndMs = endMs;
+    if (direction < 0) {
+      nextEndMs = Math.min(fullEndMs, Math.max(fullStartMs, anchorMs));
+      nextStartMs = Math.max(fullStartMs, nextEndMs - spanMs);
+      nextEndMs = Math.min(fullEndMs, nextStartMs + spanMs);
+    } else {
+      nextStartMs = Math.max(fullStartMs, Math.min(fullEndMs, anchorMs));
+      nextEndMs = Math.min(fullEndMs, nextStartMs + spanMs);
+      nextStartMs = Math.max(fullStartMs, nextEndMs - spanMs);
+    }
+
+    void loadViewport({
+      fromTs: toIsoUtc(nextStartMs),
+      toTs: toIsoUtc(nextEndMs),
+      windowDays: chartViewport.viewportDays,
+    });
+  }, [chartViewport, clearViewportScrubDebounce, loadViewport]);
+
+  const handleViewportSliderChange = useCallback((sliderValue: number) => {
+    clearViewportScrubDebounce();
+    const clampedSlider = Math.max(0, Math.min(1000, Math.round(sliderValue)));
+    setViewportSliderDraft(clampedSlider);
+
+    if (!chartViewport?.enabled || !chartViewport.currentFromTs || !chartViewport.currentToTs) {
+      return;
+    }
+    const startMs = parseIsoMillis(chartViewport.currentFromTs);
+    const endMs = parseIsoMillis(chartViewport.currentToTs);
+    const fullStartMs = parseIsoMillis(chartViewport.rangeStartTs);
+    const fullEndMs = parseIsoMillis(chartViewport.rangeEndTs);
+    if (startMs === null || endMs === null || fullStartMs === null || fullEndMs === null) {
+      return;
+    }
+
+    const spanMs = Math.max(endMs - startMs, 60_000);
+    const maxOffsetMs = Math.max(fullEndMs - fullStartMs - spanMs, 0);
+    const ratio = Math.max(0, Math.min(1, clampedSlider / 1000));
+    const nextStartMs = fullStartMs + Math.round(maxOffsetMs * ratio);
+    const nextEndMs = Math.min(fullEndMs, nextStartMs + spanMs);
+
+    viewportScrubTimerRef.current = window.setTimeout(() => {
+      viewportScrubTimerRef.current = null;
+      void loadViewport(
+        {
+          fromTs: toIsoUtc(nextStartMs),
+          toTs: toIsoUtc(nextEndMs),
+          windowDays: chartViewport.viewportDays,
+        },
+        { prefetch: false }
+      );
+    }, 160);
+  }, [chartViewport, clearViewportScrubDebounce, loadViewport]);
+
+  const handleViewportJumpLatest = useCallback(() => {
+    clearViewportScrubDebounce();
+    setViewportSliderDraft(null);
+    if (!chartViewport?.enabled) {
+      return;
+    }
+    void loadViewport({ windowDays: chartViewport.viewportDays });
+  }, [chartViewport, clearViewportScrubDebounce, loadViewport]);
+
+  const viewportNavigator = useMemo(() => {
+    if (!chartViewport?.enabled || monthPagingEnabled) {
+      return null;
+    }
+
+    const startLabel = chartViewport.currentFromTs
+      ? new Date(chartViewport.currentFromTs).toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      : "—";
+    const endLabel = chartViewport.currentToTs
+      ? new Date(chartViewport.currentToTs).toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      : "—";
+
+    return {
+      sliderValue: viewportSliderDraft ?? chartViewport.sliderValue,
+      canPageBackward: chartViewport.hasPrevious,
+      canPageForward: chartViewport.hasNext || !chartViewport.isLatest,
+      isLatest: chartViewport.isLatest,
+      isLoading: isViewportLoading,
+      label: `${startLabel} – ${endLabel}`,
+    };
+  }, [chartViewport, isViewportLoading, monthPagingEnabled, viewportSliderDraft]);
 
   const handleRunTest = async () => {
     try {
@@ -1602,8 +2568,13 @@ export default function App() {
       const sparklineWidth = 300;
       const sparklineHeight = 54;
       const liveEquityCurve = strategyPerformance.equityCurve.length > 0 ? strategyPerformance.equityCurve : [STARTING_CAPITAL];
-      const minValue = Math.min(...liveEquityCurve);
-      const maxValue = Math.max(...liveEquityCurve);
+      let minValue = liveEquityCurve[0] ?? STARTING_CAPITAL;
+      let maxValue = minValue;
+      for (let i = 1; i < liveEquityCurve.length; i += 1) {
+        const value = liveEquityCurve[i];
+        if (value < minValue) minValue = value;
+        if (value > maxValue) maxValue = value;
+      }
       const range = Math.max(1, maxValue - minValue);
       const sparklinePoints = liveEquityCurve.map((value, index) => {
         const x = (index / Math.max(1, liveEquityCurve.length - 1)) * sparklineWidth;
@@ -1799,7 +2770,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-title-group">
-          <h1 className="app-title">ODIN Market Workspace v1.38</h1>
+          <h1 className="app-title">ODIN Market Workspace v1.62</h1>
           <span className="symbol-chip">{selectedSymbol}</span>
         </div>
         <div className="topbar-tools">
@@ -1938,6 +2909,29 @@ export default function App() {
                   onIntervalChange={setIntervalInput}
                   onTimeframeChange={setSelectedTimeframe}
                 />
+                {monthPagingEligible && monthPagerLabel && (
+                  <div className="month-pager-pill" role="group" aria-label="Monthly viewport pager">
+                    <button
+                      type="button"
+                      className="month-pager-button"
+                      onClick={() => handleMonthPageShift(-1)}
+                      disabled={!canPageMonthOlder || isViewportLoading}
+                      aria-label="Load previous month"
+                    >
+                      ←
+                    </button>
+                    <span className="month-pager-label">{monthPagerLabel}</span>
+                    <button
+                      type="button"
+                      className="month-pager-button"
+                      onClick={() => handleMonthPageShift(1)}
+                      disabled={!canPageMonthNewer || isViewportLoading}
+                      aria-label="Load newer month"
+                    >
+                      →
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="chart-kpis-inline">
                 <span className="kpi-item">Last <strong>{formattedPrice}</strong></span>
@@ -1945,12 +2939,29 @@ export default function App() {
               </div>
             </div>
             <div className="chart-container">
+              {shouldShowIndicatorLoadOverlay && (
+                <div className="chart-load-overlay" role="status" aria-live="polite" aria-busy="true">
+                  <div className="chart-load-panel">
+                    <div className="chart-load-spinner" aria-hidden="true" />
+                    <div className="chart-load-title">Loading indicator data</div>
+                    <div className="chart-load-progress">
+                      {indicatorLoadLoadedCount} of {indicatorLoadTotalCount} loaded…
+                    </div>
+                  </div>
+                </div>
+              )}
+              {showIndicatorDelayNotice && (
+                <div className="chart-load-delay-note" role="status" aria-live="polite">
+                  Some agent data may be delayed.
+                </div>
+              )}
               <ChartView 
                 onCandleReceived={handleCandleReceived}
                 onSnapshotRequested={handleSnapshotRequested}
                 overlayData={overlayData}
                 overlaySchemas={overlaySchemas}
                 overlayLineColors={overlayLineColors}
+                overlaySeriesLineSettings={overlaySeriesLineSettings}
                 overlaySubgraphForced={overlaySubgraphForced}
                 overlayAreaStyles={overlayAreaStyles}
                 tradeMarkers={tradeMarkers}
@@ -1958,6 +2969,13 @@ export default function App() {
                 selectedInterval={intervalInput}
                 selectedTimeframe={selectedTimeframe}
                 onTimeframeChange={setSelectedTimeframe}
+                viewportNavigator={viewportNavigator ? {
+                  ...viewportNavigator,
+                  onPageBackward: (anchorTs?: string) => handleViewportPage(-1, anchorTs),
+                  onPageForward: (anchorTs?: string) => handleViewportPage(1, anchorTs),
+                  onSliderChange: handleViewportSliderChange,
+                  onJumpLatest: handleViewportJumpLatest,
+                } : null}
                 isLeftCollapsed={isLeftCollapsed}
                 isRightCollapsed={isRightCollapsed}
                 candleType={candleType}

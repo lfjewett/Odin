@@ -210,6 +210,39 @@ export interface EvaluateResearchExpressionResponse {
   count: number;
 }
 
+export interface SessionViewportResponse {
+  session_id: string;
+  bars: Array<{
+    id: string;
+    seq?: number;
+    rev: number;
+    bar_state: "partial" | "provisional_close" | "session_reconciled" | "final";
+    ts: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  }>;
+  overlays: ResearchRecord[];
+  trade_markers: TradeMarker[];
+  count: number;
+  overlay_count: number;
+  trade_marker_count: number;
+  range_start_ts: string | null;
+  range_end_ts: string | null;
+  viewport_from_ts: string | null;
+  viewport_to_ts: string | null;
+  total_bars: number;
+  viewport_days: number;
+  is_viewported: boolean;
+  is_latest: boolean;
+  follow_live: boolean;
+  has_previous: boolean;
+  has_next: boolean;
+  slider_value: number;
+}
+
 export interface CreateCsvExportPayload {
   start_date: string;
   end_date: string;
@@ -433,4 +466,32 @@ export async function getCsvExportJobStatus(sessionId: string, jobId: string): P
 
 export function getCsvExportDownloadUrl(sessionId: string, jobId: string): string {
   return `${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/exports/csv/${encodeURIComponent(jobId)}/download`;
+}
+
+export async function fetchSessionViewport(
+  sessionId: string,
+  params: {
+    fromTs?: string;
+    toTs?: string;
+    windowDays?: number;
+  } = {}
+): Promise<SessionViewportResponse> {
+  const search = new URLSearchParams();
+  if (params.fromTs) search.set("from_ts", params.fromTs);
+  if (params.toTs) search.set("to_ts", params.toTs);
+  if (typeof params.windowDays === "number" && Number.isFinite(params.windowDays)) {
+    search.set("window_days", String(params.windowDays));
+  }
+
+  const query = search.toString();
+  const response = await fetch(
+    `${BACKEND_URL}/api/sessions/${encodeURIComponent(sessionId)}/viewport${query ? `?${query}` : ""}`
+  );
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to fetch viewport: ${response.statusText}`);
+  }
+
+  return response.json();
 }
